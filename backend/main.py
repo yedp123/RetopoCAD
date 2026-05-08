@@ -2,7 +2,10 @@ import uvicorn
 import trimesh
 import numpy as np
 import io
+import tempfile
+import os
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -66,7 +69,7 @@ async def analyze_surface(point: Point3D):
     adjacency = mesh.face_adjacency
     angles = mesh.face_adjacency_angles
     
-    smooth_threshold = 0.35
+    smooth_threshold = 0.5
     smooth_edges = adjacency[angles < smooth_threshold]
     
     components = trimesh.graph.connected_components(
@@ -86,12 +89,9 @@ async def analyze_surface(point: Point3D):
     variance = np.var(region_normals, axis=0).sum()
     submesh = mesh.submesh([target_region], append=True)
     
-    # Relaxed tolerance for planarity to catch slightly imperfect CAD exports
     if variance < 1e-2:
-        bounds = submesh.bounds
         return {
             "type": "planar", "face_count": len(target_region),
-            "bounds": {"min": bounds[0].tolist(), "max": bounds[1].tolist()},
             "variance": float(variance)
         }
     else:
@@ -100,7 +100,6 @@ async def analyze_surface(point: Point3D):
             radius = cyl.primitive.radius if hasattr(cyl, 'primitive') else cyl.radius
             return {
                 "type": "cylindrical", "face_count": len(target_region),
-                "axis": cyl.direction.tolist(), "center": cyl.transform[:3, 3].tolist(),
                 "radius": float(radius), "variance": float(variance)
             }
         except Exception:
@@ -126,7 +125,7 @@ async def extract_feature(params: FeatureParams):
         raise HTTPException(status_code=404, detail="Could not snap to a face.")
         
     start_face = face_ids[0]
-    smooth_edges = mesh.face_adjacency[mesh.face_adjacency_angles < 0.35]
+    smooth_edges = mesh.face_adjacency[mesh.face_adjacency_angles < 0.5]
     components = trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces)))
     
     target_region = next((comp for comp in components if start_face in comp), [start_face])
@@ -185,7 +184,7 @@ async def extract_feature(params: FeatureParams):
                 radius = float(radii.mean())
                 fit_error = np.std(radii) / radius
                 
-                if fit_error < 0.15: # Good circular fit
+                if fit_error < 0.15: 
                     center_3d = center_guess + res.x[0]*u + res.x[1]*v
                     if np.dot(normal, region_normal) < 0: normal = -normal
 
@@ -231,19 +230,16 @@ def auto_extract(params: AutoExtractParams):
     mesh = state.mesh
     extracted_features = []
     
-    smooth_edges = mesh.face_adjacency[mesh.face_adjacency_angles < 0.35]
+    smooth_edges = mesh.face_adjacency[mesh.face_adjacency_angles < 0.5]
     components = trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces)))
     
     for comp in components:
-        # Reduced from 10 to 3. Many large rectangular CAD panels only consist of 2-4 triangles!
         if len(comp) < 3: 
             continue
             
         region_normals = mesh.face_normals[comp]
         region_normal = np.mean(region_normals, axis=0)
         variance = np.var(region_normals, axis=0).sum()
-        
-        # Relaxed tolerance
         is_planar = variance < 1e-2
 
         faces = mesh.faces[comp]
@@ -366,6 +362,91 @@ def generate_hulls(params: HullParams):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"CoACD failed: {str(e)}")
+
+
+@app.post("/export-step")
+async def export_step(payload: dict):
+    try:
+        import build123d as b3d
+    except ImportError:
+        raise HTTPException(status_code=500, detail="Missing build123d. Run: pip install build123d")
+        
+    shapes = []
+    
+    # 1. Convert Hull Meshes to Solid BREP Bodies
+    hulls = payload.get("hulls", [])
+    for hull in hulls:
+        try:
+            pts = [b3d.Vector(v) for v in hull["vertices"]]
+            faces = []
+            for f in hull["faces"]:
+                poly_pts = [pts[i] for i in f]
+                poly_pts.append(poly_pts[0]) # explicitly close the wire
+                wire = b3d.Wire.make_polygon(poly_pts)
+                faces.append(b3d.Face(wire))
+            
+            try:
+                shell = b3d.Shell.make_shell(faces)
+                solid = b3d.Solid.make_solid(shell)
+                shapes.append(solid)
+            except Exception as e_solid:
+                print(f"[Export Warning] Solid failed, falling back to shell: {e_solid}")
+                try:
+                    shell = b3d.Shell.make_shell(faces)
+                    shapes.append(shell)
+                except Exception as e_shell:
+                    shapes.extend(faces)
+                    
+        except Exception as e:
+            print(f"[Export Warning] Failed to process a hull: {e}")
+            
+    # 2. Convert Extracted Curves to 1D Wire/Edge Sketches
+    features = payload.get("features", [])
+    for feat in features:
+        try:
+            if feat["type"] == "circle":
+                c = b3d.Vector(feat["center"])
+                n = b3d.Vector(feat["normal"])
+                p = b3d.Plane(origin=c, z_dir=n)
+                shapes.append(b3d.Edge.make_circle(radius=feat["radius"], plane=p))
+                
+            elif feat["type"] == "planar":
+                pts = [b3d.Vector(p) for p in feat["points"]]
+                if (pts[0] - pts[-1]).length > 1e-5:
+                    pts.append(pts[0])
+                shapes.append(b3d.Wire.make_polygon(pts))
+        except Exception as e:
+            print(f"[Export Warning] Failed to build a curve feature: {e}")
+            
+    if not shapes:
+        raise HTTPException(status_code=400, detail="No geometry found to export.")
+        
+    fd, path = tempfile.mkstemp(suffix=".step")
+    os.close(fd)
+    
+    # FIX: Bulletproof build123d API handling
+    try:
+        try:
+            # Modern Build123d syntax
+            comp = b3d.Compound(children=shapes)
+        except Exception:
+            # Older Build123d syntax
+            comp = b3d.Compound(shapes)
+            
+        # Export logic handles varying versions of build123d
+        if hasattr(comp, 'export_step'):
+            comp.export_step(path)
+        elif hasattr(b3d, 'export_step'):
+            b3d.export_step(comp, path)
+        else:
+            from build123d import exporters3d
+            exporters3d.export_step(comp, path)
+            
+    except Exception as export_error:
+        print(f"[Export Error Fatal] {export_error}")
+        raise HTTPException(status_code=500, detail=f"Failed during STEP compilation: {str(export_error)}")
+    
+    return FileResponse(path, media_type="application/octet-stream", filename="RetopoCAD_Export.step")
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

@@ -4,7 +4,7 @@ import Viewport from './Viewport';
 function CompactSymmetryToggle({ label, active, onClick, colorClass }) {
   return (
     <button onClick={onClick} className={`flex items-center justify-between w-full px-3 py-1.5 rounded transition-colors ${active ? 'bg-zinc-700/50 text-white' : 'hover:bg-zinc-800/50 text-zinc-400 hover:text-zinc-200'}`}>
-      <span className="font-medium text-xs">{label}</span>
+      <span className="font-medium text-[10px] uppercase tracking-wider">{label}</span>
       <div className={`w-6 h-3 rounded-full relative transition-colors ${active ? colorClass : 'bg-zinc-800'}`}>
         <div className={`absolute top-0.5 left-0.5 w-2 h-2 rounded-full bg-white transition-transform ${active ? 'translate-x-3' : ''}`}></div>
       </div>
@@ -16,7 +16,9 @@ export default function App() {
   const [objUrl, setObjUrl] = useState(null);
   const [backendStatus, setBackendStatus] = useState("Waiting for mesh...");
   const [isUploading, setIsUploading] = useState(false);
-  const [analysisData, setAnalysisData] = useState(null);
+  const [isExporting, setIsExporting] = useState(false);
+  
+  const [analysisTooltip, setAnalysisTooltip] = useState(null);
   
   const [isGeneratingHulls, setIsGeneratingHulls] = useState(false);
   const [generationTimer, setGenerationTimer] = useState(0);
@@ -29,12 +31,10 @@ export default function App() {
   const [decimationTarget, setDecimationTarget] = useState(15000);
   const [skipDecimation, setSkipDecimation] = useState(false);
 
-  // Tooling & History
   const [activeTool, setActiveTool] = useState('analyze'); 
   const [featuresHistory, setFeaturesHistory] = useState([[]]); 
   const [historyIndex, setHistoryIndex] = useState(0);
   
-  // Auto-Extract States
   const [isAutoExtracting, setIsAutoExtracting] = useState(false);
   const [minFeatureSize, setMinFeatureSize] = useState(2.0);
 
@@ -42,7 +42,10 @@ export default function App() {
   const toggleSymmetry = (axis) => setSymmetry(prev => ({ ...prev, [axis]: !prev[axis] }));
 
   const [showMesh, setShowMesh] = useState(true);
+  const [showWireframe, setShowWireframe] = useState(true);
+  const [meshOpacity, setMeshOpacity] = useState(0.4);
   const [showHulls, setShowHulls] = useState(true);
+  
   const [consoleLogs, setConsoleLogs] = useState(["System initialized. Ready for operations..."]);
 
   const currentFeatures = featuresHistory[historyIndex];
@@ -107,7 +110,7 @@ export default function App() {
 
     const url = URL.createObjectURL(file);
     setObjUrl(url);
-    setAnalysisData(null);
+    setAnalysisTooltip(null);
     setHullsData(null);
     setFeaturesHistory([[]]);
     setHistoryIndex(0);
@@ -122,13 +125,13 @@ export default function App() {
       const res = await fetch('http://localhost:8000/upload-mesh', { method: 'POST', body: formData });
       const data = await res.json();
       if (res.ok) {
-        setBackendStatus(`Brain Sync: ${data.faces.toLocaleString()} faces loaded`);
+        setBackendStatus(`Loaded: ${data.faces.toLocaleString()} faces`);
         setConsoleLogs(prev => [...prev, `[Success] Mesh loaded. Faces: ${data.faces.toLocaleString()}`]);
       } else {
         setBackendStatus(`Error: ${data.detail}`);
       }
     } catch (err) {
-      setBackendStatus("Connection Error: Is the Python server running?");
+      setBackendStatus("Connection Error!");
     }
     setIsUploading(false);
     event.target.value = ''; 
@@ -173,173 +176,219 @@ export default function App() {
     setIsGeneratingHulls(false);
   };
 
+  const handleExportSTEP = async () => {
+    if (!hullsData && currentFeatures.length === 0) {
+        setConsoleLogs(prev => [...prev, `[Warning] Nothing to export! Generate hulls or extract curves first.`]);
+        return;
+    }
+
+    setIsExporting(true);
+    setConsoleLogs(prev => [...prev, `[System] Sending geometry to OpenCASCADE for STEP translation...`]);
+
+    try {
+      const res = await fetch('http://localhost:8000/export-step', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hulls: hullsData || [], features: currentFeatures })
+      });
+      
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'RetopoCAD_Export.step';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setConsoleLogs(prev => [...prev, `[Success] STEP file successfully downloaded!`]);
+      } else {
+        const err = await res.json();
+        setConsoleLogs(prev => [...prev, `[Error] Export failed: ${err.detail}`]);
+      }
+    } catch (err) {
+      setConsoleLogs(prev => [...prev, `[Error] Could not connect to Python backend for export.`]);
+    }
+    setIsExporting(false);
+  };
+
   return (
     <div className="absolute inset-0 flex overflow-hidden bg-zinc-900 text-zinc-100 font-sans">
       
-      <div className="w-80 bg-zinc-950 border-r border-zinc-800 p-4 flex flex-col gap-4 z-10 shrink-0 overflow-y-auto custom-scrollbar">
-        <div><h1 className="text-2xl font-bold tracking-wider text-white">RetopoCAD</h1></div>
-        <div className="h-px bg-zinc-800 w-full"></div>
-
-        {/* Importer */}
-        <div className="flex flex-col gap-2">
-          <label className="text-xs font-semibold text-zinc-300 uppercase tracking-wide">Import CAD Data</label>
-          <label className={`flex items-center justify-center w-full px-3 py-2 text-white rounded cursor-pointer transition-colors shadow-lg ${isUploading ? 'bg-indigo-800 cursor-wait' : 'bg-indigo-600 hover:bg-indigo-500'}`}>
-            <svg className="w-4 h-4 mr-2 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
-            <span className="font-medium text-sm">{isUploading ? 'Uploading...' : 'Upload .obj File'}</span>
-            <input type="file" accept=".obj" className="hidden" onChange={handleFileUpload} disabled={isUploading} />
-          </label>
-          {objUrl && (
-            <div className="mt-1 p-2 bg-zinc-900/50 rounded border border-zinc-800 flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full shrink-0 ${isUploading ? 'bg-yellow-400 animate-pulse' : (backendStatus.includes("Error") ? 'bg-red-500' : 'bg-emerald-400')}`}></div>
-              <span className="text-[10px] font-mono text-zinc-300 leading-tight">{backendStatus}</span>
-            </div>
-          )}
+      {/* ULTRA COMPACT SIDEBAR (No scrolling needed!) */}
+      <div className="w-64 bg-zinc-950 border-r border-zinc-800 flex flex-col z-10 shrink-0">
+        
+        {/* Header */}
+        <div className="p-3 border-b border-zinc-800 flex items-center justify-between">
+          <h1 className="text-lg font-bold tracking-wider text-white">RetopoCAD</h1>
+          {isUploading && <div className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></div>}
         </div>
 
-        {/* Smart Curve Tooling */}
-        {objUrl && (
-          <div className="flex flex-col gap-2">
-             <label className="text-xs font-semibold text-zinc-300 uppercase tracking-wide">Feature Extraction</label>
-             <div className="p-3 bg-zinc-900 rounded border border-zinc-800 flex flex-col gap-3">
-                
-                {/* Auto-Extract Batch Operation */}
-                <div className="flex flex-col gap-1 border-b border-zinc-800 pb-3">
-                  <div className="flex justify-between text-xs text-zinc-400">
-                    <span className="font-semibold text-zinc-200">Min. Feature Size</span>
-                    <span className="text-emerald-400">{minFeatureSize} units</span>
-                  </div>
-                  <input type="range" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value))} disabled={isAutoExtracting} className="w-full accent-emerald-500" />
-                  
-                  <button onClick={handleAutoExtract} disabled={isAutoExtracting} className={`mt-2 w-full py-1.5 rounded text-xs font-bold uppercase tracking-wide transition-colors flex items-center justify-center gap-2 ${isAutoExtracting ? 'bg-zinc-800 text-zinc-500 cursor-wait' : 'bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white border border-emerald-600/50 shadow-sm'}`}>
-                    {isAutoExtracting ? 'Scanning Mesh...' : 'Auto-Extract All'}
-                  </button>
-
-                  <button 
-                    onClick={handleClearAllFeatures} 
-                    disabled={isAutoExtracting || currentFeatures.length === 0} 
-                    className={`mt-2 w-full py-1.5 rounded text-xs font-bold uppercase tracking-wide transition-colors flex items-center justify-center gap-2 ${isAutoExtracting || currentFeatures.length === 0 ? 'bg-zinc-800/50 text-zinc-600 cursor-not-allowed border border-transparent' : 'bg-red-600/10 text-red-500 hover:bg-red-600 hover:text-white border border-red-600/30 shadow-sm'}`}
-                  >
-                    Clear All Curves
-                  </button>
-                  <span className="text-[9px] text-zinc-500 mt-1 leading-tight text-center">
-                    Scans mesh and extracts all curves larger than the threshold.
-                  </span>
-                </div>
-
-                <div className="flex justify-between items-center">
-                  <span className="text-xs text-zinc-400">Manual Tools:</span>
-                  <span className="text-xs text-zinc-500">Use toolbar in viewport</span>
-                </div>
-
-             </div>
+        {/* Dense Content wrapper */}
+        <div className="flex flex-col gap-3 p-3 flex-1 overflow-hidden">
+          
+          {/* Import Panel */}
+          <div className="bg-zinc-900 border border-zinc-800 rounded p-2 flex flex-col gap-2">
+            <div className="flex justify-between items-center">
+              <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Import Mesh</span>
+              <label className={`px-2 py-1 rounded text-[10px] font-bold text-white cursor-pointer transition-colors shadow ${isUploading ? 'bg-indigo-800 cursor-wait' : 'bg-indigo-600 hover:bg-indigo-500'}`}>
+                {isUploading ? 'WAIT...' : 'UPLOAD .OBJ'}
+                <input type="file" accept=".obj" className="hidden" onChange={handleFileUpload} disabled={isUploading} />
+              </label>
+            </div>
+            {objUrl && <span className="text-[9px] font-mono text-emerald-400 leading-tight block truncate">{backendStatus}</span>}
           </div>
-        )}
 
-        {/* Auto-Blocker */}
-        {objUrl && (
-          <div className="flex flex-col gap-2 mt-auto">
-             <label className="text-xs font-semibold text-zinc-300 uppercase tracking-wide">Auto-Blocker</label>
-             <div className="p-3 bg-zinc-900 rounded border border-zinc-800 flex flex-col gap-3">
-                <div className="flex bg-zinc-950 rounded p-1 border border-zinc-800">
-                  <button onClick={() => handleModeChange('organic')} disabled={isGeneratingHulls} className={`flex-1 py-1 text-xs font-medium rounded transition-colors ${activeMode === 'organic' ? 'bg-indigo-600 text-white shadow' : 'text-zinc-500 hover:text-zinc-300'}`}>Organic</button>
-                  <button onClick={() => handleModeChange('hard-surface')} disabled={isGeneratingHulls} className={`flex-1 py-1 text-xs font-medium rounded transition-colors ${activeMode === 'hard-surface' ? 'bg-indigo-600 text-white shadow' : 'text-zinc-500 hover:text-zinc-300'}`}>Hard Surface</button>
+          {/* Smart Curve Tooling */}
+          {objUrl && (
+             <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
+                <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Curves Extraction</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] w-14 text-zinc-400">Min Size</span>
+                  <input type="range" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value))} disabled={isAutoExtracting} className="flex-1 accent-emerald-500 h-1" />
+                  <span className="text-[10px] text-emerald-400 w-8 text-right font-mono">{minFeatureSize}</span>
                 </div>
-                <div className="flex flex-col gap-3">
-                  <div className="flex flex-col gap-1">
-                    <div className="flex justify-between text-xs text-zinc-400">
-                      <span className="font-semibold text-zinc-200">Max Blocks</span>
-                      <span className="text-indigo-400">{maxHulls}</span>
-                    </div>
-                    <input type="range" min="1" max="100" value={maxHulls} onChange={(e) => setMaxHulls(parseInt(e.target.value))} disabled={isGeneratingHulls} className="w-full accent-indigo-500" />
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    <div className="flex justify-between text-xs text-zinc-400">
-                      <span className="font-semibold text-zinc-200">Merge Tolerance</span>
-                      <span className="text-indigo-400">{mergeTolerance}%</span>
-                    </div>
-                    <input type="range" min="1" max="100" value={mergeTolerance} onChange={(e) => setMergeTolerance(parseInt(e.target.value))} disabled={isGeneratingHulls} className="w-full accent-indigo-500" />
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    <div className="flex justify-between text-xs text-zinc-400">
-                      <span className="font-semibold text-zinc-200">Math Resolution</span>
-                      <span className={`text-indigo-400 ${skipDecimation ? 'line-through opacity-50' : ''}`}>{decimationTarget.toLocaleString()}</span>
-                    </div>
-                    <input type="range" min="1000" max="30000" step="1000" value={decimationTarget} onChange={(e) => setDecimationTarget(parseInt(e.target.value))} disabled={isGeneratingHulls || skipDecimation} className={`w-full accent-indigo-500 ${skipDecimation ? 'opacity-50 grayscale' : ''}`} />
-                    
-                    <div className="flex items-center gap-2 mt-1 bg-zinc-950 p-1.5 rounded border border-zinc-800">
-                      <input type="checkbox" id="skipDec" checked={skipDecimation} onChange={(e) => setSkipDecimation(e.target.checked)} disabled={isGeneratingHulls} className="accent-red-500 w-3 h-3 rounded bg-zinc-800 border-zinc-700" />
-                      <label htmlFor="skipDec" className="text-[10px] text-zinc-300 font-medium cursor-pointer select-none">Skip Decimation (Raw Mesh)</label>
-                    </div>
-                  </div>
+                <div className="flex gap-1.5 mt-0.5">
+                  <button onClick={handleAutoExtract} disabled={isAutoExtracting} className="flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white border border-emerald-600/50 transition-colors">
+                    Auto
+                  </button>
+                  <button onClick={handleClearAllFeatures} disabled={isAutoExtracting || currentFeatures.length === 0} className="flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-red-600/10 text-red-500 hover:bg-red-600 hover:text-white border border-red-600/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                    Clear
+                  </button>
                 </div>
-                <button onClick={handleGenerateHulls} disabled={isGeneratingHulls} className={`w-full py-1.5 rounded text-sm font-medium transition-colors flex items-center justify-center gap-2 ${isGeneratingHulls ? 'bg-zinc-800 text-zinc-500 cursor-wait' : 'bg-zinc-800 text-white hover:bg-zinc-700 border border-zinc-700 shadow-lg'}`}>
-                  {isGeneratingHulls ? `Processing... (${generationTimer}s)` : 'Generate Hulls'}
+             </div>
+          )}
+
+          {/* Auto-Blocker */}
+          {objUrl && (
+             <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
+                <div className="flex justify-between items-center mb-0.5">
+                  <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Auto-Blocker</span>
+                </div>
+                
+                <div className="flex bg-zinc-950 rounded border border-zinc-800 p-0.5">
+                  <button onClick={() => handleModeChange('organic')} disabled={isGeneratingHulls} className={`flex-1 py-0.5 text-[9px] font-bold uppercase tracking-wide rounded transition-colors ${activeMode === 'organic' ? 'bg-indigo-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>Organic</button>
+                  <button onClick={() => handleModeChange('hard-surface')} disabled={isGeneratingHulls} className={`flex-1 py-0.5 text-[9px] font-bold uppercase tracking-wide rounded transition-colors ${activeMode === 'hard-surface' ? 'bg-indigo-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>Hard Surface</button>
+                </div>
+                
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] w-14 text-zinc-400">Blocks</span>
+                  <input type="range" min="1" max="100" value={maxHulls} onChange={(e) => setMaxHulls(parseInt(e.target.value))} disabled={isGeneratingHulls} className="flex-1 accent-indigo-500 h-1" />
+                  <span className="text-[10px] text-indigo-400 w-8 text-right font-mono">{maxHulls}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] w-14 text-zinc-400">Merge</span>
+                  <input type="range" min="1" max="100" value={mergeTolerance} onChange={(e) => setMergeTolerance(parseInt(e.target.value))} disabled={isGeneratingHulls} className="flex-1 accent-indigo-500 h-1" />
+                  <span className="text-[10px] text-indigo-400 w-8 text-right font-mono">{mergeTolerance}%</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] w-14 text-zinc-400">Detail</span>
+                  <input type="range" min="1000" max="30000" step="1000" value={decimationTarget} onChange={(e) => setDecimationTarget(parseInt(e.target.value))} disabled={isGeneratingHulls || skipDecimation} className={`flex-1 accent-indigo-500 h-1 ${skipDecimation ? 'opacity-50 grayscale' : ''}`} />
+                  <span className={`text-[10px] text-indigo-400 w-8 text-right font-mono ${skipDecimation ? 'line-through opacity-50' : ''}`}>{decimationTarget/1000}k</span>
+                </div>
+
+                <div className="flex items-center gap-2 mt-1">
+                  <input type="checkbox" id="skipDec" checked={skipDecimation} onChange={(e) => setSkipDecimation(e.target.checked)} disabled={isGeneratingHulls} className="accent-red-500 w-3 h-3 rounded bg-zinc-800 border-zinc-700" />
+                  <label htmlFor="skipDec" className="text-[9px] text-zinc-300 uppercase tracking-wide cursor-pointer select-none">Skip Decimation (Raw)</label>
+                </div>
+                
+                <button onClick={handleGenerateHulls} disabled={isGeneratingHulls} className={`w-full py-1.5 mt-1 rounded text-[11px] font-bold uppercase tracking-widest transition-colors flex items-center justify-center gap-2 ${isGeneratingHulls ? 'bg-zinc-800 text-zinc-500 cursor-wait' : 'bg-indigo-600 text-white hover:bg-indigo-500 shadow'}`}>
+                  {isGeneratingHulls ? `Processing (${generationTimer}s)` : 'Generate'}
                 </button>
              </div>
-          </div>
-        )}
+          )}
 
-        {/* Surface Analysis */}
-        {objUrl && (
-          <div className="flex flex-col gap-2 mt-auto">
-            <label className="text-xs font-semibold text-zinc-300 uppercase tracking-wide">Surface Analysis</label>
-            <div className="p-3 bg-zinc-900 rounded border border-zinc-800 min-h-[100px] flex flex-col justify-center">
-              {!analysisData ? (
-                <div className="text-zinc-500 text-center text-xs italic">Select info tool and click on mesh.</div>
-              ) : (
-                <div className="flex flex-col gap-1.5 text-xs font-mono">
-                  <div className="flex justify-between border-b border-zinc-800 pb-1">
-                    <span className="text-zinc-400">Type:</span>
-                    <span className={analysisData.type === 'planar' ? 'text-blue-400 font-bold uppercase' : (analysisData.type === 'cylindrical' ? 'text-green-400 font-bold uppercase' : 'text-orange-400 font-bold uppercase')}>{analysisData.type}</span>
-                  </div>
-                  <div className="flex justify-between border-b border-zinc-800 pb-1">
-                    <span className="text-zinc-400">Faces:</span>
-                    <span className="text-zinc-200">{analysisData.face_count}</span>
-                  </div>
-                  {analysisData.type === 'cylindrical' && (
-                    <div className="flex justify-between border-b border-zinc-800 pb-1">
-                      <span className="text-zinc-400">Radius:</span>
-                      <span className="text-zinc-200">{analysisData.radius.toFixed(4)} units</span>
-                    </div>
-                  )}
-                  <div className="flex justify-between">
-                    <span className="text-zinc-400">Variance:</span>
-                    <span className="text-zinc-200">{analysisData.variance.toExponential(2)}</span>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
+          {/* Export Section pinned to bottom of flex area */}
+          {objUrl && (
+             <div className="mt-auto pt-2 border-t border-zinc-800">
+                <button onClick={handleExportSTEP} disabled={isExporting} className={`w-full py-2.5 rounded text-[11px] font-bold uppercase tracking-widest transition-all flex items-center justify-center gap-2 ${isExporting ? 'bg-emerald-900 text-emerald-400 cursor-wait' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-lg shadow-emerald-900/20'}`}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                  {isExporting ? 'Building STEP...' : 'Export STEP'}
+                </button>
+             </div>
+          )}
+        </div>
       </div>
 
       {/* Main Content Area (Viewport + Console) */}
       <div className="flex-1 flex flex-col relative bg-zinc-900">
         
-        <div className="flex-1 relative">
+        <div className="flex-1 relative overflow-hidden">
           <Viewport 
             objUrl={objUrl} 
             symmetry={symmetry} 
             activeTool={activeTool}
-            onAnalyze={(data) => setAnalysisData(data)} 
+            onAnalyze={(data) => setAnalysisTooltip(data)} 
             onFeatureExtracted={handleFeatureExtracted}
             onFeatureDelete={handleFeatureDelete}
             extractedFeatures={currentFeatures}
             hullsData={hullsData} 
             showMesh={showMesh} 
+            showWireframe={showWireframe}
+            meshOpacity={meshOpacity}
             showHulls={showHulls} 
           />
 
-          {/* Floating UI: Top Left Rendering Toggles */}
-          <div className="absolute top-4 left-4 flex gap-2 z-10">
-            <button onClick={() => setShowMesh(!showMesh)} className={`flex items-center gap-2 px-3 py-2 rounded-md shadow-lg border backdrop-blur-md transition-all ${showMesh ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
-              <span className="text-xs font-semibold">Ghost Mesh</span>
-            </button>
-            <button onClick={() => setShowHulls(!showHulls)} className={`flex items-center gap-2 px-3 py-2 rounded-md shadow-lg border backdrop-blur-md transition-all ${showHulls ? 'bg-blue-900/40 border-blue-700 text-blue-100' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" /></svg>
-              <span className="text-xs font-semibold">Hulls</span>
-            </button>
+          {/* FLOATING UI: Surface Info Tooltip */}
+          {analysisTooltip && (
+             <div 
+                style={{ left: Math.min(analysisTooltip.x + 15, window.innerWidth - 250), top: Math.min(analysisTooltip.y + 15, window.innerHeight - 150) }} 
+                className="absolute bg-zinc-900/95 backdrop-blur-md border border-zinc-700 rounded-lg shadow-2xl p-3 w-56 z-50 pointer-events-auto"
+             >
+                <div className="flex justify-between items-center mb-2 pb-1 border-b border-zinc-800">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-300">Surface Info</span>
+                  <button onClick={() => setAnalysisTooltip(null)} className="text-zinc-500 hover:text-white">
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                  </button>
+                </div>
+                <div className="flex flex-col gap-1.5 text-xs font-mono">
+                  <div className="flex justify-between">
+                    <span className="text-zinc-400">Type:</span>
+                    <span className={analysisTooltip.type === 'planar' ? 'text-blue-400 font-bold uppercase' : 'text-green-400 font-bold uppercase'}>{analysisTooltip.type}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-400">Faces:</span>
+                    <span className="text-zinc-200">{analysisTooltip.face_count}</span>
+                  </div>
+                  {analysisTooltip.type === 'cylindrical' && (
+                    <div className="flex justify-between">
+                      <span className="text-zinc-400">Radius:</span>
+                      <span className="text-zinc-200">{analysisTooltip.radius?.toFixed(4)}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between">
+                    <span className="text-zinc-400">Variance:</span>
+                    <span className="text-zinc-200">{analysisTooltip.variance.toExponential(2)}</span>
+                  </div>
+                </div>
+             </div>
+          )}
+
+          {/* Floating UI: Top Left Rendering Toggles & Nested Opacity Slider */}
+          <div className="absolute top-4 left-4 flex flex-col gap-1.5 z-10 items-start">
+            <div className="flex gap-2">
+              <button onClick={() => setShowMesh(!showMesh)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showMesh ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                <span className="text-xs font-semibold">Mesh</span>
+              </button>
+
+              <button onClick={() => setShowWireframe(!showWireframe)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showWireframe ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>
+                <span className="text-xs font-semibold">Wireframe</span>
+              </button>
+
+              <button onClick={() => setShowHulls(!showHulls)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showHulls ? 'bg-blue-900/40 border-blue-700 text-blue-100' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" /></svg>
+                <span className="text-xs font-semibold">Hulls</span>
+              </button>
+            </div>
+            
+            {showMesh && (
+              <div className="flex items-center gap-3 px-3 py-1.5 bg-zinc-900/80 border border-zinc-800 rounded-md shadow-lg backdrop-blur-md">
+                <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wide">Opacity</span>
+                <input type="range" min="0" max="1" step="0.05" value={meshOpacity} onChange={(e) => setMeshOpacity(parseFloat(e.target.value))} className="w-24 accent-zinc-300 h-1" />
+              </div>
+            )}
           </div>
 
           {/* Floating UI: Vertical Tools Toolbar (Middle Left) */}
@@ -371,8 +420,8 @@ export default function App() {
           </div>
 
           {/* Floating UI: Symmetry Tools */}
-          <div className="absolute top-4 right-4 bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-md shadow-2xl p-3 w-48 z-10 flex flex-col gap-2">
-            <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest border-b border-zinc-800/50 pb-2 mb-1">Mirror Planes</span>
+          <div className="absolute top-4 right-4 bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-md shadow-2xl p-2 w-40 z-10 flex flex-col gap-1.5">
+            <span className="text-[9px] font-bold text-zinc-400 uppercase tracking-widest border-b border-zinc-800/50 pb-1.5 mb-0.5 text-center">Mirror Planes</span>
             <CompactSymmetryToggle label="X (YZ)" active={symmetry.x} onClick={() => toggleSymmetry('x')} colorClass="bg-red-500" />
             <CompactSymmetryToggle label="Y (XZ)" active={symmetry.y} onClick={() => toggleSymmetry('y')} colorClass="bg-green-500" />
             <CompactSymmetryToggle label="Z (XY)" active={symmetry.z} onClick={() => toggleSymmetry('z')} colorClass="bg-blue-500" />
@@ -380,17 +429,17 @@ export default function App() {
         </div>
 
         {/* Bottom Console Panel */}
-        <div className="h-32 bg-[#0a0a0c] border-t border-zinc-800 shrink-0 flex flex-col shadow-[inset_0_4px_6px_rgba(0,0,0,0.5)]">
-          <div className="flex items-center justify-between px-4 py-1.5 bg-zinc-900 border-b border-zinc-800">
-            <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-500 flex items-center gap-2">
+        <div className="h-28 bg-[#0a0a0c] border-t border-zinc-800 shrink-0 flex flex-col shadow-[inset_0_4px_6px_rgba(0,0,0,0.5)]">
+          <div className="flex items-center justify-between px-3 py-1 bg-zinc-900 border-b border-zinc-800">
+            <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 flex items-center gap-2">
               <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
               Output Console
             </span>
           </div>
-          <div className="flex-1 p-3 overflow-y-auto custom-scrollbar font-mono text-xs text-zinc-400 leading-relaxed flex flex-col justify-end">
+          <div className="flex-1 p-2 overflow-y-auto custom-scrollbar font-mono text-[11px] text-zinc-400 leading-relaxed flex flex-col justify-end">
             {consoleLogs.slice(-15).map((log, i) => (
-              <div key={i} className={log.includes('[Error]') ? 'text-red-400' : log.includes('[Success]') || log.includes('[CAD]') ? 'text-emerald-400' : ''}>
-                <span className="opacity-30 select-none mr-3">{'>'}</span>{log}
+              <div key={i} className={log.includes('[Error]') ? 'text-red-400' : log.includes('[Success]') || log.includes('[CAD]') ? 'text-emerald-400' : log.includes('[Warning]') ? 'text-yellow-400' : ''}>
+                <span className="opacity-30 select-none mr-2">{'>'}</span>{log}
               </div>
             ))}
           </div>

@@ -1,6 +1,6 @@
 import React, { Suspense, useEffect, useRef, useMemo, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
-import { OrbitControls, Bounds, Edges, Grid } from '@react-three/drei';
+import { OrbitControls, Bounds, Edges, Grid, GizmoHelper, GizmoViewport } from '@react-three/drei';
 import { useLoader } from '@react-three/fiber';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader';
 import * as THREE from 'three';
@@ -94,8 +94,7 @@ function PlanarCurve({ feature, centerOffset, activeTool, onDelete }) {
   );
 }
 
-
-function GhostModel({ url, symmetry, activeTool, onAnalyze, onFeatureExtracted, onFeatureDelete, extractedFeatures, hullsData, showMesh, showHulls }) {
+function GhostModel({ url, symmetry, activeTool, onAnalyze, onFeatureExtracted, onFeatureDelete, extractedFeatures, hullsData, showMesh, showWireframe, meshOpacity, showHulls }) {
   const obj = useLoader(OBJLoader, url);
   const cursorGroupRef = useRef(); 
   const cursorRef = useRef();
@@ -189,6 +188,10 @@ function GhostModel({ url, symmetry, activeTool, onAnalyze, onFeatureExtracted, 
     const worldPoint = e.point.clone();
     const localPoint = cursorGroupRef.current.worldToLocal(worldPoint);
     const rawPoint = localPoint.clone().add(centerOffset);
+    
+    // FIX: Bulletproof screen coordinate extraction to prevent tool death
+    const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
+    const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
 
     if (activeTool === 'analyze') {
       try {
@@ -197,7 +200,10 @@ function GhostModel({ url, symmetry, activeTool, onAnalyze, onFeatureExtracted, 
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ x: rawPoint.x, y: rawPoint.y, z: rawPoint.z })
         });
-        if (res.ok) onAnalyze(await res.json());
+        if (res.ok) {
+          const data = await res.json();
+          onAnalyze({ ...data, x: screenX, y: screenY });
+        }
       } catch (err) { console.error(err); }
     } 
     else if (activeTool === 'extract') {
@@ -220,8 +226,8 @@ function GhostModel({ url, symmetry, activeTool, onAnalyze, onFeatureExtracted, 
       <group>
         {showMesh && meshes.map((mesh, index) => (
           <mesh key={`base-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onClick={handleClick}>
-            <meshStandardMaterial color="#cccccc" transparent opacity={0.4} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
-            <Edges raycast={() => null} threshold={15} color="#18181b" />
+            <meshStandardMaterial color="#cccccc" transparent opacity={meshOpacity} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
+            {showWireframe && <Edges raycast={() => null} threshold={15} color="#18181b" />}
           </mesh>
         ))}
         {showHulls && hullsData && hullsData.map((hull, idx) => (
@@ -239,8 +245,8 @@ function GhostModel({ url, symmetry, activeTool, onAnalyze, onFeatureExtracted, 
         <group key={`mirror-group-${groupIndex}`} scale={scale}>
           {showMesh && meshes.map((mesh, index) => (
             <mesh key={`mirror-${groupIndex}-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale}>
-              <meshStandardMaterial color="#cccccc" transparent opacity={0.4} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
-              <Edges raycast={() => null} threshold={15} color="#18181b" />
+              <meshStandardMaterial color="#cccccc" transparent opacity={meshOpacity} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
+              {showWireframe && <Edges raycast={() => null} threshold={15} color="#18181b" />}
             </mesh>
           ))}
           {showHulls && hullsData && hullsData.map((hull, idx) => (
@@ -274,7 +280,7 @@ function GhostModel({ url, symmetry, activeTool, onAnalyze, onFeatureExtracted, 
   );
 }
 
-export default function Viewport({ objUrl, symmetry, activeTool, onAnalyze, onFeatureExtracted, onFeatureDelete, extractedFeatures, hullsData, showMesh, showHulls }) {
+export default function Viewport({ objUrl, symmetry, activeTool, onAnalyze, onFeatureExtracted, onFeatureDelete, extractedFeatures, hullsData, showMesh, showWireframe, meshOpacity, showHulls }) {
   return (
     <Canvas camera={{ position: [5, 5, 5], fov: 45 }} gl={{ antialias: true }} raycaster={{ params: { Line: { threshold: 0.2 } } }}>
       <color attach="background" args={['#18181b']} />
@@ -297,6 +303,8 @@ export default function Viewport({ objUrl, symmetry, activeTool, onAnalyze, onFe
                 extractedFeatures={extractedFeatures}
                 hullsData={hullsData} 
                 showMesh={showMesh} 
+                showWireframe={showWireframe}
+                meshOpacity={meshOpacity}
                 showHulls={showHulls} 
               />
             </Bounds>
@@ -307,7 +315,12 @@ export default function Viewport({ objUrl, symmetry, activeTool, onAnalyze, onFe
         )}
       </Suspense>
 
-      <OrbitControls makeDefault />
+      <OrbitControls makeDefault enablePan={true} />
+
+      <GizmoHelper alignment="bottom-right" margin={[60, 60]}>
+        <GizmoViewport axisColors={['#ef4444', '#22c55e', '#3b82f6']} labelColor="white" />
+      </GizmoHelper>
+
     </Canvas>
   );
 }
