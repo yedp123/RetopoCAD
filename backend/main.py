@@ -28,6 +28,9 @@ class Point3D(BaseModel):
 
 class HullParams(BaseModel):
     max_hulls: int
+    threshold_pct: float
+    decimation_target: int
+    skip_decimation: bool = False
 
 @app.post("/upload-mesh")
 async def upload_mesh(file: UploadFile = File(...)):
@@ -35,14 +38,14 @@ async def upload_mesh(file: UploadFile = File(...)):
         contents = await file.read()
         mesh = trimesh.load(io.BytesIO(contents), file_type='obj', force='mesh')
         state.mesh = mesh
-        return {"message": "Mesh successfully loaded into the Brain", "faces": len(mesh.faces)}
+        return {"message": "Mesh successfully loaded", "faces": len(mesh.faces)}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load mesh: {str(e)}")
 
 @app.post("/analyze-surface")
 async def analyze_surface(point: Point3D):
     if state.mesh is None:
-        raise HTTPException(status_code=400, detail="No mesh loaded. Please upload first.")
+        raise HTTPException(status_code=400, detail="No mesh loaded.")
     
     mesh = state.mesh
     target_pt = np.array([[point.x, point.y, point.z]])
@@ -59,8 +62,7 @@ async def analyze_surface(point: Point3D):
     smooth_edges = adjacency[angles < smooth_threshold]
     
     components = trimesh.graph.connected_components(
-        edges=smooth_edges, 
-        nodes=np.arange(len(mesh.faces))
+        edges=smooth_edges, nodes=np.arange(len(mesh.faces))
     )
     
     target_region = None
@@ -79,8 +81,7 @@ async def analyze_surface(point: Point3D):
     if variance < 1e-4:
         bounds = submesh.bounds
         return {
-            "type": "planar",
-            "face_count": len(target_region),
+            "type": "planar", "face_count": len(target_region),
             "bounds": {"min": bounds[0].tolist(), "max": bounds[1].tolist()},
             "variance": float(variance)
         }
@@ -89,22 +90,13 @@ async def analyze_surface(point: Point3D):
             cyl = submesh.bounding_cylinder
             radius = cyl.primitive.radius if hasattr(cyl, 'primitive') else cyl.radius
             return {
-                "type": "cylindrical",
-                "face_count": len(target_region),
-                "axis": cyl.direction.tolist(),
-                "center": cyl.transform[:3, 3].tolist(),
-                "radius": float(radius),
-                "variance": float(variance)
+                "type": "cylindrical", "face_count": len(target_region),
+                "axis": cyl.direction.tolist(), "center": cyl.transform[:3, 3].tolist(),
+                "radius": float(radius), "variance": float(variance)
             }
         except Exception:
-            return {
-                "type": "complex_curved",
-                "face_count": len(target_region),
-                "variance": float(variance)
-            }
+            return {"type": "complex_curved", "face_count": len(target_region), "variance": float(variance)}
 
-# NOTE: Using standard `def` here instead of `async def` tells FastAPI to run this 
-# in a separate thread pool. It will not block your server!
 @app.post("/generate-hulls")
 def generate_hulls(params: HullParams):
     if state.mesh is None:
@@ -113,14 +105,34 @@ def generate_hulls(params: HullParams):
     try:
         import coacd
     except ImportError:
-        raise HTTPException(status_code=500, detail="coacd module not found. Please install it.")
+        raise HTTPException(status_code=500, detail="coacd module not found.")
 
     try:
-        # Turn on native C++ logging so you can see progress in your VS Code terminal!
+        math_mesh = state.mesh
+        coacd_threshold = 0.01 + (params.threshold_pct / 100.0) * 0.14
+
+        # Honor the new Skip Decimation toggle
+        if not params.skip_decimation and len(math_mesh.faces) > params.decimation_target:
+            print(f"\n[Brain] Decimating mesh to ~{params.decimation_target} faces...")
+            try:
+                import fast_simplification
+                result = fast_simplification.simplify(
+                    math_mesh.vertices, math_mesh.faces, target_count=params.decimation_target
+                )
+                math_mesh = trimesh.Trimesh(vertices=result[0], faces=result[1])
+                print(f"[Brain] Decimation complete. New face count: {len(math_mesh.faces)}")
+            except Exception as e:
+                print(f"[Brain] Decimation skipped: {e}")
+        else:
+            if params.skip_decimation:
+                print(f"\n[Brain] WARNING: Decimation skipped by user. Processing {len(math_mesh.faces)} raw faces.")
+            print(f"[Brain] Feeding faces into CoACD...")
+
+        print(f"[Brain] CoACD parameters: max_hulls={params.max_hulls}, threshold={coacd_threshold:.3f}")
         coacd.set_log_level("info")
+        coacd_mesh = coacd.Mesh(math_mesh.vertices, math_mesh.faces)
         
-        coacd_mesh = coacd.Mesh(state.mesh.vertices, state.mesh.faces)
-        parts = coacd.run_coacd(coacd_mesh, max_convex_hull=params.max_hulls)
+        parts = coacd.run_coacd(coacd_mesh, max_convex_hull=params.max_hulls, threshold=coacd_threshold)
         
         serialized_hulls = []
         for vertices, faces in parts:
@@ -129,7 +141,9 @@ def generate_hulls(params: HullParams):
                 "faces": np.array(faces).tolist()
             })
             
+        print(f"[Brain] CoACD finished. Generated {len(serialized_hulls)} precise hulls.\n")
         return {"hulls": serialized_hulls}
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"CoACD failed: {str(e)}")
 

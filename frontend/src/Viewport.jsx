@@ -5,29 +5,22 @@ import { useLoader } from '@react-three/fiber';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader';
 import * as THREE from 'three';
 
-// Custom component to dynamically render a single Convex Hull returned from Python
 function HullMesh({ vertices, faces, centerOffset, material }) {
   const geometry = useMemo(() => {
     const geo = new THREE.BufferGeometry();
-    
-    // Flatten the Python nested arrays into 1D TypedArrays for WebGL
     const verts = new Float32Array(vertices.flat());
     const indices = new Uint32Array(faces.flat());
-    
     geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
     geo.setIndex(new THREE.BufferAttribute(indices, 1));
     geo.computeVertexNormals();
-    
-    // Offset the hull so it aligns perfectly with our locally centered ghost mesh
     geo.translate(-centerOffset.x, -centerOffset.y, -centerOffset.z);
-    
     return geo;
   }, [vertices, faces, centerOffset]);
 
   return <mesh geometry={geometry} material={material} />;
 }
 
-function GhostModel({ url, symmetry, onAnalyze, hullsData }) {
+function GhostModel({ url, symmetry, onAnalyze, hullsData, showMesh, showHulls }) {
   const obj = useLoader(OBJLoader, url);
   const cursorGroupRef = useRef(); 
   const cursorRef = useRef();
@@ -78,9 +71,8 @@ function GhostModel({ url, symmetry, onAnalyze, hullsData }) {
     return { meshes: extracted, cursorRadius: calculatedRadius, centerOffset: center };
   }, [obj]);
 
-  // Unified Material for all Auto-Block Hulls
   const hullMaterial = useMemo(() => new THREE.MeshStandardMaterial({
-    color: "#3b82f6", // tailwind blue-500
+    color: "#3b82f6", 
     transparent: true,
     opacity: 0.6,
     roughness: 0.4,
@@ -139,52 +131,58 @@ function GhostModel({ url, symmetry, onAnalyze, hullsData }) {
 
   return (
     <group ref={cursorGroupRef}>
-      {/* Base Interactive Mesh Group */}
+      
+      {/* BASE GROUP */}
       <group>
-        {meshes.map((mesh, index) => (
+        {/* Render Ghost Mesh conditionally */}
+        {showMesh && meshes.map((mesh, index) => (
           <mesh key={`base-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onClick={handleClick}>
-            <meshStandardMaterial color="#cccccc" transparent opacity={0.5} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
+            <meshStandardMaterial color="#cccccc" transparent opacity={0.4} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
             <Edges raycast={() => null} threshold={15} color="#18181b" />
           </mesh>
         ))}
-        {/* Render Base Hulls */}
-        {hullsData && hullsData.map((hull, idx) => (
+        {/* Render Hulls conditionally */}
+        {showHulls && hullsData && hullsData.map((hull, idx) => (
           <HullMesh key={`base-hull-${idx}`} vertices={hull.vertices} faces={hull.faces} centerOffset={centerOffset} material={hullMaterial} />
         ))}
       </group>
 
-      {/* Mirrored Mesh Instances */}
+      {/* MIRRORED GROUPS */}
       {activeScales.map((scale, groupIndex) => (
         <group key={`mirror-group-${groupIndex}`} scale={scale}>
-          {meshes.map((mesh, index) => (
+          {showMesh && meshes.map((mesh, index) => (
             <mesh key={`mirror-${groupIndex}-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale}>
-              <meshStandardMaterial color="#cccccc" transparent opacity={0.5} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
+              <meshStandardMaterial color="#cccccc" transparent opacity={0.4} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
               <Edges raycast={() => null} threshold={15} color="#18181b" />
             </mesh>
           ))}
-          {/* Render Mirrored Hulls */}
-          {hullsData && hullsData.map((hull, idx) => (
+          {showHulls && hullsData && hullsData.map((hull, idx) => (
              <HullMesh key={`mirror-hull-${groupIndex}-${idx}`} vertices={hull.vertices} faces={hull.faces} centerOffset={centerOffset} material={hullMaterial} />
           ))}
         </group>
       ))}
 
-      <mesh ref={cursorRef} visible={false} renderOrder={1}>
-        <sphereGeometry args={[cursorRadius, 16, 16]} />
-        <meshBasicMaterial color="#ffffff" depthTest={false} /> 
-      </mesh>
+      {/* Cursors (only show if mesh is visible to interact with) */}
+      {showMesh && (
+        <>
+          <mesh ref={cursorRef} visible={false} renderOrder={1}>
+            <sphereGeometry args={[cursorRadius, 16, 16]} />
+            <meshBasicMaterial color="#ffffff" depthTest={false} /> 
+          </mesh>
 
-      {activeScales.map((_, i) => (
-        <mesh key={`cursor-${i}`} ref={(el) => (mirroredCursorRefs.current[i] = el)} visible={false} renderOrder={1}>
-          <sphereGeometry args={[cursorRadius, 16, 16]} />
-          <meshBasicMaterial color="#ef4444" depthTest={false} />
-        </mesh>
-      ))}
+          {activeScales.map((_, i) => (
+            <mesh key={`cursor-${i}`} ref={(el) => (mirroredCursorRefs.current[i] = el)} visible={false} renderOrder={1}>
+              <sphereGeometry args={[cursorRadius, 16, 16]} />
+              <meshBasicMaterial color="#ef4444" depthTest={false} />
+            </mesh>
+          ))}
+        </>
+      )}
     </group>
   );
 }
 
-export default function Viewport({ objUrl, symmetry, onAnalyze, hullsData }) {
+export default function Viewport({ objUrl, symmetry, onAnalyze, hullsData, showMesh, showHulls }) {
   return (
     <Canvas camera={{ position: [5, 5, 5], fov: 45 }} gl={{ antialias: true }}>
       <color attach="background" args={['#18181b']} />
@@ -197,7 +195,7 @@ export default function Viewport({ objUrl, symmetry, onAnalyze, hullsData }) {
         {objUrl && (
           <>
             <Bounds fit clip observe margin={1.2}>
-              <GhostModel url={objUrl} symmetry={symmetry} onAnalyze={onAnalyze} hullsData={hullsData} />
+              <GhostModel url={objUrl} symmetry={symmetry} onAnalyze={onAnalyze} hullsData={hullsData} showMesh={showMesh} showHulls={showHulls} />
             </Bounds>
             {symmetry.x && <mesh rotation={[0, Math.PI / 2, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#ef4444" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
             {symmetry.y && <mesh rotation={[-Math.PI / 2, 0, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#22c55e" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
