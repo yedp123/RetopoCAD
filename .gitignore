@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Large Mesh files
+*.obj
+*.stl
