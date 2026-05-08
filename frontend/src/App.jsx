@@ -137,6 +137,55 @@ export default function App() {
     event.target.value = ''; 
   };
 
+  // --- NEW: Local Save & Load ---
+  const handleSaveProject = () => {
+    const projectData = {
+      hullsData,
+      features: currentFeatures,
+      settings: { activeMode, maxHulls, mergeTolerance, decimationTarget, skipDecimation, minFeatureSize, symmetry }
+    };
+    const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = "RetopoCAD_Session.json";
+    a.click();
+    URL.revokeObjectURL(url);
+    setConsoleLogs(prev => [...prev, `[System] Session saved locally.`]);
+  };
+
+  const handleLoadProject = (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (data.hullsData) setHullsData(data.hullsData);
+        if (data.features) {
+          setFeaturesHistory([data.features]);
+          setHistoryIndex(0);
+        }
+        if (data.settings) {
+          if (data.settings.activeMode) setActiveMode(data.settings.activeMode);
+          if (data.settings.maxHulls) setMaxHulls(data.settings.maxHulls);
+          if (data.settings.mergeTolerance) setMergeTolerance(data.settings.mergeTolerance);
+          if (data.settings.decimationTarget) setDecimationTarget(data.settings.decimationTarget);
+          if (data.settings.skipDecimation !== undefined) setSkipDecimation(data.settings.skipDecimation);
+          if (data.settings.minFeatureSize) setMinFeatureSize(data.settings.minFeatureSize);
+          if (data.settings.symmetry) setSymmetry(data.settings.symmetry);
+        }
+        setConsoleLogs(prev => [...prev, `[Success] Session loaded perfectly.`]);
+      } catch (err) {
+        setConsoleLogs(prev => [...prev, `[Error] Invalid session file.`]);
+      }
+    };
+    reader.readAsText(file);
+    event.target.value = '';
+  };
+  // ------------------------------
+
   const handleModeChange = (mode) => {
     setActiveMode(mode);
     if (mode === 'organic') {
@@ -215,19 +264,15 @@ export default function App() {
   return (
     <div className="absolute inset-0 flex overflow-hidden bg-zinc-900 text-zinc-100 font-sans">
       
-      {/* ULTRA COMPACT SIDEBAR (No scrolling needed!) */}
       <div className="w-64 bg-zinc-950 border-r border-zinc-800 flex flex-col z-10 shrink-0">
         
-        {/* Header */}
-        <div className="p-3 border-b border-zinc-800 flex items-center justify-between">
+        <div className="p-3 border-b border-zinc-800 flex items-center justify-between shrink-0">
           <h1 className="text-lg font-bold tracking-wider text-white">RetopoCAD</h1>
           {isUploading && <div className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></div>}
         </div>
 
-        {/* Dense Content wrapper */}
-        <div className="flex flex-col gap-3 p-3 flex-1 overflow-hidden">
+        <div className="flex flex-col gap-3 p-3 flex-1 overflow-y-auto custom-scrollbar">
           
-          {/* Import Panel */}
           <div className="bg-zinc-900 border border-zinc-800 rounded p-2 flex flex-col gap-2">
             <div className="flex justify-between items-center">
               <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Import Mesh</span>
@@ -237,9 +282,19 @@ export default function App() {
               </label>
             </div>
             {objUrl && <span className="text-[9px] font-mono text-emerald-400 leading-tight block truncate">{backendStatus}</span>}
+
+            {/* Local Save/Load Session buttons */}
+            <div className="flex gap-1.5 mt-1 pt-2 border-t border-zinc-800">
+              <button onClick={handleSaveProject} disabled={!objUrl} className="flex-1 py-1 rounded text-[9px] font-bold uppercase tracking-wider bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed border border-zinc-700">
+                Save Session
+              </button>
+              <label className={`flex-1 flex items-center justify-center py-1 rounded text-[9px] font-bold uppercase tracking-wider bg-zinc-800 text-zinc-300 transition-colors border border-zinc-700 ${!objUrl ? 'opacity-50 cursor-not-allowed' : 'hover:bg-zinc-700 hover:text-white cursor-pointer'}`}>
+                Load Session
+                <input type="file" accept=".json" onChange={handleLoadProject} disabled={!objUrl} className="hidden" />
+              </label>
+            </div>
           </div>
 
-          {/* Smart Curve Tooling */}
           {objUrl && (
              <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
                 <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Curves Extraction</span>
@@ -259,7 +314,6 @@ export default function App() {
              </div>
           )}
 
-          {/* Auto-Blocker */}
           {objUrl && (
              <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
                 <div className="flex justify-between items-center mb-0.5">
@@ -298,7 +352,6 @@ export default function App() {
              </div>
           )}
 
-          {/* Export Section pinned to bottom of flex area */}
           {objUrl && (
              <div className="mt-auto pt-2 border-t border-zinc-800">
                 <button onClick={handleExportSTEP} disabled={isExporting} className={`w-full py-2.5 rounded text-[11px] font-bold uppercase tracking-widest transition-all flex items-center justify-center gap-2 ${isExporting ? 'bg-emerald-900 text-emerald-400 cursor-wait' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-lg shadow-emerald-900/20'}`}>
@@ -310,7 +363,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* Main Content Area (Viewport + Console) */}
       <div className="flex-1 flex flex-col relative bg-zinc-900">
         
         <div className="flex-1 relative overflow-hidden">
@@ -329,7 +381,6 @@ export default function App() {
             showHulls={showHulls} 
           />
 
-          {/* FLOATING UI: Surface Info Tooltip */}
           {analysisTooltip && (
              <div 
                 style={{ left: Math.min(analysisTooltip.x + 15, window.innerWidth - 250), top: Math.min(analysisTooltip.y + 15, window.innerHeight - 150) }} 
@@ -364,7 +415,6 @@ export default function App() {
              </div>
           )}
 
-          {/* Floating UI: Top Left Rendering Toggles & Nested Opacity Slider */}
           <div className="absolute top-4 left-4 flex flex-col gap-1.5 z-10 items-start">
             <div className="flex gap-2">
               <button onClick={() => setShowMesh(!showMesh)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showMesh ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
@@ -391,7 +441,6 @@ export default function App() {
             )}
           </div>
 
-          {/* Floating UI: Vertical Tools Toolbar (Middle Left) */}
           <div className="absolute top-1/2 left-4 -translate-y-1/2 flex flex-col gap-2 z-10 bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-lg shadow-2xl p-2">
             
             <button title="Surface Info" onClick={() => setActiveTool('analyze')} className={`p-2.5 rounded-md transition-all ${activeTool === 'analyze' ? 'bg-blue-600 text-white shadow-md' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`}>
@@ -419,7 +468,6 @@ export default function App() {
 
           </div>
 
-          {/* Floating UI: Symmetry Tools */}
           <div className="absolute top-4 right-4 bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-md shadow-2xl p-2 w-40 z-10 flex flex-col gap-1.5">
             <span className="text-[9px] font-bold text-zinc-400 uppercase tracking-widest border-b border-zinc-800/50 pb-1.5 mb-0.5 text-center">Mirror Planes</span>
             <CompactSymmetryToggle label="X (YZ)" active={symmetry.x} onClick={() => toggleSymmetry('x')} colorClass="bg-red-500" />
@@ -428,7 +476,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Bottom Console Panel */}
         <div className="h-28 bg-[#0a0a0c] border-t border-zinc-800 shrink-0 flex flex-col shadow-[inset_0_4px_6px_rgba(0,0,0,0.5)]">
           <div className="flex items-center justify-between px-3 py-1 bg-zinc-900 border-b border-zinc-800">
             <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 flex items-center gap-2">

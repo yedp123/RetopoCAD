@@ -368,12 +368,13 @@ def generate_hulls(params: HullParams):
 async def export_step(payload: dict):
     try:
         import build123d as b3d
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
     except ImportError:
-        raise HTTPException(status_code=500, detail="Missing build123d. Run: pip install build123d")
+        raise HTTPException(status_code=500, detail="Missing build123d or OCP. Run: pip install build123d")
         
     shapes = []
     
-    # 1. Convert Hull Meshes to Solid BREP Bodies
+    # 1. Convert Hull Meshes to Solid BREP Bodies (Robust Sewing Logic)
     hulls = payload.get("hulls", [])
     for hull in hulls:
         try:
@@ -381,24 +382,39 @@ async def export_step(payload: dict):
             faces = []
             for f in hull["faces"]:
                 poly_pts = [pts[i] for i in f]
-                poly_pts.append(poly_pts[0]) # explicitly close the wire
-                wire = b3d.Wire.make_polygon(poly_pts)
-                faces.append(b3d.Face(wire))
+                if len(poly_pts) >= 3:
+                    poly_pts.append(poly_pts[0]) # explicitly close the wire loop
+                    wire = b3d.Wire.make_polygon(poly_pts)
+                    faces.append(b3d.Face(wire))
             
-            try:
-                shell = b3d.Shell.make_shell(faces)
-                solid = b3d.Solid.make_solid(shell)
-                shapes.append(solid)
-            except Exception as e_solid:
-                print(f"[Export Warning] Solid failed, falling back to shell: {e_solid}")
+            # Use OpenCASCADE Sewing API to forcefully stitch microscopic gaps together!
+            sewer = BRepBuilderAPI_Sewing()
+            sewer.SetTolerance(1e-2) # 0.01 tolerance bridges floating point inaccuracies
+            for face in faces:
+                sewer.Add(face.wrapped)
+            sewer.Perform()
+            sewed_shape = sewer.SewedShape()
+            
+            # Try to cast the perfectly stitched shell back into a solid body
+            sewed_b3d = b3d.Shape(sewed_shape)
+            
+            if isinstance(sewed_b3d, b3d.Shell):
                 try:
-                    shell = b3d.Shell.make_shell(faces)
-                    shapes.append(shell)
-                except Exception as e_shell:
-                    shapes.extend(faces)
-                    
+                    shapes.append(b3d.Solid.make_solid(sewed_b3d))
+                except:
+                    shapes.append(sewed_b3d) # Fallback to a clean shell if solid fails
+            elif isinstance(sewed_b3d, b3d.Compound):
+                # Sometimes sewing returns multiple distinct shells
+                for shell in sewed_b3d.shells():
+                    try:
+                        shapes.append(b3d.Solid.make_solid(shell))
+                    except:
+                        shapes.append(shell)
+            else:
+                shapes.append(sewed_b3d)
+
         except Exception as e:
-            print(f"[Export Warning] Failed to process a hull: {e}")
+            print(f"[Export Warning] Failed to sew/process a hull: {e}")
             
     # 2. Convert Extracted Curves to 1D Wire/Edge Sketches
     features = payload.get("features", [])
@@ -424,16 +440,13 @@ async def export_step(payload: dict):
     fd, path = tempfile.mkstemp(suffix=".step")
     os.close(fd)
     
-    # FIX: Bulletproof build123d API handling
+    # Safe compound builder for build123d API
     try:
         try:
-            # Modern Build123d syntax
             comp = b3d.Compound(children=shapes)
         except Exception:
-            # Older Build123d syntax
             comp = b3d.Compound(shapes)
             
-        # Export logic handles varying versions of build123d
         if hasattr(comp, 'export_step'):
             comp.export_step(path)
         elif hasattr(b3d, 'export_step'):
