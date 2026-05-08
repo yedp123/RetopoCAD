@@ -1,4 +1,4 @@
-import React, { Suspense, useEffect, useRef, useMemo } from 'react';
+import React, { Suspense, useEffect, useRef, useMemo, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Bounds, Edges, Grid } from '@react-three/drei';
 import { useLoader } from '@react-three/fiber';
@@ -20,7 +20,82 @@ function HullMesh({ vertices, faces, centerOffset, material }) {
   return <mesh geometry={geometry} material={material} />;
 }
 
-function GhostModel({ url, symmetry, onAnalyze, hullsData, showMesh, showHulls }) {
+function CircleCurve({ feature, centerOffset, activeTool, onDelete }) {
+  const [hovered, setHovered] = useState(false);
+  const { id, center, normal, radius } = feature;
+
+  const points = useMemo(() => {
+    const pts = [];
+    for (let i = 0; i <= 64; i++) {
+      const theta = (i / 64) * Math.PI * 2;
+      pts.push(new THREE.Vector3(Math.cos(theta) * radius, Math.sin(theta) * radius, 0));
+    }
+    return pts;
+  }, [radius]);
+
+  const geometry = useMemo(() => new THREE.BufferGeometry().setFromPoints(points), [points]);
+  
+  const quaternion = useMemo(() => {
+    const up = new THREE.Vector3(0, 0, 1);
+    const n = new THREE.Vector3(...normal).normalize();
+    return new THREE.Quaternion().setFromUnitVectors(up, n);
+  }, [normal]);
+
+  const pos = new THREE.Vector3(...center).sub(centerOffset);
+  const isDeleteMode = activeTool === 'delete';
+  const color = isDeleteMode && hovered ? '#ef4444' : '#10b981';
+
+  return (
+    <line 
+      geometry={geometry} 
+      position={pos} 
+      quaternion={quaternion}
+      onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
+      onPointerOut={() => setHovered(false)}
+      onClick={(e) => {
+        if (isDeleteMode) {
+          e.stopPropagation();
+          onDelete(id);
+        }
+      }}
+    >
+      <lineBasicMaterial color={color} linewidth={hovered ? 3 : 2} depthTest={false} />
+    </line>
+  );
+}
+
+function PlanarCurve({ feature, centerOffset, activeTool, onDelete }) {
+  const [hovered, setHovered] = useState(false);
+  const { id, points } = feature;
+
+  const geometry = useMemo(() => {
+    const pts = points.map(p => new THREE.Vector3(...p).sub(centerOffset));
+    if (pts.length > 0) pts.push(pts[0].clone()); 
+    return new THREE.BufferGeometry().setFromPoints(pts);
+  }, [points, centerOffset]);
+
+  const isDeleteMode = activeTool === 'delete';
+  const color = isDeleteMode && hovered ? '#ef4444' : '#10b981';
+
+  return (
+    <line 
+      geometry={geometry}
+      onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
+      onPointerOut={() => setHovered(false)}
+      onClick={(e) => {
+        if (isDeleteMode) {
+          e.stopPropagation();
+          onDelete(id);
+        }
+      }}
+    >
+      <lineBasicMaterial color={color} linewidth={hovered ? 3 : 2} depthTest={false} />
+    </line>
+  );
+}
+
+
+function GhostModel({ url, symmetry, activeTool, onAnalyze, onFeatureExtracted, onFeatureDelete, extractedFeatures, hullsData, showMesh, showHulls }) {
   const obj = useLoader(OBJLoader, url);
   const cursorGroupRef = useRef(); 
   const cursorRef = useRef();
@@ -81,6 +156,8 @@ function GhostModel({ url, symmetry, onAnalyze, hullsData, showMesh, showHulls }
 
   const handlePointerMove = (e) => {
     e.stopPropagation(); 
+    if (activeTool === 'delete') return;
+
     if (cursorRef.current && cursorGroupRef.current) {
       const worldPoint = e.point.clone();
       const localPoint = cursorGroupRef.current.worldToLocal(worldPoint);
@@ -107,47 +184,57 @@ function GhostModel({ url, symmetry, onAnalyze, hullsData, showMesh, showHulls }
 
   const handleClick = async (e) => {
     e.stopPropagation(); 
-    if (!cursorGroupRef.current) return;
+    if (!cursorGroupRef.current || activeTool === 'delete') return;
 
     const worldPoint = e.point.clone();
     const localPoint = cursorGroupRef.current.worldToLocal(worldPoint);
     const rawPoint = localPoint.clone().add(centerOffset);
 
-    try {
-      const res = await fetch('http://localhost:8000/analyze-surface', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ x: rawPoint.x, y: rawPoint.y, z: rawPoint.z })
-      });
-      
-      if (res.ok) {
-        const data = await res.json();
-        if (onAnalyze) onAnalyze(data);
-      }
-    } catch (err) {
-      console.error("Failed to reach Python backend", err);
+    if (activeTool === 'analyze') {
+      try {
+        const res = await fetch(`http://localhost:8000/analyze-surface`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ x: rawPoint.x, y: rawPoint.y, z: rawPoint.z })
+        });
+        if (res.ok) onAnalyze(await res.json());
+      } catch (err) { console.error(err); }
+    } 
+    else if (activeTool === 'extract') {
+      try {
+        const res = await fetch(`http://localhost:8000/extract-feature`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ x: rawPoint.x, y: rawPoint.y, z: rawPoint.z })
+        });
+        if (res.ok) onFeatureExtracted(await res.json());
+      } catch (err) { console.error(err); }
     }
   };
+
+  const mainCursorColor = activeTool === 'extract' ? "#10b981" : "#3b82f6";
 
   return (
     <group ref={cursorGroupRef}>
       
-      {/* BASE GROUP */}
       <group>
-        {/* Render Ghost Mesh conditionally */}
         {showMesh && meshes.map((mesh, index) => (
           <mesh key={`base-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onClick={handleClick}>
             <meshStandardMaterial color="#cccccc" transparent opacity={0.4} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
             <Edges raycast={() => null} threshold={15} color="#18181b" />
           </mesh>
         ))}
-        {/* Render Hulls conditionally */}
         {showHulls && hullsData && hullsData.map((hull, idx) => (
           <HullMesh key={`base-hull-${idx}`} vertices={hull.vertices} faces={hull.faces} centerOffset={centerOffset} material={hullMaterial} />
         ))}
+        
+        {extractedFeatures.map((feat) => (
+          feat.type === 'circle' 
+            ? <CircleCurve key={feat.id} feature={feat} centerOffset={centerOffset} activeTool={activeTool} onDelete={onFeatureDelete} />
+            : <PlanarCurve key={feat.id} feature={feat} centerOffset={centerOffset} activeTool={activeTool} onDelete={onFeatureDelete} />
+        ))}
       </group>
 
-      {/* MIRRORED GROUPS */}
       {activeScales.map((scale, groupIndex) => (
         <group key={`mirror-group-${groupIndex}`} scale={scale}>
           {showMesh && meshes.map((mesh, index) => (
@@ -159,15 +246,20 @@ function GhostModel({ url, symmetry, onAnalyze, hullsData, showMesh, showHulls }
           {showHulls && hullsData && hullsData.map((hull, idx) => (
              <HullMesh key={`mirror-hull-${groupIndex}-${idx}`} vertices={hull.vertices} faces={hull.faces} centerOffset={centerOffset} material={hullMaterial} />
           ))}
+          
+          {extractedFeatures.map((feat) => (
+             feat.type === 'circle' 
+              ? <CircleCurve key={`mirror-circ-${groupIndex}-${feat.id}`} feature={feat} centerOffset={centerOffset} activeTool={activeTool} onDelete={onFeatureDelete} />
+              : <PlanarCurve key={`mirror-plan-${groupIndex}-${feat.id}`} feature={feat} centerOffset={centerOffset} activeTool={activeTool} onDelete={onFeatureDelete} />
+          ))}
         </group>
       ))}
 
-      {/* Cursors (only show if mesh is visible to interact with) */}
-      {showMesh && (
+      {showMesh && activeTool !== 'delete' && (
         <>
           <mesh ref={cursorRef} visible={false} renderOrder={1}>
             <sphereGeometry args={[cursorRadius, 16, 16]} />
-            <meshBasicMaterial color="#ffffff" depthTest={false} /> 
+            <meshBasicMaterial color={mainCursorColor} depthTest={false} /> 
           </mesh>
 
           {activeScales.map((_, i) => (
@@ -182,9 +274,9 @@ function GhostModel({ url, symmetry, onAnalyze, hullsData, showMesh, showHulls }
   );
 }
 
-export default function Viewport({ objUrl, symmetry, onAnalyze, hullsData, showMesh, showHulls }) {
+export default function Viewport({ objUrl, symmetry, activeTool, onAnalyze, onFeatureExtracted, onFeatureDelete, extractedFeatures, hullsData, showMesh, showHulls }) {
   return (
-    <Canvas camera={{ position: [5, 5, 5], fov: 45 }} gl={{ antialias: true }}>
+    <Canvas camera={{ position: [5, 5, 5], fov: 45 }} gl={{ antialias: true }} raycaster={{ params: { Line: { threshold: 0.2 } } }}>
       <color attach="background" args={['#18181b']} />
       <ambientLight intensity={0.4} />
       <hemisphereLight skyColor="#ffffff" groundColor="#444444" intensity={0.6} />
@@ -194,8 +286,19 @@ export default function Viewport({ objUrl, symmetry, onAnalyze, hullsData, showM
       <Suspense fallback={null}>
         {objUrl && (
           <>
-            <Bounds fit clip observe margin={1.2}>
-              <GhostModel url={objUrl} symmetry={symmetry} onAnalyze={onAnalyze} hullsData={hullsData} showMesh={showMesh} showHulls={showHulls} />
+            <Bounds fit clip margin={1.2}>
+              <GhostModel 
+                url={objUrl} 
+                symmetry={symmetry} 
+                activeTool={activeTool}
+                onAnalyze={onAnalyze} 
+                onFeatureExtracted={onFeatureExtracted}
+                onFeatureDelete={onFeatureDelete}
+                extractedFeatures={extractedFeatures}
+                hullsData={hullsData} 
+                showMesh={showMesh} 
+                showHulls={showHulls} 
+              />
             </Bounds>
             {symmetry.x && <mesh rotation={[0, Math.PI / 2, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#ef4444" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
             {symmetry.y && <mesh rotation={[-Math.PI / 2, 0, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#22c55e" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
