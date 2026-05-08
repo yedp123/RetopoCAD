@@ -51,5 +51,3 @@ In a separate terminal, navigate to your frontend directory:
 
 npm install  
 npm run dev
-
-*Developed by Yann.*
