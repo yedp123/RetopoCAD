@@ -4,6 +4,9 @@ import numpy as np
 import io
 import tempfile
 import os
+import sys
+import subprocess
+import pickle
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,8 +24,16 @@ app.add_middleware(
 
 class AppState:
     mesh = None
+    live_logs = []
 
 state = AppState()
+
+# Helper to broadcast logs to the React UI
+def broadcast_log(msg: str):
+    print(msg)
+    state.live_logs.append(msg)
+    if len(state.live_logs) > 30:
+        state.live_logs.pop(0)
 
 class Point3D(BaseModel):
     x: float
@@ -43,14 +54,22 @@ class HullParams(BaseModel):
     decimation_target: int
     skip_decimation: bool = False
 
+@app.get("/api/logs")
+async def get_logs():
+    return {"logs": state.live_logs}
+
 @app.post("/upload-mesh")
 async def upload_mesh(file: UploadFile = File(...)):
     try:
+        state.live_logs = [] # Clear logs on new upload
+        broadcast_log(f"[System] Receiving {file.filename}...")
         contents = await file.read()
         mesh = trimesh.load(io.BytesIO(contents), file_type='obj', force='mesh')
         state.mesh = mesh
+        broadcast_log(f"[Success] Python parsed mesh. Faces: {len(mesh.faces):,}")
         return {"message": "Mesh successfully loaded", "faces": len(mesh.faces)}
     except Exception as e:
+        broadcast_log(f"[Error] Failed to load mesh: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to load mesh: {str(e)}")
 
 @app.post("/analyze-surface")
@@ -230,6 +249,7 @@ def auto_extract(params: AutoExtractParams):
     mesh = state.mesh
     extracted_features = []
     
+    broadcast_log(f"[System] Isolating panels > {params.min_size} units...")
     smooth_edges = mesh.face_adjacency[mesh.face_adjacency_angles < 0.5]
     components = trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces)))
     
@@ -318,7 +338,7 @@ def auto_extract(params: AutoExtractParams):
                 except:
                     pass
                     
-    print(f"[Brain] Auto-Extract complete. Found {len(extracted_features)} valid features.\n")
+    broadcast_log(f"[Success] Auto-Extract complete. Found {len(extracted_features)} valid features.")
     return {"features": extracted_features}
 
 
@@ -328,29 +348,90 @@ def generate_hulls(params: HullParams):
         raise HTTPException(status_code=400, detail="No mesh loaded.")
     
     try:
-        import coacd
-    except ImportError:
-        raise HTTPException(status_code=500, detail="coacd module not found.")
-
-    try:
         math_mesh = state.mesh
         coacd_threshold = 0.01 + (params.threshold_pct / 100.0) * 0.14
 
         if not params.skip_decimation and len(math_mesh.faces) > params.decimation_target:
+            broadcast_log(f"[System] Decimating mesh down to {params.decimation_target:,} faces...")
             try:
                 import fast_simplification
                 result = fast_simplification.simplify(
                     math_mesh.vertices, math_mesh.faces, target_count=params.decimation_target
                 )
                 math_mesh = trimesh.Trimesh(vertices=result[0], faces=result[1])
+                broadcast_log(f"[Success] Decimation complete. (Actual: {len(math_mesh.faces):,} faces)")
             except Exception as e:
-                pass
+                broadcast_log(f"[Warning] Decimation skipped: {e}")
 
-        coacd.set_log_level("info")
-        coacd_mesh = coacd.Mesh(math_mesh.vertices, math_mesh.faces)
+        broadcast_log("[System] Launching CoACD Subprocess to capture C++ logs...")
         
-        parts = coacd.run_coacd(coacd_mesh, max_convex_hull=params.max_hulls, threshold=coacd_threshold)
+        # 1. Export decimated mesh to temporary file
+        fd_obj, obj_path = tempfile.mkstemp(suffix=".obj")
+        os.close(fd_obj)
+        math_mesh.export(obj_path)
         
+        fd_out, out_path = tempfile.mkstemp(suffix=".pkl")
+        os.close(fd_out)
+        
+        # 2. Write a temporary Python worker script that runs CoACD
+        safe_obj_path = obj_path.replace('\\', '/')
+        safe_out_path = out_path.replace('\\', '/')
+        
+        worker_script = f"""
+import coacd
+import trimesh
+import pickle
+
+if __name__ == '__main__':
+    mesh = trimesh.load('{safe_obj_path}', process=False, force='mesh')
+    coacd.set_log_level('info')
+    c_mesh = coacd.Mesh(mesh.vertices, mesh.faces)
+    parts = coacd.run_coacd(c_mesh, max_convex_hull={params.max_hulls}, threshold={coacd_threshold})
+    
+    with open('{safe_out_path}', 'wb') as f:
+        pickle.dump(parts, f)
+"""
+        fd_script, script_path = tempfile.mkstemp(suffix=".py")
+        with open(script_path, 'w') as f:
+            f.write(worker_script)
+        os.close(fd_script)
+        
+        # 3. Execute worker as an isolated OS Subprocess to intercept stdout
+        process = subprocess.Popen(
+            [sys.executable, script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        
+        # 4. Stream the raw output back to React in real-time
+        for line in process.stdout:
+            msg = line.strip()
+            if msg:
+                # Clean up the prefix so it looks beautiful in the console
+                if "[CoACD] [info]" in msg:
+                    msg = msg.split("[CoACD] [info]")[-1].strip()
+                broadcast_log(f"[CoACD] {msg}")
+                
+        process.wait()
+        
+        if process.returncode != 0:
+            raise Exception(f"CoACD Subprocess crashed with code {process.returncode}")
+            
+        # 5. Load the generated parts back into the API
+        with open(out_path, 'rb') as f:
+            parts = pickle.load(f)
+            
+        # 6. Cleanup temporary files
+        try:
+            os.remove(obj_path)
+            os.remove(out_path)
+            os.remove(script_path)
+        except Exception:
+            pass
+        
+        # Format the hulls for React
         serialized_hulls = []
         for vertices, faces in parts:
             serialized_hulls.append({
@@ -358,9 +439,11 @@ def generate_hulls(params: HullParams):
                 "faces": np.array(faces).tolist()
             })
             
+        broadcast_log(f"[Success] C++ Kernel Finished! Generated {len(serialized_hulls)} blocks.")
         return {"hulls": serialized_hulls}
         
     except Exception as e:
+        broadcast_log(f"[Error] CoACD failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"CoACD failed: {str(e)}")
 
 
@@ -369,55 +452,76 @@ async def export_step(payload: dict):
     try:
         import build123d as b3d
         from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Missing build123d or OCP. Run: pip install build123d")
+    except ImportError as e:
+        raise HTTPException(status_code=500, detail=f"Import Error: {str(e)}. Try deleting your .venv folder and recreating it.")
         
     shapes = []
+    merge_hulls = payload.get("merge_hulls", False)
     
-    # 1. Convert Hull Meshes to Solid BREP Bodies (Robust Sewing Logic)
     hulls = payload.get("hulls", [])
-    for hull in hulls:
+    hull_solids = []
+    
+    if hulls:
+        broadcast_log(f"[System] Stitching {len(hulls)} triangulated hulls into Solid Bodies...")
+        
+    for idx, hull in enumerate(hulls):
         try:
             pts = [b3d.Vector(v) for v in hull["vertices"]]
             faces = []
             for f in hull["faces"]:
                 poly_pts = [pts[i] for i in f]
                 if len(poly_pts) >= 3:
-                    poly_pts.append(poly_pts[0]) # explicitly close the wire loop
+                    poly_pts.append(poly_pts[0]) 
                     wire = b3d.Wire.make_polygon(poly_pts)
                     faces.append(b3d.Face(wire))
             
-            # Use OpenCASCADE Sewing API to forcefully stitch microscopic gaps together!
-            sewer = BRepBuilderAPI_Sewing()
-            sewer.SetTolerance(1e-2) # 0.01 tolerance bridges floating point inaccuracies
-            for face in faces:
-                sewer.Add(face.wrapped)
-            sewer.Perform()
-            sewed_shape = sewer.SewedShape()
-            
-            # Try to cast the perfectly stitched shell back into a solid body
-            sewed_b3d = b3d.Shape(sewed_shape)
+            try:
+                sewer = BRepBuilderAPI_Sewing()
+                sewer.SetTolerance(1e-2)
+                for face in faces:
+                    sewer.Add(face.wrapped)
+                sewer.Perform()
+                sewed_shape = sewer.SewedShape()
+                sewed_b3d = b3d.Shape(sewed_shape)
+            except Exception:
+                sewed_b3d = b3d.Shell.make_shell(faces)
             
             if isinstance(sewed_b3d, b3d.Shell):
                 try:
-                    shapes.append(b3d.Solid.make_solid(sewed_b3d))
+                    hull_solids.append(b3d.Solid.make_solid(sewed_b3d))
                 except:
-                    shapes.append(sewed_b3d) # Fallback to a clean shell if solid fails
+                    hull_solids.append(sewed_b3d)
             elif isinstance(sewed_b3d, b3d.Compound):
-                # Sometimes sewing returns multiple distinct shells
                 for shell in sewed_b3d.shells():
                     try:
-                        shapes.append(b3d.Solid.make_solid(shell))
+                        hull_solids.append(b3d.Solid.make_solid(shell))
                     except:
-                        shapes.append(shell)
+                        hull_solids.append(shell)
             else:
-                shapes.append(sewed_b3d)
+                hull_solids.append(sewed_b3d)
 
         except Exception as e:
-            print(f"[Export Warning] Failed to sew/process a hull: {e}")
+            broadcast_log(f"[Warning] Failed to process hull #{idx}: {e}")
             
-    # 2. Convert Extracted Curves to 1D Wire/Edge Sketches
+    if merge_hulls and len(hull_solids) > 1:
+        broadcast_log("[System] Melting intersecting solids via Boolean Union...")
+        try:
+            fused_shape = hull_solids[0]
+            for next_shape in hull_solids[1:]:
+                fused_shape = fused_shape.fuse(next_shape)
+                
+            shapes.append(fused_shape)
+            broadcast_log("[Success] Solids cleanly merged!")
+        except Exception as e:
+            broadcast_log(f"[Warning] Boolean Union hit a zero-thickness error. Falling back to separate blocks.")
+            shapes.extend(hull_solids) 
+    else:
+        shapes.extend(hull_solids)
+            
     features = payload.get("features", [])
+    if features:
+        broadcast_log(f"[System] Compiling {len(features)} CAD sketches...")
+        
     for feat in features:
         try:
             if feat["type"] == "circle":
@@ -432,15 +536,16 @@ async def export_step(payload: dict):
                     pts.append(pts[0])
                 shapes.append(b3d.Wire.make_polygon(pts))
         except Exception as e:
-            print(f"[Export Warning] Failed to build a curve feature: {e}")
+            broadcast_log(f"[Warning] Failed to build a sketch feature: {e}")
             
     if not shapes:
+        broadcast_log("[Error] No geometry found to export.")
         raise HTTPException(status_code=400, detail="No geometry found to export.")
         
+    broadcast_log("[System] Writing STEP file to disk...")
     fd, path = tempfile.mkstemp(suffix=".step")
     os.close(fd)
     
-    # Safe compound builder for build123d API
     try:
         try:
             comp = b3d.Compound(children=shapes)
@@ -456,9 +561,10 @@ async def export_step(payload: dict):
             exporters3d.export_step(comp, path)
             
     except Exception as export_error:
-        print(f"[Export Error Fatal] {export_error}")
+        broadcast_log(f"[Error] Fatal OpenCASCADE crash: {export_error}")
         raise HTTPException(status_code=500, detail=f"Failed during STEP compilation: {str(export_error)}")
     
+    broadcast_log("[Success] STEP translation complete! Initiating download.")
     return FileResponse(path, media_type="application/octet-stream", filename="RetopoCAD_Export.step")
 
 if __name__ == "__main__":

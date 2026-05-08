@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import Viewport from './Viewport';
 
 function CompactSymmetryToggle({ label, active, onClick, colorClass }) {
@@ -17,6 +17,7 @@ export default function App() {
   const [backendStatus, setBackendStatus] = useState("Waiting for mesh...");
   const [isUploading, setIsUploading] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [mergeExportHulls, setMergeExportHulls] = useState(true);
   
   const [analysisTooltip, setAnalysisTooltip] = useState(null);
   
@@ -46,7 +47,36 @@ export default function App() {
   const [meshOpacity, setMeshOpacity] = useState(0.4);
   const [showHulls, setShowHulls] = useState(true);
   
-  const [consoleLogs, setConsoleLogs] = useState(["System initialized. Ready for operations..."]);
+  // LIVE POLLING SYSTEM FOR CONSOLE
+  const [serverLogs, setServerLogs] = useState(["System initialized. Ready for operations..."]);
+  const consoleEndRef = useRef(null);
+
+  useEffect(() => {
+    const pollLogs = async () => {
+      try {
+        const res = await fetch('http://localhost:8000/api/logs');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.logs && data.logs.length > 0) {
+            setServerLogs(data.logs);
+          }
+        }
+      } catch (err) {
+        // Silently fail if server isn't running yet
+      }
+    };
+    
+    const interval = setInterval(pollLogs, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Auto-scroll console to bottom when logs update
+  useEffect(() => {
+    if (consoleEndRef.current) {
+      consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [serverLogs]);
+
 
   const currentFeatures = featuresHistory[historyIndex];
 
@@ -63,26 +93,21 @@ export default function App() {
   const handleFeatureExtracted = (featureData) => {
     const newFeature = { ...featureData, id: Math.random().toString(36).substr(2, 9) };
     commitFeatures([...currentFeatures, newFeature]);
-    setConsoleLogs(prev => [...prev, `[CAD] Extracted ${featureData.type} curve.`]);
   };
 
   const handleFeatureDelete = (id) => {
     if (activeTool !== 'delete') return;
     const filtered = currentFeatures.filter(f => f.id !== id);
     commitFeatures(filtered);
-    setConsoleLogs(prev => [...prev, `[CAD] Curve deleted.`]);
   };
 
   const handleClearAllFeatures = () => {
     if (currentFeatures.length === 0) return;
     commitFeatures([]);
-    setConsoleLogs(prev => [...prev, `[System] Cleared all extracted curves.`]);
   };
 
   const handleAutoExtract = async () => {
     setIsAutoExtracting(true);
-    setConsoleLogs(prev => [...prev, `[System] Scanning entire mesh for curves > ${minFeatureSize} units...`]);
-    
     try {
       const res = await fetch('http://localhost:8000/auto-extract', {
         method: 'POST',
@@ -94,12 +119,9 @@ export default function App() {
       if (res.ok) {
         const newFeatures = data.features.map(f => ({ ...f, id: Math.random().toString(36).substr(2, 9) }));
         commitFeatures([...currentFeatures, ...newFeatures]);
-        setConsoleLogs(prev => [...prev, `[Success] Auto-extracted ${newFeatures.length} curves from mesh!`]);
-      } else {
-        setConsoleLogs(prev => [...prev, `[Error] Auto-extract failed.`]);
       }
     } catch (err) {
-      setConsoleLogs(prev => [...prev, `[Error] Could not connect to Python backend.`]);
+      console.error(err);
     }
     setIsAutoExtracting(false);
   };
@@ -119,14 +141,12 @@ export default function App() {
     formData.append('file', file);
     setIsUploading(true);
     setBackendStatus("Syncing with Python Brain...");
-    setConsoleLogs(prev => [...prev, `[System] Uploading ${file.name}...`]);
 
     try {
       const res = await fetch('http://localhost:8000/upload-mesh', { method: 'POST', body: formData });
       const data = await res.json();
       if (res.ok) {
         setBackendStatus(`Loaded: ${data.faces.toLocaleString()} faces`);
-        setConsoleLogs(prev => [...prev, `[Success] Mesh loaded. Faces: ${data.faces.toLocaleString()}`]);
       } else {
         setBackendStatus(`Error: ${data.detail}`);
       }
@@ -137,12 +157,11 @@ export default function App() {
     event.target.value = ''; 
   };
 
-  // --- NEW: Local Save & Load ---
   const handleSaveProject = () => {
     const projectData = {
       hullsData,
       features: currentFeatures,
-      settings: { activeMode, maxHulls, mergeTolerance, decimationTarget, skipDecimation, minFeatureSize, symmetry }
+      settings: { activeMode, maxHulls, mergeTolerance, decimationTarget, skipDecimation, minFeatureSize, symmetry, mergeExportHulls }
     };
     const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -151,7 +170,6 @@ export default function App() {
     a.download = "RetopoCAD_Session.json";
     a.click();
     URL.revokeObjectURL(url);
-    setConsoleLogs(prev => [...prev, `[System] Session saved locally.`]);
   };
 
   const handleLoadProject = (event) => {
@@ -175,16 +193,15 @@ export default function App() {
           if (data.settings.skipDecimation !== undefined) setSkipDecimation(data.settings.skipDecimation);
           if (data.settings.minFeatureSize) setMinFeatureSize(data.settings.minFeatureSize);
           if (data.settings.symmetry) setSymmetry(data.settings.symmetry);
+          if (data.settings.mergeExportHulls !== undefined) setMergeExportHulls(data.settings.mergeExportHulls);
         }
-        setConsoleLogs(prev => [...prev, `[Success] Session loaded perfectly.`]);
       } catch (err) {
-        setConsoleLogs(prev => [...prev, `[Error] Invalid session file.`]);
+        console.error(err);
       }
     };
     reader.readAsText(file);
     event.target.value = '';
   };
-  // ------------------------------
 
   const handleModeChange = (mode) => {
     setActiveMode(mode);
@@ -197,7 +214,6 @@ export default function App() {
 
   const handleGenerateHulls = async () => {
     setIsGeneratingHulls(true);
-    setConsoleLogs(prev => [...prev, `[CoACD] Initiating hull generation...`]);
     setGenerationTimer(0);
     const startTime = Date.now();
     timerIntervalRef.current = setInterval(() => setGenerationTimer(((Date.now() - startTime) / 1000).toFixed(1)), 100);
@@ -210,35 +226,26 @@ export default function App() {
       });
       const data = await res.json();
       clearInterval(timerIntervalRef.current);
-      const finalTime = ((Date.now() - startTime) / 1000).toFixed(1);
 
       if (res.ok) {
         setHullsData(data.hulls);
-        setConsoleLogs(prev => [...prev, `[Success] Generated ${data.hulls.length} volumetric hulls in ${finalTime}s.`]);
-      } else {
-        setConsoleLogs(prev => [...prev, `[Error] Generation failed.`]);
       }
     } catch (err) {
       clearInterval(timerIntervalRef.current);
-      alert("Failed to connect to backend");
     }
     setIsGeneratingHulls(false);
   };
 
   const handleExportSTEP = async () => {
-    if (!hullsData && currentFeatures.length === 0) {
-        setConsoleLogs(prev => [...prev, `[Warning] Nothing to export! Generate hulls or extract curves first.`]);
-        return;
-    }
+    if (!hullsData && currentFeatures.length === 0) return;
 
     setIsExporting(true);
-    setConsoleLogs(prev => [...prev, `[System] Sending geometry to OpenCASCADE for STEP translation...`]);
 
     try {
       const res = await fetch('http://localhost:8000/export-step', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hulls: hullsData || [], features: currentFeatures })
+        body: JSON.stringify({ hulls: hullsData || [], features: currentFeatures, merge_hulls: mergeExportHulls })
       });
       
       if (res.ok) {
@@ -250,13 +257,9 @@ export default function App() {
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
-        setConsoleLogs(prev => [...prev, `[Success] STEP file successfully downloaded!`]);
-      } else {
-        const err = await res.json();
-        setConsoleLogs(prev => [...prev, `[Error] Export failed: ${err.detail}`]);
       }
     } catch (err) {
-      setConsoleLogs(prev => [...prev, `[Error] Could not connect to Python backend for export.`]);
+      console.error(err);
     }
     setIsExporting(false);
   };
@@ -283,7 +286,6 @@ export default function App() {
             </div>
             {objUrl && <span className="text-[9px] font-mono text-emerald-400 leading-tight block truncate">{backendStatus}</span>}
 
-            {/* Local Save/Load Session buttons */}
             <div className="flex gap-1.5 mt-1 pt-2 border-t border-zinc-800">
               <button onClick={handleSaveProject} disabled={!objUrl} className="flex-1 py-1 rounded text-[9px] font-bold uppercase tracking-wider bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed border border-zinc-700">
                 Save Session
@@ -353,7 +355,11 @@ export default function App() {
           )}
 
           {objUrl && (
-             <div className="mt-auto pt-2 border-t border-zinc-800">
+             <div className="mt-auto pt-2 border-t border-zinc-800 flex flex-col gap-2">
+                <div className="flex items-center gap-2 px-1">
+                  <input type="checkbox" id="mergeHulls" checked={mergeExportHulls} onChange={(e) => setMergeExportHulls(e.target.checked)} disabled={isExporting} className="accent-emerald-500 w-3 h-3 rounded bg-zinc-800 border-zinc-700" />
+                  <label htmlFor="mergeHulls" className="text-[10px] text-zinc-300 uppercase tracking-wide cursor-pointer select-none">Merge Hulls (Boolean)</label>
+                </div>
                 <button onClick={handleExportSTEP} disabled={isExporting} className={`w-full py-2.5 rounded text-[11px] font-bold uppercase tracking-widest transition-all flex items-center justify-center gap-2 ${isExporting ? 'bg-emerald-900 text-emerald-400 cursor-wait' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-lg shadow-emerald-900/20'}`}>
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
                   {isExporting ? 'Building STEP...' : 'Export STEP'}
@@ -483,12 +489,13 @@ export default function App() {
               Output Console
             </span>
           </div>
-          <div className="flex-1 p-2 overflow-y-auto custom-scrollbar font-mono text-[11px] text-zinc-400 leading-relaxed flex flex-col justify-end">
-            {consoleLogs.slice(-15).map((log, i) => (
+          <div className="flex-1 p-2 overflow-y-auto custom-scrollbar font-mono text-[11px] text-zinc-400 leading-relaxed flex flex-col justify-start">
+            {serverLogs.map((log, i) => (
               <div key={i} className={log.includes('[Error]') ? 'text-red-400' : log.includes('[Success]') || log.includes('[CAD]') ? 'text-emerald-400' : log.includes('[Warning]') ? 'text-yellow-400' : ''}>
                 <span className="opacity-30 select-none mr-2">{'>'}</span>{log}
               </div>
             ))}
+            <div ref={consoleEndRef} />
           </div>
         </div>
 
