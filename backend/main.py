@@ -50,7 +50,7 @@ class AutoExtractParams(BaseModel):
 
 class HullParams(BaseModel):
     max_hulls: int
-    threshold_pct: float
+    detail_level: float
     decimation_target: int
     skip_decimation: bool = False
 
@@ -61,7 +61,7 @@ async def get_logs():
 @app.post("/upload-mesh")
 async def upload_mesh(file: UploadFile = File(...)):
     try:
-        state.live_logs = [] # Clear logs on new upload
+        state.live_logs = [] 
         broadcast_log(f"[System] Receiving {file.filename}...")
         contents = await file.read()
         mesh = trimesh.load(io.BytesIO(contents), file_type='obj', force='mesh')
@@ -348,8 +348,15 @@ def generate_hulls(params: HullParams):
         raise HTTPException(status_code=400, detail="No mesh loaded.")
     
     try:
+        import coacd
+    except ImportError:
+        broadcast_log("[Error] Missing coacd library. Run: pip install coacd")
+        raise HTTPException(status_code=500, detail="coacd module not found.")
+
+    try:
         math_mesh = state.mesh
-        coacd_threshold = 0.01 + (params.threshold_pct / 100.0) * 0.14
+        # INVERTED MATH: 100 Detail = 0.01 threshold (sharp), 0 Detail = 0.16 threshold (potato)
+        coacd_threshold = 0.01 + ((100.0 - params.detail_level) / 100.0) * 0.15
 
         if not params.skip_decimation and len(math_mesh.faces) > params.decimation_target:
             broadcast_log(f"[System] Decimating mesh down to {params.decimation_target:,} faces...")
@@ -365,27 +372,29 @@ def generate_hulls(params: HullParams):
 
         broadcast_log("[System] Launching CoACD Subprocess to capture C++ logs...")
         
-        # 1. Export decimated mesh to temporary file
-        fd_obj, obj_path = tempfile.mkstemp(suffix=".obj")
-        os.close(fd_obj)
-        math_mesh.export(obj_path)
+        # 1. Use high-precision binary Pickle instead of .obj to prevent geometry shattering!
+        fd_in, in_path = tempfile.mkstemp(suffix=".pkl")
+        os.close(fd_in)
+        with open(in_path, 'wb') as f:
+            pickle.dump({'vertices': math_mesh.vertices, 'faces': math_mesh.faces}, f)
         
         fd_out, out_path = tempfile.mkstemp(suffix=".pkl")
         os.close(fd_out)
         
-        # 2. Write a temporary Python worker script that runs CoACD
-        safe_obj_path = obj_path.replace('\\', '/')
+        safe_in_path = in_path.replace('\\', '/')
         safe_out_path = out_path.replace('\\', '/')
         
+        # 2. Write a temporary Python worker script
         worker_script = f"""
 import coacd
-import trimesh
 import pickle
 
 if __name__ == '__main__':
-    mesh = trimesh.load('{safe_obj_path}', process=False, force='mesh')
+    with open('{safe_in_path}', 'rb') as f:
+        data = pickle.load(f)
+        
     coacd.set_log_level('info')
-    c_mesh = coacd.Mesh(mesh.vertices, mesh.faces)
+    c_mesh = coacd.Mesh(data['vertices'], data['faces'])
     parts = coacd.run_coacd(c_mesh, max_convex_hull={params.max_hulls}, threshold={coacd_threshold})
     
     with open('{safe_out_path}', 'wb') as f:
@@ -409,7 +418,6 @@ if __name__ == '__main__':
         for line in process.stdout:
             msg = line.strip()
             if msg:
-                # Clean up the prefix so it looks beautiful in the console
                 if "[CoACD] [info]" in msg:
                     msg = msg.split("[CoACD] [info]")[-1].strip()
                 broadcast_log(f"[CoACD] {msg}")
@@ -419,19 +427,18 @@ if __name__ == '__main__':
         if process.returncode != 0:
             raise Exception(f"CoACD Subprocess crashed with code {process.returncode}")
             
-        # 5. Load the generated parts back into the API
+        # 5. Load the perfectly preserved parts back into the API
         with open(out_path, 'rb') as f:
             parts = pickle.load(f)
             
         # 6. Cleanup temporary files
         try:
-            os.remove(obj_path)
+            os.remove(in_path)
             os.remove(out_path)
             os.remove(script_path)
         except Exception:
             pass
         
-        # Format the hulls for React
         serialized_hulls = []
         for vertices, faces in parts:
             serialized_hulls.append({
@@ -439,7 +446,7 @@ if __name__ == '__main__':
                 "faces": np.array(faces).tolist()
             })
             
-        broadcast_log(f"[Success] C++ Kernel Finished! Generated {len(serialized_hulls)} blocks.")
+        broadcast_log(f"[Success] C++ Kernel Finished! Generated {len(serialized_hulls)} clean blocks.")
         return {"hulls": serialized_hulls}
         
     except Exception as e:

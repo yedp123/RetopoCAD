@@ -27,8 +27,8 @@ export default function App() {
   
   const [hullsData, setHullsData] = useState(null);
   const [activeMode, setActiveMode] = useState('hard-surface');
-  const [maxHulls, setMaxHulls] = useState(50);
-  const [mergeTolerance, setMergeTolerance] = useState(5);
+  const [maxHulls, setMaxHulls] = useState(200);
+  const [detailLevel, setDetailLevel] = useState(85);
   const [decimationTarget, setDecimationTarget] = useState(15000);
   const [skipDecimation, setSkipDecimation] = useState(false);
 
@@ -161,7 +161,7 @@ export default function App() {
     const projectData = {
       hullsData,
       features: currentFeatures,
-      settings: { activeMode, maxHulls, mergeTolerance, decimationTarget, skipDecimation, minFeatureSize, symmetry, mergeExportHulls }
+      settings: { activeMode, maxHulls, detailLevel, decimationTarget, skipDecimation, minFeatureSize, symmetry, mergeExportHulls }
     };
     const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -188,7 +188,7 @@ export default function App() {
         if (data.settings) {
           if (data.settings.activeMode) setActiveMode(data.settings.activeMode);
           if (data.settings.maxHulls) setMaxHulls(data.settings.maxHulls);
-          if (data.settings.mergeTolerance) setMergeTolerance(data.settings.mergeTolerance);
+          if (data.settings.detailLevel) setDetailLevel(data.settings.detailLevel);
           if (data.settings.decimationTarget) setDecimationTarget(data.settings.decimationTarget);
           if (data.settings.skipDecimation !== undefined) setSkipDecimation(data.settings.skipDecimation);
           if (data.settings.minFeatureSize) setMinFeatureSize(data.settings.minFeatureSize);
@@ -206,9 +206,9 @@ export default function App() {
   const handleModeChange = (mode) => {
     setActiveMode(mode);
     if (mode === 'organic') {
-      setMaxHulls(15); setMergeTolerance(30); setDecimationTarget(4000); setSkipDecimation(false);
+      setMaxHulls(50); setDetailLevel(40); setDecimationTarget(4000); setSkipDecimation(false);
     } else {
-      setMaxHulls(50); setMergeTolerance(5); setDecimationTarget(15000); setSkipDecimation(false);
+      setMaxHulls(250); setDetailLevel(85); setDecimationTarget(15000); setSkipDecimation(false);
     }
   };
 
@@ -222,7 +222,7 @@ export default function App() {
       const res = await fetch('http://localhost:8000/generate-hulls', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ max_hulls: maxHulls, threshold_pct: mergeTolerance, decimation_target: decimationTarget, skip_decimation: skipDecimation })
+        body: JSON.stringify({ max_hulls: maxHulls, detail_level: detailLevel, decimation_target: decimationTarget, skip_decimation: skipDecimation })
       });
       const data = await res.json();
       clearInterval(timerIntervalRef.current);
@@ -329,16 +329,16 @@ export default function App() {
                 
                 <div className="flex items-center gap-2">
                   <span className="text-[10px] w-14 text-zinc-400">Blocks</span>
-                  <input type="range" min="1" max="100" value={maxHulls} onChange={(e) => setMaxHulls(parseInt(e.target.value))} disabled={isGeneratingHulls} className="flex-1 accent-indigo-500 h-1" />
+                  <input type="range" min="1" max="500" value={maxHulls} onChange={(e) => setMaxHulls(parseInt(e.target.value))} disabled={isGeneratingHulls} className="flex-1 accent-indigo-500 h-1" />
                   <span className="text-[10px] text-indigo-400 w-8 text-right font-mono">{maxHulls}</span>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="text-[10px] w-14 text-zinc-400">Merge</span>
-                  <input type="range" min="1" max="100" value={mergeTolerance} onChange={(e) => setMergeTolerance(parseInt(e.target.value))} disabled={isGeneratingHulls} className="flex-1 accent-indigo-500 h-1" />
-                  <span className="text-[10px] text-indigo-400 w-8 text-right font-mono">{mergeTolerance}%</span>
+                  <span className="text-[10px] w-14 text-zinc-400">Detail</span>
+                  <input type="range" min="1" max="100" value={detailLevel} onChange={(e) => setDetailLevel(parseInt(e.target.value))} disabled={isGeneratingHulls} className="flex-1 accent-indigo-500 h-1" />
+                  <span className="text-[10px] text-indigo-400 w-8 text-right font-mono">{detailLevel}%</span>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="text-[10px] w-14 text-zinc-400">Detail</span>
+                  <span className="text-[10px] w-14 text-zinc-400">Resol.</span>
                   <input type="range" min="1000" max="30000" step="1000" value={decimationTarget} onChange={(e) => setDecimationTarget(parseInt(e.target.value))} disabled={isGeneratingHulls || skipDecimation} className={`flex-1 accent-indigo-500 h-1 ${skipDecimation ? 'opacity-50 grayscale' : ''}`} />
                   <span className={`text-[10px] text-indigo-400 w-8 text-right font-mono ${skipDecimation ? 'line-through opacity-50' : ''}`}>{decimationTarget/1000}k</span>
                 </div>
