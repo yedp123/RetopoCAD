@@ -27,7 +27,7 @@ export default function App() {
   
   const [hullsData, setHullsData] = useState(null);
   const [activeMode, setActiveMode] = useState('hard-surface');
-  const [maxHulls, setMaxHulls] = useState(200);
+  const [maxHulls, setMaxHulls] = useState(250);
   const [detailLevel, setDetailLevel] = useState(85);
   const [decimationTarget, setDecimationTarget] = useState(15000);
   const [skipDecimation, setSkipDecimation] = useState(false);
@@ -70,7 +70,6 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Auto-scroll console to bottom when logs update
   useEffect(() => {
     if (consoleEndRef.current) {
       consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
@@ -266,11 +265,23 @@ export default function App() {
 
   return (
     <div className="absolute inset-0 flex overflow-hidden bg-zinc-900 text-zinc-100 font-sans">
+      <style>{`
+        /* Hide spin buttons on numeric inputs for a cleaner CAD UI */
+        input[type=number]::-webkit-inner-spin-button, 
+        input[type=number]::-webkit-outer-spin-button { 
+          -webkit-appearance: none; 
+          margin: 0; 
+        }
+        input[type=number] {
+          -moz-appearance: textfield;
+        }
+      `}</style>
       
-      <div className="w-64 bg-zinc-950 border-r border-zinc-800 flex flex-col z-10 shrink-0">
+      {/* INCREASED SIDEBAR WIDTH from w-64 to w-72 (288px) so the logo and labels fit easily */}
+      <div className="w-72 bg-zinc-950 border-r border-zinc-800 flex flex-col z-10 shrink-0">
         
-        <div className="p-3 border-b border-zinc-800 flex items-center justify-between shrink-0">
-          <h1 className="text-lg font-bold tracking-wider text-white">RetopoCAD</h1>
+        <div className="p-4 border-b border-zinc-800 flex items-center justify-between shrink-0">
+          <h1 className="text-xl font-black tracking-wider text-white">RetopoCAD</h1>
           {isUploading && <div className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></div>}
         </div>
 
@@ -303,7 +314,7 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <span className="text-[10px] w-14 text-zinc-400">Min Size</span>
                   <input type="range" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value))} disabled={isAutoExtracting} className="flex-1 accent-emerald-500 h-1" />
-                  <span className="text-[10px] text-emerald-400 w-8 text-right font-mono">{minFeatureSize}</span>
+                  <input type="number" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value) || 0)} disabled={isAutoExtracting} className="text-[10px] text-emerald-400 w-10 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-emerald-500" />
                 </div>
                 <div className="flex gap-1.5 mt-0.5">
                   <button onClick={handleAutoExtract} disabled={isAutoExtracting} className="flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white border border-emerald-600/50 transition-colors">
@@ -330,17 +341,20 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <span className="text-[10px] w-14 text-zinc-400">Blocks</span>
                   <input type="range" min="1" max="500" value={maxHulls} onChange={(e) => setMaxHulls(parseInt(e.target.value))} disabled={isGeneratingHulls} className="flex-1 accent-indigo-500 h-1" />
-                  <span className="text-[10px] text-indigo-400 w-8 text-right font-mono">{maxHulls}</span>
+                  <input type="number" min="1" max="500" value={maxHulls} onChange={(e) => setMaxHulls(parseInt(e.target.value) || 0)} disabled={isGeneratingHulls} className="text-[10px] text-indigo-400 w-10 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-indigo-500" />
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-[10px] w-14 text-zinc-400">Detail</span>
                   <input type="range" min="1" max="100" value={detailLevel} onChange={(e) => setDetailLevel(parseInt(e.target.value))} disabled={isGeneratingHulls} className="flex-1 accent-indigo-500 h-1" />
-                  <span className="text-[10px] text-indigo-400 w-8 text-right font-mono">{detailLevel}%</span>
+                  <div className="flex items-center bg-zinc-950 border border-zinc-700 rounded px-1 focus-within:border-indigo-500 w-12 justify-end transition-colors">
+                    <input type="number" min="1" max="100" value={detailLevel} onChange={(e) => setDetailLevel(parseInt(e.target.value) || 0)} disabled={isGeneratingHulls} className="text-[10px] text-indigo-400 w-full text-right font-mono bg-transparent outline-none" />
+                    <span className="text-[10px] text-indigo-400 ml-0.5">%</span>
+                  </div>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-[10px] w-14 text-zinc-400">Resol.</span>
                   <input type="range" min="1000" max="30000" step="1000" value={decimationTarget} onChange={(e) => setDecimationTarget(parseInt(e.target.value))} disabled={isGeneratingHulls || skipDecimation} className={`flex-1 accent-indigo-500 h-1 ${skipDecimation ? 'opacity-50 grayscale' : ''}`} />
-                  <span className={`text-[10px] text-indigo-400 w-8 text-right font-mono ${skipDecimation ? 'line-through opacity-50' : ''}`}>{decimationTarget/1000}k</span>
+                  <input type="number" min="1000" max="100000" step="1000" value={decimationTarget} onChange={(e) => setDecimationTarget(parseInt(e.target.value) || 0)} disabled={isGeneratingHulls || skipDecimation} className={`text-[10px] text-indigo-400 w-14 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-indigo-500 ${skipDecimation ? 'line-through opacity-50' : ''}`} />
                 </div>
 
                 <div className="flex items-center gap-2 mt-1">
@@ -443,6 +457,7 @@ export default function App() {
               <div className="flex items-center gap-3 px-3 py-1.5 bg-zinc-900/80 border border-zinc-800 rounded-md shadow-lg backdrop-blur-md">
                 <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wide">Opacity</span>
                 <input type="range" min="0" max="1" step="0.05" value={meshOpacity} onChange={(e) => setMeshOpacity(parseFloat(e.target.value))} className="w-24 accent-zinc-300 h-1" />
+                <input type="number" min="0" max="1" step="0.05" value={meshOpacity} onChange={(e) => setMeshOpacity(parseFloat(e.target.value) || 0)} className="text-[10px] text-zinc-300 w-10 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-zinc-500" />
               </div>
             )}
           </div>

@@ -7,6 +7,7 @@ import os
 import sys
 import subprocess
 import pickle
+import traceback
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -355,8 +356,9 @@ def generate_hulls(params: HullParams):
 
     try:
         math_mesh = state.mesh
-        # INVERTED MATH: 100 Detail = 0.01 threshold (sharp), 0 Detail = 0.16 threshold (potato)
-        coacd_threshold = 0.01 + ((100.0 - params.detail_level) / 100.0) * 0.15
+        # Kept the fast, optimized math variables
+        coacd_threshold = 0.008 + ((100.0 - params.detail_level) / 100.0) * 0.15
+        prep_res = int(30 + (params.detail_level / 100.0) * 50)
 
         if not params.skip_decimation and len(math_mesh.faces) > params.decimation_target:
             broadcast_log(f"[System] Decimating mesh down to {params.decimation_target:,} faces...")
@@ -372,11 +374,14 @@ def generate_hulls(params: HullParams):
 
         broadcast_log("[System] Launching CoACD Subprocess to capture C++ logs...")
         
-        # 1. Use high-precision binary Pickle instead of .obj to prevent geometry shattering!
         fd_in, in_path = tempfile.mkstemp(suffix=".pkl")
         os.close(fd_in)
         with open(in_path, 'wb') as f:
-            pickle.dump({'vertices': math_mesh.vertices, 'faces': math_mesh.faces}, f)
+            # Kept the contiguous memory array fix so the blocks don't shatter
+            pickle.dump({
+                'vertices': np.ascontiguousarray(math_mesh.vertices, dtype=np.float64), 
+                'faces': np.ascontiguousarray(math_mesh.faces, dtype=np.int32)
+            }, f)
         
         fd_out, out_path = tempfile.mkstemp(suffix=".pkl")
         os.close(fd_out)
@@ -384,18 +389,27 @@ def generate_hulls(params: HullParams):
         safe_in_path = in_path.replace('\\', '/')
         safe_out_path = out_path.replace('\\', '/')
         
-        # 2. Write a temporary Python worker script
         worker_script = f"""
 import coacd
 import pickle
+import numpy as np
 
 if __name__ == '__main__':
     with open('{safe_in_path}', 'rb') as f:
         data = pickle.load(f)
         
     coacd.set_log_level('info')
-    c_mesh = coacd.Mesh(data['vertices'], data['faces'])
-    parts = coacd.run_coacd(c_mesh, max_convex_hull={params.max_hulls}, threshold={coacd_threshold})
+    v = np.ascontiguousarray(data['vertices'], dtype=np.float64)
+    f = np.ascontiguousarray(data['faces'], dtype=np.int32)
+    
+    c_mesh = coacd.Mesh(v, f)
+    parts = coacd.run_coacd(
+        c_mesh, 
+        max_convex_hull={params.max_hulls}, 
+        threshold={coacd_threshold},
+        preprocess_resolution={prep_res},
+        mcts_iterations=100
+    )
     
     with open('{safe_out_path}', 'wb') as f:
         pickle.dump(parts, f)
@@ -405,7 +419,6 @@ if __name__ == '__main__':
             f.write(worker_script)
         os.close(fd_script)
         
-        # 3. Execute worker as an isolated OS Subprocess to intercept stdout
         process = subprocess.Popen(
             [sys.executable, script_path],
             stdout=subprocess.PIPE,
@@ -414,7 +427,6 @@ if __name__ == '__main__':
             bufsize=1
         )
         
-        # 4. Stream the raw output back to React in real-time
         for line in process.stdout:
             msg = line.strip()
             if msg:
@@ -427,11 +439,9 @@ if __name__ == '__main__':
         if process.returncode != 0:
             raise Exception(f"CoACD Subprocess crashed with code {process.returncode}")
             
-        # 5. Load the perfectly preserved parts back into the API
         with open(out_path, 'rb') as f:
             parts = pickle.load(f)
             
-        # 6. Cleanup temporary files
         try:
             os.remove(in_path)
             os.remove(out_path)
@@ -456,6 +466,7 @@ if __name__ == '__main__':
 
 @app.post("/export-step")
 async def export_step(payload: dict):
+    # REVERTED: Back to the exactly stable exporter from the uploaded file!
     try:
         import build123d as b3d
         from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
