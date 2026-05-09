@@ -25,11 +25,12 @@ app.add_middleware(
 
 class AppState:
     mesh = None
+    components = None
     live_logs = []
+    rebuild_geometry = [] # Unified stack for analytical Solids and Sheets
 
 state = AppState()
 
-# Helper to broadcast logs to the React UI
 def broadcast_log(msg: str):
     print(msg)
     state.live_logs.append(msg)
@@ -55,6 +56,16 @@ class HullParams(BaseModel):
     decimation_target: int
     skip_decimation: bool = False
 
+class CommitGeometryParams(BaseModel):
+    operation: str
+    loops: list
+    extrude_depth: float = 2.0
+
+class BooleanCutParams(BaseModel):
+    loops: list
+    extrude_depth: float
+    target_index: int
+
 @app.get("/api/logs")
 async def get_logs():
     return {"logs": state.live_logs}
@@ -63,10 +74,19 @@ async def get_logs():
 async def upload_mesh(file: UploadFile = File(...)):
     try:
         state.live_logs = [] 
+        state.rebuild_geometry = [] # Clear history on new upload
         broadcast_log(f"[System] Receiving {file.filename}...")
         contents = await file.read()
         mesh = trimesh.load(io.BytesIO(contents), file_type='obj', force='mesh')
         state.mesh = mesh
+        
+        # PRE-CACHE OPTIMIZATION: Calculate edge graph on upload for instant UI hovering!
+        broadcast_log("[System] Pre-calculating surface adjacency graph...")
+        adjacency = mesh.face_adjacency
+        angles = mesh.face_adjacency_angles
+        smooth_edges = adjacency[angles < 0.5]
+        state.components = trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces)))
+        
         broadcast_log(f"[Success] Python parsed mesh. Faces: {len(mesh.faces):,}")
         return {"message": "Mesh successfully loaded", "faces": len(mesh.faces)}
     except Exception as e:
@@ -86,22 +106,13 @@ async def analyze_surface(point: Point3D):
         raise HTTPException(status_code=404, detail="Could not snap to a face.")
         
     start_face = face_ids[0]
-    adjacency = mesh.face_adjacency
-    angles = mesh.face_adjacency_angles
-    
-    smooth_threshold = 0.5
-    smooth_edges = adjacency[angles < smooth_threshold]
-    
-    components = trimesh.graph.connected_components(
-        edges=smooth_edges, nodes=np.arange(len(mesh.faces))
-    )
-    
     target_region = None
-    for comp in components:
-        if start_face in comp:
-            target_region = comp
-            break
-            
+    if state.components is not None:
+        for comp in state.components:
+            if start_face in comp:
+                target_region = comp
+                break
+                
     if target_region is None or len(target_region) == 0:
         target_region = [start_face] 
 
@@ -125,6 +136,256 @@ async def analyze_surface(point: Point3D):
         except Exception:
             return {"type": "complex_curved", "face_count": len(target_region), "variance": float(variance)}
 
+@app.post("/scout-loop")
+async def scout_loop(params: Point3D):
+    if state.mesh is None or state.components is None:
+        raise HTTPException(status_code=400)
+        
+    try:
+        import networkx as nx
+        mesh = state.mesh
+        target_pt = np.array([[params.x, params.y, params.z]])
+        
+        _, _, face_ids = mesh.nearest.on_surface(target_pt)
+        if len(face_ids) == 0: raise HTTPException(status_code=404)
+        
+        start_face = face_ids[0]
+        target_region = next((comp for comp in state.components if start_face in comp), [start_face])
+        
+        faces = mesh.faces[target_region]
+        edges = trimesh.geometry.faces_to_edges(faces)
+        edges_sorted = np.sort(edges, axis=1)
+        unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
+        boundary_edges = unique_edges[counts == 1]
+        
+        if len(boundary_edges) == 0: raise HTTPException(status_code=400)
+
+        G = nx.Graph()
+        G.add_edges_from(boundary_edges)
+        loops = list(nx.connected_components(G))
+        
+        min_dist = float('inf')
+        best_loop = None
+        best_subgraph = None
+        
+        for loop in loops:
+            loop_verts = mesh.vertices[list(loop)]
+            dist = np.min(np.linalg.norm(loop_verts - target_pt, axis=1))
+            if dist < min_dist:
+                min_dist = dist
+                best_loop = list(loop)
+                best_subgraph = G.subgraph(loop)
+
+        try:
+            cycle = nx.find_cycle(best_subgraph)
+            ordered_nodes = [u for u, v in cycle]
+        except:
+            ordered_nodes = list(nx.dfs_preorder_nodes(best_subgraph))
+            
+        ordered_points = mesh.vertices[ordered_nodes]
+        return {
+            "id": f"scout_{np.random.randint(100000)}",
+            "type": "planar",
+            "points": ordered_points.tolist()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500)
+
+@app.post("/undo-geometry")
+async def undo_geometry():
+    if len(state.rebuild_geometry) > 0:
+        state.rebuild_geometry.pop()
+        broadcast_log("[System] Undo: Restored previous geometry state.")
+        return {"success": True}
+    return {"success": False, "message": "Nothing to undo."}
+
+def apply_pca_firewall(points):
+    """PLANAR FIREWALL: Best-fit plane projection via SVD"""
+    pts = np.array(points)
+    centroid = np.mean(pts, axis=0)
+    _, _, vh = np.linalg.svd(pts - centroid)
+    normal = vh[2, :] # normal vector is the last row of Vh
+    proj_pts = []
+    for p in pts:
+        dist = np.dot(p - centroid, normal)
+        proj_pts.append(p - dist * normal)
+    return proj_pts
+
+@app.post("/create-sheet")
+async def create_sheet(params: CommitGeometryParams):
+    try:
+        import build123d as b3d
+    except ImportError:
+        raise HTTPException(status_code=500, detail="build123d missing")
+
+    broadcast_log(f"[System] Committing SURFACE SHEET to Stack...")
+    
+    if not params.loops or len(params.loops) != 1:
+        raise ValueError("Creating a sheet requires exactly 1 loop.")
+
+    try:
+        # CRITICAL: Always use firewall
+        processed_loop = apply_pca_firewall(params.loops[0]['points'])
+        
+        pts = [b3d.Vector(p) for p in processed_loop]
+        if (pts[0] - pts[-1]).length > 1e-5:
+            pts.append(pts[0])
+            
+        wire = b3d.Wire.make_polygon(pts)
+        sheet_face = b3d.Face(wire)
+
+        # Store in unified backend stack
+        state.rebuild_geometry.append(sheet_face)
+
+        fd, path = tempfile.mkstemp(suffix=".stl")
+        os.close(fd)
+        
+        try:
+            from build123d.exporters3d import export_stl
+            export_stl(sheet_face, path)
+                
+            tmesh = trimesh.load(path, file_type='stl')
+            vertices = tmesh.vertices.tolist()
+            faces_out = tmesh.faces.tolist()
+            
+            broadcast_log(f"[Success] Rebuild Sheet created. Returning {len(faces_out)} faces to viewport.")
+            return {"vertices": vertices, "faces": faces_out}
+        finally:
+            try:
+                os.remove(path)
+            except: pass
+
+    except Exception as e:
+        err_msg = str(e)
+        broadcast_log(f"[Error] Failed to build Surface Sheet: {err_msg}")
+        raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
+
+
+@app.post("/commit-geometry")
+async def commit_geometry(params: CommitGeometryParams):
+    try:
+        import build123d as b3d
+    except ImportError:
+        raise HTTPException(status_code=500, detail="build123d missing")
+
+    broadcast_log(f"[System] Committing {params.operation.upper()} solid to Stack...")
+    try:
+        if not params.loops:
+            raise ValueError("No loops provided.")
+
+        # CRITICAL: Run every loop through the mathematical firewall
+        processed_loops = []
+        for loop_data in params.loops:
+            processed_loops.append(apply_pca_firewall(loop_data['points']))
+
+        # ALIGNMENT: Shift indices to prevent Loft Twisting / Self-Intersections
+        if params.operation == 'loft' and len(processed_loops) == 2:
+            pts1, pts2 = processed_loops[0], processed_loops[1]
+            p0 = np.array(pts1[0])
+            dists = [np.linalg.norm(np.array(p) - p0) for p in pts2]
+            best_idx = np.argmin(dists)
+            processed_loops[1] = pts2[best_idx:] + pts2[:best_idx]
+
+        faces = []
+        for pts_list in processed_loops:
+            pts = [b3d.Vector(p) for p in pts_list]
+            if (pts[0] - pts[-1]).length > 1e-5:
+                pts.append(pts[0])
+            wire = b3d.Wire.make_polygon(pts)
+            faces.append(b3d.Face(wire))
+
+        solid = None
+        if params.operation == 'extrude' and len(faces) == 1:
+            solid = b3d.extrude(faces[0], amount=params.extrude_depth)
+        elif params.operation == 'loft' and len(faces) == 2:
+            solid = b3d.loft(faces)
+        else:
+            raise ValueError("Invalid operation or loop count.")
+
+        state.rebuild_geometry.append(solid)
+
+        # Tessellate solid back to React so it can be previewed
+        fd, path = tempfile.mkstemp(suffix=".stl")
+        os.close(fd)
+        
+        try:
+            if hasattr(solid, 'export_stl'):
+                solid.export_stl(path)
+            else:
+                from build123d.exporters3d import export_stl
+                export_stl(solid, path)
+                
+            tmesh = trimesh.load(path, file_type='stl')
+            vertices = tmesh.vertices.tolist()
+            faces_out = tmesh.faces.tolist()
+            
+            broadcast_log(f"[Success] Rebuild Solid created. Returning {len(faces_out)} faces to viewport.")
+            return {"vertices": vertices, "faces": faces_out}
+        finally:
+            try:
+                os.remove(path)
+            except: pass
+
+    except Exception as e:
+        err_msg = str(e)
+        broadcast_log(f"[Error] Failed to build CAD Solid: {err_msg}")
+        raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
+
+@app.post("/boolean-cut")
+async def boolean_cut(params: BooleanCutParams):
+    try:
+        import build123d as b3d
+    except ImportError:
+        raise HTTPException(status_code=500, detail="build123d missing")
+
+    broadcast_log(f"[System] Committing BOOLEAN CUT to Stack...")
+    try:
+        if not params.loops or params.target_index is None:
+            raise ValueError("Requires 1 loop and 1 target solid.")
+        if params.target_index >= len(state.rebuild_geometry) or params.target_index < 0:
+            raise ValueError("Target solid not found.")
+
+        # CRITICAL: Always firewall before building the tool
+        processed_loop = apply_pca_firewall(params.loops[0]['points'])
+        
+        pts = [b3d.Vector(p) for p in processed_loop]
+        if (pts[0] - pts[-1]).length > 1e-5:
+            pts.append(pts[0])
+        wire = b3d.Wire.make_polygon(pts)
+        face = b3d.Face(wire)
+        
+        tool_extrusion = b3d.extrude(face, amount=params.extrude_depth)
+        target_solid = state.rebuild_geometry[params.target_index]
+        
+        # Perform explicit boolean cut, catching kernel errors with a robust fallback
+        try:
+            result_solid = target_solid - tool_extrusion
+        except Exception:
+            from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+            cut_algo = BRepAlgoAPI_Cut(target_solid.wrapped, tool_extrusion.wrapped)
+            cut_algo.Build()
+            result_solid = b3d.Shape.cast(cut_algo.Shape())
+        
+        # Override the solid in history with the exact cut version
+        state.rebuild_geometry[params.target_index] = result_solid
+
+        # Re-tessellate and return to React
+        fd, path = tempfile.mkstemp(suffix=".stl")
+        os.close(fd)
+        try:
+            from build123d.exporters3d import export_stl
+            export_stl(result_solid, path)
+            tmesh = trimesh.load(path, file_type='stl')
+            broadcast_log(f"[Success] Boolean Cut created. Returning {len(tmesh.faces)} faces.")
+            return {"vertices": tmesh.vertices.tolist(), "faces": tmesh.faces.tolist()}
+        finally:
+            try: os.remove(path)
+            except: pass
+            
+    except Exception as e:
+        broadcast_log(f"[Error] Failed to Boolean Cut: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Geometry Error: {str(e)}")
+
 
 @app.post("/extract-feature")
 async def extract_feature(params: FeatureParams):
@@ -145,10 +406,7 @@ async def extract_feature(params: FeatureParams):
         raise HTTPException(status_code=404, detail="Could not snap to a face.")
         
     start_face = face_ids[0]
-    smooth_edges = mesh.face_adjacency[mesh.face_adjacency_angles < 0.5]
-    components = trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces)))
-    
-    target_region = next((comp for comp in components if start_face in comp), [start_face])
+    target_region = next((comp for comp in state.components if start_face in comp), [start_face])
     region_normals = mesh.face_normals[target_region]
     region_normal = np.mean(region_normals, axis=0)
     
@@ -235,7 +493,6 @@ async def extract_feature(params: FeatureParams):
         except Exception as e:
             raise HTTPException(status_code=500, detail="Failed to trace shape boundary.")
 
-
 @app.post("/auto-extract")
 def auto_extract(params: AutoExtractParams):
     if state.mesh is None:
@@ -251,10 +508,8 @@ def auto_extract(params: AutoExtractParams):
     extracted_features = []
     
     broadcast_log(f"[System] Isolating panels > {params.min_size} units...")
-    smooth_edges = mesh.face_adjacency[mesh.face_adjacency_angles < 0.5]
-    components = trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces)))
     
-    for comp in components:
+    for comp in state.components:
         if len(comp) < 3: 
             continue
             
@@ -342,7 +597,6 @@ def auto_extract(params: AutoExtractParams):
     broadcast_log(f"[Success] Auto-Extract complete. Found {len(extracted_features)} valid features.")
     return {"features": extracted_features}
 
-
 @app.post("/generate-hulls")
 def generate_hulls(params: HullParams):
     if state.mesh is None:
@@ -356,7 +610,6 @@ def generate_hulls(params: HullParams):
 
     try:
         math_mesh = state.mesh
-        # Kept the fast, optimized math variables
         coacd_threshold = 0.008 + ((100.0 - params.detail_level) / 100.0) * 0.15
         prep_res = int(30 + (params.detail_level / 100.0) * 50)
 
@@ -377,7 +630,6 @@ def generate_hulls(params: HullParams):
         fd_in, in_path = tempfile.mkstemp(suffix=".pkl")
         os.close(fd_in)
         with open(in_path, 'wb') as f:
-            # Kept the contiguous memory array fix so the blocks don't shatter
             pickle.dump({
                 'vertices': np.ascontiguousarray(math_mesh.vertices, dtype=np.float64), 
                 'faces': np.ascontiguousarray(math_mesh.faces, dtype=np.int32)
@@ -399,6 +651,7 @@ if __name__ == '__main__':
         data = pickle.load(f)
         
     coacd.set_log_level('info')
+    
     v = np.ascontiguousarray(data['vertices'], dtype=np.float64)
     f = np.ascontiguousarray(data['faces'], dtype=np.int32)
     
@@ -463,44 +716,63 @@ if __name__ == '__main__':
         broadcast_log(f"[Error] CoACD failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"CoACD failed: {str(e)}")
 
-
 @app.post("/export-step")
 async def export_step(payload: dict):
-    # REVERTED: Back to the exactly stable exporter from the uploaded file!
     try:
         import build123d as b3d
-        from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_Transform
+        from OCP.STEPControl import STEPControl_Writer, STEPControl_StepModelType
+        from OCP.gp import gp_Trsf, gp_Ax2, gp_Pnt, gp_Dir
     except ImportError as e:
         raise HTTPException(status_code=500, detail=f"Import Error: {str(e)}. Try deleting your .venv folder and recreating it.")
         
     shapes = []
     merge_hulls = payload.get("merge_hulls", False)
+    symmetry = payload.get("symmetry", {"x": False, "y": False, "z": False})
     
+    # Inject perfectly pure analytical geometry (Solids & Sheets) from unified backend history!
+    for shape in state.rebuild_geometry:
+        shapes.append(shape)
+        
     hulls = payload.get("hulls", [])
     hull_solids = []
     
     if hulls:
-        broadcast_log(f"[System] Stitching {len(hulls)} triangulated hulls into Solid Bodies...")
+        broadcast_log(f"[System] Orienting normals and stitching {len(hulls)} hulls into Solid Bodies...")
         
     for idx, hull in enumerate(hulls):
         try:
-            pts = [b3d.Vector(v) for v in hull["vertices"]]
+            center_pt = np.mean(hull["vertices"], axis=0)
             faces = []
-            for f in hull["faces"]:
-                poly_pts = [pts[i] for i in f]
-                if len(poly_pts) >= 3:
-                    poly_pts.append(poly_pts[0]) 
-                    wire = b3d.Wire.make_polygon(poly_pts)
-                    faces.append(b3d.Face(wire))
             
+            for f in hull["faces"]:
+                if len(f) < 3:
+                    continue
+                
+                v0 = np.array(hull["vertices"][f[0]])
+                v1 = np.array(hull["vertices"][f[1]])
+                v2 = np.array(hull["vertices"][f[2]])
+                normal = np.cross(v1 - v0, v2 - v0)
+                
+                if np.dot(normal, v0 - center_pt) < 0:
+                    f.reverse()
+                    
+                poly_pts = [b3d.Vector(hull["vertices"][i]) for i in f]
+                poly_pts.append(poly_pts[0]) 
+                wire = b3d.Wire.make_polygon(poly_pts)
+                faces.append(b3d.Face(wire))
+            
+            if not faces:
+                continue
+                
             try:
                 sewer = BRepBuilderAPI_Sewing()
-                sewer.SetTolerance(1e-2)
+                sewer.SetTolerance(1e-3) 
                 for face in faces:
                     sewer.Add(face.wrapped)
                 sewer.Perform()
                 sewed_shape = sewer.SewedShape()
-                sewed_b3d = b3d.Shape(sewed_shape)
+                sewed_b3d = b3d.Shape.cast(sewed_shape)
             except Exception:
                 sewed_b3d = b3d.Shell.make_shell(faces)
             
@@ -510,11 +782,14 @@ async def export_step(payload: dict):
                 except:
                     hull_solids.append(sewed_b3d)
             elif isinstance(sewed_b3d, b3d.Compound):
-                for shell in sewed_b3d.shells():
-                    try:
-                        hull_solids.append(b3d.Solid.make_solid(shell))
-                    except:
-                        hull_solids.append(shell)
+                try:
+                    for shell in sewed_b3d.shells():
+                        try:
+                            hull_solids.append(b3d.Solid.make_solid(shell))
+                        except:
+                            hull_solids.append(shell)
+                except:
+                    hull_solids.append(sewed_b3d)
             else:
                 hull_solids.append(sewed_b3d)
 
@@ -524,14 +799,34 @@ async def export_step(payload: dict):
     if merge_hulls and len(hull_solids) > 1:
         broadcast_log("[System] Melting intersecting solids via Boolean Union...")
         try:
-            fused_shape = hull_solids[0]
-            for next_shape in hull_solids[1:]:
-                fused_shape = fused_shape.fuse(next_shape)
+            true_solids = [s for s in hull_solids if isinstance(s, b3d.Solid)]
+            other_shapes = [s for s in hull_solids if not isinstance(s, b3d.Solid)]
+            
+            if len(true_solids) > 1:
+                fused_shape = true_solids[0]
+                unfused_solids = []
                 
-            shapes.append(fused_shape)
-            broadcast_log("[Success] Solids cleanly merged!")
+                for next_shape in true_solids[1:]:
+                    try:
+                        attempt = fused_shape.fuse(next_shape)
+                        if attempt is not None and hasattr(attempt, 'wrapped') and getattr(attempt, 'volume', 0) > 1e-5:
+                            fused_shape = attempt
+                        else:
+                            unfused_solids.append(next_shape)
+                    except Exception:
+                        unfused_solids.append(next_shape)
+                
+                if fused_shape is not None and hasattr(fused_shape, 'wrapped'):
+                    shapes.append(fused_shape)
+                    
+                shapes.extend(unfused_solids)
+                shapes.extend(other_shapes)
+                broadcast_log(f"[Success] Merged blocks. ({len(unfused_solids)} skipped to prevent black-hole bug).")
+            else:
+                shapes.extend(hull_solids)
+                broadcast_log("[Warning] Not enough perfect solids to merge.")
         except Exception as e:
-            broadcast_log(f"[Warning] Boolean Union hit a zero-thickness error. Falling back to separate blocks.")
+            broadcast_log(f"[Warning] Boolean Union failed. Falling back to separate blocks.")
             shapes.extend(hull_solids) 
     else:
         shapes.extend(hull_solids)
@@ -556,31 +851,53 @@ async def export_step(payload: dict):
         except Exception as e:
             broadcast_log(f"[Warning] Failed to build a sketch feature: {e}")
             
-    if not shapes:
-        broadcast_log("[Error] No geometry found to export.")
-        raise HTTPException(status_code=400, detail="No geometry found to export.")
+    shapes = [s for s in shapes if s is not None and hasattr(s, 'wrapped')]
+
+    # SYMMETRY AWARE EXPORT LOGIC - Bulletproof OCP Mirroring
+    if any([symmetry.get('x'), symmetry.get('y'), symmetry.get('z')]):
+        broadcast_log("[System] Applying structural symmetry arrays...")
         
-    broadcast_log("[System] Writing STEP file to disk...")
+        def mirror_shape(shape, axis_dir):
+            trsf = gp_Trsf()
+            trsf.SetMirror(gp_Ax2(gp_Pnt(0,0,0), gp_Dir(*axis_dir)))
+            transformed = BRepBuilderAPI_Transform(shape.wrapped, trsf, True).Shape()
+            return b3d.Shape.cast(transformed)
+
+        final_shapes = []
+        for s in shapes:
+            final_shapes.append(s)
+
+        try:
+            if symmetry.get('x'):
+                final_shapes.extend([mirror_shape(s, (1, 0, 0)) for s in list(final_shapes)])
+            if symmetry.get('y'):
+                final_shapes.extend([mirror_shape(s, (0, 1, 0)) for s in list(final_shapes)])
+            if symmetry.get('z'):
+                final_shapes.extend([mirror_shape(s, (0, 0, 1)) for s in list(final_shapes)])
+            shapes = final_shapes
+        except Exception as mirror_err:
+            broadcast_log(f"[Warning] Symmetry Mirroring failed during export: {mirror_err}")
+
+    if not shapes:
+        broadcast_log("[Error] No valid geometry found to export after filtering.")
+        raise HTTPException(status_code=400, detail="No valid geometry found to export.")
+        
+    broadcast_log("[System] Writing STEP file to disk using raw C++ Writer...")
     fd, path = tempfile.mkstemp(suffix=".step")
     os.close(fd)
     
     try:
-        try:
-            comp = b3d.Compound(children=shapes)
-        except Exception:
-            comp = b3d.Compound(shapes)
+        writer = STEPControl_Writer()
+        for shape in shapes:
+            writer.Transfer(shape.wrapped, STEPControl_StepModelType.STEPControl_AsIs)
             
-        if hasattr(comp, 'export_step'):
-            comp.export_step(path)
-        elif hasattr(b3d, 'export_step'):
-            b3d.export_step(comp, path)
-        else:
-            from build123d import exporters3d
-            exporters3d.export_step(comp, path)
+        status = writer.Write(path)
+        if status != 1:  
+            raise Exception(f"C++ Kernel failure status: {status}")
             
-    except Exception as export_error:
-        broadcast_log(f"[Error] Fatal OpenCASCADE crash: {export_error}")
-        raise HTTPException(status_code=500, detail=f"Failed during STEP compilation: {str(export_error)}")
+    except Exception as ocp_err:
+        broadcast_log(f"[Error] Fatal CAD compilation crash: {str(ocp_err)}")
+        raise HTTPException(status_code=500, detail=f"Failed during STEP compilation: {str(ocp_err)}")
     
     broadcast_log("[Success] STEP translation complete! Initiating download.")
     return FileResponse(path, media_type="application/octet-stream", filename="RetopoCAD_Export.step")
