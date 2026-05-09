@@ -716,12 +716,12 @@ if __name__ == '__main__':
         broadcast_log(f"[Error] CoACD failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"CoACD failed: {str(e)}")
 
+
 @app.post("/export-step")
 async def export_step(payload: dict):
     try:
         import build123d as b3d
         from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_Transform
-        from OCP.STEPControl import STEPControl_Writer, STEPControl_StepModelType
         from OCP.gp import gp_Trsf, gp_Ax2, gp_Pnt, gp_Dir
     except ImportError as e:
         raise HTTPException(status_code=500, detail=f"Import Error: {str(e)}. Try deleting your .venv folder and recreating it.")
@@ -730,49 +730,36 @@ async def export_step(payload: dict):
     merge_hulls = payload.get("merge_hulls", False)
     symmetry = payload.get("symmetry", {"x": False, "y": False, "z": False})
     
-    # Inject perfectly pure analytical geometry (Solids & Sheets) from unified backend history!
+    # 1. Inject perfectly pure analytical geometry (Solids & Sheets) from precision rebuild
     for shape in state.rebuild_geometry:
         shapes.append(shape)
         
+    # 2. Process CoACD Hulls using the robust original logic
     hulls = payload.get("hulls", [])
     hull_solids = []
     
     if hulls:
-        broadcast_log(f"[System] Orienting normals and stitching {len(hulls)} hulls into Solid Bodies...")
+        broadcast_log(f"[System] Stitching {len(hulls)} triangulated hulls into Solid Bodies...")
         
     for idx, hull in enumerate(hulls):
         try:
-            center_pt = np.mean(hull["vertices"], axis=0)
+            pts = [b3d.Vector(v) for v in hull["vertices"]]
             faces = []
-            
             for f in hull["faces"]:
-                if len(f) < 3:
-                    continue
-                
-                v0 = np.array(hull["vertices"][f[0]])
-                v1 = np.array(hull["vertices"][f[1]])
-                v2 = np.array(hull["vertices"][f[2]])
-                normal = np.cross(v1 - v0, v2 - v0)
-                
-                if np.dot(normal, v0 - center_pt) < 0:
-                    f.reverse()
-                    
-                poly_pts = [b3d.Vector(hull["vertices"][i]) for i in f]
-                poly_pts.append(poly_pts[0]) 
-                wire = b3d.Wire.make_polygon(poly_pts)
-                faces.append(b3d.Face(wire))
+                poly_pts = [pts[i] for i in f]
+                if len(poly_pts) >= 3:
+                    poly_pts.append(poly_pts[0]) 
+                    wire = b3d.Wire.make_polygon(poly_pts)
+                    faces.append(b3d.Face(wire))
             
-            if not faces:
-                continue
-                
             try:
                 sewer = BRepBuilderAPI_Sewing()
-                sewer.SetTolerance(1e-3) 
+                sewer.SetTolerance(1e-2)
                 for face in faces:
                     sewer.Add(face.wrapped)
                 sewer.Perform()
                 sewed_shape = sewer.SewedShape()
-                sewed_b3d = b3d.Shape.cast(sewed_shape)
+                sewed_b3d = b3d.Shape(sewed_shape)
             except Exception:
                 sewed_b3d = b3d.Shell.make_shell(faces)
             
@@ -782,14 +769,11 @@ async def export_step(payload: dict):
                 except:
                     hull_solids.append(sewed_b3d)
             elif isinstance(sewed_b3d, b3d.Compound):
-                try:
-                    for shell in sewed_b3d.shells():
-                        try:
-                            hull_solids.append(b3d.Solid.make_solid(shell))
-                        except:
-                            hull_solids.append(shell)
-                except:
-                    hull_solids.append(sewed_b3d)
+                for shell in sewed_b3d.shells():
+                    try:
+                        hull_solids.append(b3d.Solid.make_solid(shell))
+                    except:
+                        hull_solids.append(shell)
             else:
                 hull_solids.append(sewed_b3d)
 
@@ -799,38 +783,19 @@ async def export_step(payload: dict):
     if merge_hulls and len(hull_solids) > 1:
         broadcast_log("[System] Melting intersecting solids via Boolean Union...")
         try:
-            true_solids = [s for s in hull_solids if isinstance(s, b3d.Solid)]
-            other_shapes = [s for s in hull_solids if not isinstance(s, b3d.Solid)]
-            
-            if len(true_solids) > 1:
-                fused_shape = true_solids[0]
-                unfused_solids = []
+            fused_shape = hull_solids[0]
+            for next_shape in hull_solids[1:]:
+                fused_shape = fused_shape.fuse(next_shape)
                 
-                for next_shape in true_solids[1:]:
-                    try:
-                        attempt = fused_shape.fuse(next_shape)
-                        if attempt is not None and hasattr(attempt, 'wrapped') and getattr(attempt, 'volume', 0) > 1e-5:
-                            fused_shape = attempt
-                        else:
-                            unfused_solids.append(next_shape)
-                    except Exception:
-                        unfused_solids.append(next_shape)
-                
-                if fused_shape is not None and hasattr(fused_shape, 'wrapped'):
-                    shapes.append(fused_shape)
-                    
-                shapes.extend(unfused_solids)
-                shapes.extend(other_shapes)
-                broadcast_log(f"[Success] Merged blocks. ({len(unfused_solids)} skipped to prevent black-hole bug).")
-            else:
-                shapes.extend(hull_solids)
-                broadcast_log("[Warning] Not enough perfect solids to merge.")
+            shapes.append(fused_shape)
+            broadcast_log("[Success] Solids cleanly merged!")
         except Exception as e:
-            broadcast_log(f"[Warning] Boolean Union failed. Falling back to separate blocks.")
+            broadcast_log(f"[Warning] Boolean Union hit a zero-thickness error. Falling back to separate blocks.")
             shapes.extend(hull_solids) 
     else:
         shapes.extend(hull_solids)
             
+    # 3. Process Extracted Sketched Features
     features = payload.get("features", [])
     if features:
         broadcast_log(f"[System] Compiling {len(features)} CAD sketches...")
@@ -853,7 +818,7 @@ async def export_step(payload: dict):
             
     shapes = [s for s in shapes if s is not None and hasattr(s, 'wrapped')]
 
-    # SYMMETRY AWARE EXPORT LOGIC - Bulletproof OCP Mirroring
+    # 4. Symmetry Logic across all collected shapes
     if any([symmetry.get('x'), symmetry.get('y'), symmetry.get('z')]):
         broadcast_log("[System] Applying structural symmetry arrays...")
         
@@ -879,25 +844,31 @@ async def export_step(payload: dict):
             broadcast_log(f"[Warning] Symmetry Mirroring failed during export: {mirror_err}")
 
     if not shapes:
-        broadcast_log("[Error] No valid geometry found to export after filtering.")
-        raise HTTPException(status_code=400, detail="No valid geometry found to export.")
+        broadcast_log("[Error] No geometry found to export.")
+        raise HTTPException(status_code=400, detail="No geometry found to export.")
         
-    broadcast_log("[System] Writing STEP file to disk using raw C++ Writer...")
+    # 5. Native build123d robust export
+    broadcast_log("[System] Writing STEP file to disk...")
     fd, path = tempfile.mkstemp(suffix=".step")
     os.close(fd)
     
     try:
-        writer = STEPControl_Writer()
-        for shape in shapes:
-            writer.Transfer(shape.wrapped, STEPControl_StepModelType.STEPControl_AsIs)
+        try:
+            comp = b3d.Compound(children=shapes)
+        except Exception:
+            comp = b3d.Compound(shapes)
             
-        status = writer.Write(path)
-        if status != 1:  
-            raise Exception(f"C++ Kernel failure status: {status}")
+        if hasattr(comp, 'export_step'):
+            comp.export_step(path)
+        elif hasattr(b3d, 'export_step'):
+            b3d.export_step(comp, path)
+        else:
+            from build123d import exporters3d
+            exporters3d.export_step(comp, path)
             
-    except Exception as ocp_err:
-        broadcast_log(f"[Error] Fatal CAD compilation crash: {str(ocp_err)}")
-        raise HTTPException(status_code=500, detail=f"Failed during STEP compilation: {str(ocp_err)}")
+    except Exception as export_error:
+        broadcast_log(f"[Error] Fatal OpenCASCADE crash: {export_error}")
+        raise HTTPException(status_code=500, detail=f"Failed during STEP compilation: {str(export_error)}")
     
     broadcast_log("[Success] STEP translation complete! Initiating download.")
     return FileResponse(path, media_type="application/octet-stream", filename="RetopoCAD_Export.step")
