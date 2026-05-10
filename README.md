@@ -1,14 +1,15 @@
 # **RetopoCAD 🚀**
 
+<img width="1920" height="919" alt="image" src="https://github.com/user-attachments/assets/98b8b2b7-43f7-4ed3-a696-ac9698477518" />
+
+
 **An experimental, browser-based tool to bridge the gap between messy high-poly meshes and clean Solid CAD.**
 
 ## **⚠️ Highly Experimental**
 
--
-
 ## **Features**
 
--
+wip
 
 ## **Tech Stack & Credits**
 
