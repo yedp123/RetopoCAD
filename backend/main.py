@@ -211,6 +211,32 @@ def apply_pca_firewall(points):
         proj_pts.append(p - dist * normal)
     return proj_pts
 
+def resample_loop(points, target_count=100):
+    """Uniformly resamples a 3D loop using linear interpolation to standardize vertex counts."""
+    pts = np.array(points)
+    if len(pts) < 2:
+        return points
+    
+    # Calculate segment lengths including the closing edge
+    diffs = np.diff(pts, axis=0)
+    diffs = np.vstack([diffs, pts[0] - pts[-1]])
+    
+    dists = np.linalg.norm(diffs, axis=1)
+    cum_dists = np.insert(np.cumsum(dists), 0, 0)
+    total_len = cum_dists[-1]
+    
+    if total_len == 0:
+        return points
+    
+    target_dists = np.linspace(0, total_len, target_count, endpoint=False)
+    resampled = np.zeros((target_count, 3))
+    
+    # Interpolate for x, y, z individually
+    for i in range(3):
+        resampled[:, i] = np.interp(target_dists, cum_dists, np.append(pts[:, i], pts[0, i]))
+        
+    return resampled.tolist()
+
 @app.post("/create-sheet")
 async def create_sheet(params: CommitGeometryParams):
     try:
@@ -278,13 +304,19 @@ async def commit_geometry(params: CommitGeometryParams):
         for loop_data in params.loops:
             processed_loops.append(apply_pca_firewall(loop_data['points']))
 
-        # ALIGNMENT: Shift indices to prevent Loft Twisting / Self-Intersections
+        # ALIGNMENT AND RESAMPLING FOR LOFT
         if params.operation == 'loft' and len(processed_loops) == 2:
-            pts1, pts2 = processed_loops[0], processed_loops[1]
+            # Uniformly resample both loops to precisely match vertices
+            pts1 = resample_loop(processed_loops[0], 100)
+            pts2 = resample_loop(processed_loops[1], 100)
+            
+            # Anti-Twist: Align start points of Loop B to Loop A
             p0 = np.array(pts1[0])
             dists = [np.linalg.norm(np.array(p) - p0) for p in pts2]
             best_idx = np.argmin(dists)
-            processed_loops[1] = pts2[best_idx:] + pts2[:best_idx]
+            pts2 = pts2[best_idx:] + pts2[:best_idx]
+            
+            processed_loops = [pts1, pts2]
 
         faces = []
         for pts_list in processed_loops:
@@ -295,12 +327,20 @@ async def commit_geometry(params: CommitGeometryParams):
             faces.append(b3d.Face(wire))
 
         solid = None
-        if params.operation == 'extrude' and len(faces) == 1:
-            solid = b3d.extrude(faces[0], amount=params.extrude_depth)
-        elif params.operation == 'loft' and len(faces) == 2:
-            solid = b3d.loft(faces)
-        else:
-            raise ValueError("Invalid operation or loop count.")
+        
+        # Graceful Kernel Error Catching
+        try:
+            if params.operation == 'extrude' and len(faces) == 1:
+                solid = b3d.extrude(faces[0], amount=params.extrude_depth)
+            elif params.operation == 'loft' and len(faces) == 2:
+                solid = b3d.loft(faces)
+            else:
+                raise ValueError("Invalid operation or loop count.")
+        except Exception as b3d_err:
+            err_str = str(b3d_err)
+            if "not done" in err_str.lower() or "brep_api" in err_str.lower():
+                raise ValueError("Loft failed: The resulting geometry would self-intersect. Try simplifying your loops.")
+            raise b3d_err
 
         state.rebuild_geometry.append(solid)
 
@@ -329,7 +369,7 @@ async def commit_geometry(params: CommitGeometryParams):
     except Exception as e:
         err_msg = str(e)
         broadcast_log(f"[Error] Failed to build CAD Solid: {err_msg}")
-        raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
+        raise HTTPException(status_code=400, detail=err_msg)
 
 @app.post("/boolean-cut")
 async def boolean_cut(params: BooleanCutParams):

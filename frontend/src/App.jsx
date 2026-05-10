@@ -30,7 +30,7 @@ function HullMesh({ vertices, faces, centerOffset, material }) {
   return <mesh geometry={geometry} material={material} />;
 }
 
-function CircleCurve({ feature, centerOffset, activeTool, onDelete, customColor, hoveredOverride }) {
+function CircleCurve({ feature, centerOffset, customColor, hoveredOverride, onSelect }) {
   const [hovered, setHovered] = useState(false);
   const { id, center, normal, radius } = feature;
 
@@ -63,8 +63,7 @@ function CircleCurve({ feature, centerOffset, activeTool, onDelete, customColor,
   const pos = new THREE.Vector3(...center);
   if (centerOffset) pos.sub(centerOffset);
   
-  const isDeleteMode = activeTool === 'delete';
-  const color = customColor ? customColor : (isDeleteMode && hovered ? '#ef4444' : '#10b981');
+  const color = customColor ? customColor : (hovered ? '#10b981' : '#059669');
   const finalHover = hoveredOverride !== undefined ? hoveredOverride : hovered;
 
   return (
@@ -75,9 +74,11 @@ function CircleCurve({ feature, centerOffset, activeTool, onDelete, customColor,
       onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
       onPointerOut={() => setHovered(false)}
       onClick={(e) => {
-        if (isDeleteMode && onDelete) {
-          e.stopPropagation();
-          onDelete(id);
+        e.stopPropagation();
+        if (onSelect) {
+            const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
+            const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
+            onSelect(feature, { x: screenX, y: screenY });
         }
       }}
     >
@@ -86,7 +87,7 @@ function CircleCurve({ feature, centerOffset, activeTool, onDelete, customColor,
   );
 }
 
-function PlanarCurve({ feature, centerOffset, activeTool, onDelete, customColor, hoveredOverride }) {
+function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSelect }) {
   const [hovered, setHovered] = useState(false);
   const { id, points } = feature;
 
@@ -104,8 +105,7 @@ function PlanarCurve({ feature, centerOffset, activeTool, onDelete, customColor,
 
   if (!geometry) return null;
 
-  const isDeleteMode = activeTool === 'delete';
-  const color = customColor ? customColor : (isDeleteMode && hovered ? '#ef4444' : '#10b981');
+  const color = customColor ? customColor : (hovered ? '#10b981' : '#059669');
   const finalHover = hoveredOverride !== undefined ? hoveredOverride : hovered;
 
   return (
@@ -114,9 +114,11 @@ function PlanarCurve({ feature, centerOffset, activeTool, onDelete, customColor,
       onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
       onPointerOut={() => setHovered(false)}
       onClick={(e) => {
-        if (isDeleteMode && onDelete) {
-          e.stopPropagation();
-          onDelete(id);
+        e.stopPropagation();
+        if (onSelect) {
+            const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
+            const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
+            onSelect(feature, { x: screenX, y: screenY });
         }
       }}
     >
@@ -126,10 +128,11 @@ function PlanarCurve({ feature, centerOffset, activeTool, onDelete, customColor,
 }
 
 function GhostModel({ 
-  url, symmetry, activeTool, activeTab, 
-  onAnalyze, onFeatureExtracted, onFeatureDelete, onSelectLoop, onSelectSolid,
-  extractedFeatures, hullsData, showMesh, showWireframe, meshOpacity, showHulls,
-  selectedLoops, rebuildHistory, selectedSolidIndex 
+  url, symmetry, activeTool, 
+  onSelectLoop, onSelectSolid,
+  showMesh, showWireframe, meshOpacity,
+  selectedLoops, rebuildHistory, selectedItemId, cursorScale,
+  extractedFeatures
 }) {
   const obj = useLoader(OBJLoader, url);
   const cursorGroupRef = useRef(); 
@@ -169,7 +172,8 @@ function GhostModel({
     const size = new THREE.Vector3();
     box.getSize(size);
     const maxDimension = Math.max(size.x, size.y, size.z);
-    const calculatedRadius = maxDimension * 0.015;
+    
+    const calculatedRadius = maxDimension * (cursorScale || 0.005);
 
     obj.traverse((child) => {
       if (child.isMesh && child.geometry) {
@@ -187,15 +191,7 @@ function GhostModel({
     });
     
     return { meshes: extracted, cursorRadius: calculatedRadius, centerOffset: center };
-  }, [obj]);
-
-  const hullMaterial = useMemo(() => new THREE.MeshStandardMaterial({
-    color: "#3b82f6", 
-    transparent: true,
-    opacity: 0.6,
-    roughness: 0.4,
-    side: THREE.DoubleSide
-  }), []);
+  }, [obj, cursorScale]);
 
   const solidMaterial = useMemo(() => new THREE.MeshStandardMaterial({
     color: "#3b82f6", 
@@ -215,8 +211,8 @@ function GhostModel({
     side: THREE.DoubleSide
   }), []);
 
-  const selectedSolidMaterial = useMemo(() => new THREE.MeshStandardMaterial({
-    color: "#f97316", // Amber / Orange indicating targeted
+  const selectedMaterial = useMemo(() => new THREE.MeshStandardMaterial({
+    color: "#f97316", 
     emissive: "#ea580c",
     emissiveIntensity: 0.4,
     transparent: true,
@@ -228,7 +224,6 @@ function GhostModel({
 
   const handlePointerMove = (e) => {
     e.stopPropagation(); 
-    if (activeTool === 'delete') return;
 
     if (cursorGroupRef.current) {
       const worldPoint = e.point.clone();
@@ -248,8 +243,7 @@ function GhostModel({
         }
       });
 
-      // Topogun-Style Fast Preview for Precision Rebuild Tab
-      if (activeTab === 'rebuild' && activeTool !== 'analyze') {
+      if (activeTool !== 'analyze') {
         clearTimeout(scoutTimeout.current);
         scoutTimeout.current = setTimeout(async () => {
           try {
@@ -263,7 +257,7 @@ function GhostModel({
               setScoutLoop(data);
             }
           } catch(err) {}
-        }, 50); // High-speed hover debounce
+        }, 50); 
       }
     }
   };
@@ -279,55 +273,19 @@ function GhostModel({
 
   const handleClick = async (e) => {
     e.stopPropagation(); 
-    if (!cursorGroupRef.current || activeTool === 'delete') return;
+    if (!cursorGroupRef.current) return;
 
     const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
     const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
 
-    // Precision Rebuild Click -> Commit to Stack
-    if (activeTab === 'rebuild') {
-      if (scoutLoop) {
-        onSelectLoop(scoutLoop, { x: screenX, y: screenY });
-        setScoutLoop(null);
-      }
-      return;
-    }
-
-    // Quick Prototype Clicks
-    const worldPoint = e.point.clone();
-    const localPoint = cursorGroupRef.current.worldToLocal(worldPoint);
-    const rawPoint = localPoint.clone().add(centerOffset);
-
-    if (activeTool === 'analyze') {
-      try {
-        const res = await fetch(`http://localhost:8000/analyze-surface`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ x: rawPoint.x, y: rawPoint.y, z: rawPoint.z })
-        });
-        if (res.ok) {
-          const data = await res.json();
-          onAnalyze({ ...data, x: screenX, y: screenY });
-        }
-      } catch (err) { console.error(err); }
-    } 
-    else if (activeTool === 'extract') {
-      try {
-        const res = await fetch(`http://localhost:8000/extract-feature`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ x: rawPoint.x, y: rawPoint.y, z: rawPoint.z })
-        });
-        if (res.ok) onFeatureExtracted(await res.json());
-      } catch (err) { console.error(err); }
+    if (scoutLoop) {
+      onSelectLoop(scoutLoop, { x: screenX, y: screenY });
+      setScoutLoop(null);
     }
   };
 
-  const mainCursorColor = activeTool === 'extract' ? "#10b981" : "#3b82f6";
-
   return (
     <group ref={cursorGroupRef}>
-      
       <group>
         {showMesh && meshes?.map((mesh, index) => (
           <mesh key={`base-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onClick={handleClick}>
@@ -336,56 +294,46 @@ function GhostModel({
           </mesh>
         ))}
 
-        {/* Prototype Renderings */}
-        {activeTab === 'prototype' && showHulls && hullsData && hullsData.map((hull, idx) => (
-          <HullMesh key={`base-hull-${idx}`} vertices={hull.vertices} faces={hull.faces} centerOffset={centerOffset} material={hullMaterial} />
-        ))}
-        {activeTab === 'prototype' && extractedFeatures?.map((feat) => (
-          feat.type === 'circle' 
-            ? <CircleCurve key={feat.id} feature={feat} centerOffset={centerOffset} activeTool={activeTool} onDelete={onFeatureDelete} />
-            : <PlanarCurve key={feat.id} feature={feat} centerOffset={centerOffset} activeTool={activeTool} onDelete={onFeatureDelete} />
-        ))}
+        {extractedFeatures?.map((feat) => {
+          const isSelected = selectedLoops?.some(l => l.id === feat.id);
+          if (isSelected) return null; 
+          return feat.type === 'circle' 
+            ? <CircleCurve key={feat.id} feature={feat} centerOffset={centerOffset} onSelect={onSelectLoop} />
+            : <PlanarCurve key={feat.id} feature={feat} centerOffset={centerOffset} onSelect={onSelectLoop} />
+        })}
 
-        {/* Precision Rebuild Renderings */}
-        {activeTab === 'rebuild' && (
-          <>
-            {/* Ghost Preview - Orange */}
-            {scoutLoop && <PlanarCurve feature={scoutLoop} centerOffset={centerOffset} customColor="#f97316" hoveredOverride={true} />}
-            
-            {/* Selected Loops - Blue */}
-            {selectedLoops?.map((feat, idx) => (
-              <PlanarCurve key={`sel-${feat.id}-${idx}`} feature={feat} centerOffset={centerOffset} customColor="#38bdf8" hoveredOverride={true} />
-            ))}
-            
-            {/* Built Geometry (Solids & Sheets) */}
-            {rebuildHistory?.map((geo, idx) => {
-               const isSelected = idx === selectedSolidIndex;
-               const mat = geo.type === 'sheet' ? sheetMaterial : (isSelected ? selectedSolidMaterial : solidMaterial);
-               return (
-                 <group 
-                   key={`geo-${idx}`} 
-                   onClick={(e) => { 
-                      e.stopPropagation(); 
-                      const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
-                      const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
-                      if (onSelectSolid) onSelectSolid(idx, { x: screenX, y: screenY }); 
-                   }}
-                 >
-                   <HullMesh 
-                     vertices={geo.vertices} 
-                     faces={geo.faces} 
-                     centerOffset={centerOffset} 
-                     material={mat} 
-                   />
-                 </group>
-               );
-            })}
-          </>
-        )}
+        {scoutLoop && <PlanarCurve feature={scoutLoop} centerOffset={centerOffset} customColor="#f97316" hoveredOverride={true} />}
+        
+        {selectedLoops?.map((feat, idx) => (
+          <PlanarCurve key={`sel-${feat.id}-${idx}`} feature={feat} centerOffset={centerOffset} customColor="#38bdf8" hoveredOverride={true} />
+        ))}
+        
+        {rebuildHistory?.map((geo) => {
+            if (geo.visible === false) return null;
+            const isSelected = geo.id === selectedItemId;
+            const mat = geo.type === 'sheet' ? (isSelected ? selectedMaterial : sheetMaterial) : (isSelected ? selectedMaterial : solidMaterial);
+            return (
+              <group 
+                key={`geo-${geo.id}`} 
+                onClick={(e) => { 
+                  e.stopPropagation(); 
+                  const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
+                  const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
+                  if (onSelectSolid) onSelectSolid(geo.id, { x: screenX, y: screenY }); 
+                }}
+              >
+                <HullMesh 
+                  vertices={geo.vertices} 
+                  faces={geo.faces} 
+                  centerOffset={centerOffset} 
+                  material={mat} 
+                />
+              </group>
+            );
+        })}
       </group>
 
-      {/* Mirror Groups */}
-      {activeScales?.map((scale, groupIndex) => {
+      {activeScales?.map((scale) => {
         const mirrorKey = scale.join(',');
         return (
           <group key={`mirror-group-${mirrorKey}`} scale={scale}>
@@ -395,32 +343,32 @@ function GhostModel({
                 {showWireframe && <Edges raycast={() => null} threshold={15} color="#18181b" />}
               </mesh>
             ))}
-            {activeTab === 'prototype' && showHulls && hullsData && hullsData.map((hull, idx) => (
-               <HullMesh key={`mirror-hull-${mirrorKey}-${idx}`} vertices={hull.vertices} faces={hull.faces} centerOffset={centerOffset} material={hullMaterial} />
-            ))}
-            {activeTab === 'prototype' && extractedFeatures?.map((feat) => (
-               feat.type === 'circle' 
-                ? <CircleCurve key={`mirror-circ-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} activeTool={activeTool} onDelete={onFeatureDelete} />
-                : <PlanarCurve key={`mirror-plan-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} activeTool={activeTool} onDelete={onFeatureDelete} />
-            ))}
-            {activeTab === 'rebuild' && rebuildHistory?.map((geo, idx) => (
-               <HullMesh 
-                 key={`mirror-geo-${mirrorKey}-${idx}`} 
-                 vertices={geo.vertices} 
-                 faces={geo.faces} 
-                 centerOffset={centerOffset} 
-                 material={geo.type === 'sheet' ? sheetMaterial : solidMaterial} 
-               />
-            ))}
+            {extractedFeatures?.map((feat) => {
+              return feat.type === 'circle' 
+                ? <CircleCurve key={`mirror-circ-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} />
+                : <PlanarCurve key={`mirror-plan-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} />
+            })}
+            {rebuildHistory?.map((geo) => {
+               if (geo.visible === false) return null;
+               return (
+                 <HullMesh 
+                   key={`mirror-geo-${mirrorKey}-${geo.id}`} 
+                   vertices={geo.vertices} 
+                   faces={geo.faces} 
+                   centerOffset={centerOffset} 
+                   material={geo.type === 'sheet' ? sheetMaterial : solidMaterial} 
+                 />
+               );
+            })}
           </group>
         );
       })}
 
-      {showMesh && activeTool !== 'delete' && (
+      {showMesh && (
         <>
           <mesh ref={cursorRef} visible={false} renderOrder={1}>
             <sphereGeometry args={[cursorRadius, 16, 16]} />
-            <meshBasicMaterial color={mainCursorColor} depthTest={false} /> 
+            <meshBasicMaterial color="#3b82f6" depthTest={false} /> 
           </mesh>
 
           {activeScales?.map((scale, i) => (
@@ -436,10 +384,11 @@ function GhostModel({
 }
 
 function Viewport({ 
-  objUrl, symmetry, activeTool, activeTab, 
-  onAnalyze, onFeatureExtracted, onFeatureDelete, onSelectLoop, onSelectSolid,
-  extractedFeatures, hullsData, showMesh, showWireframe, meshOpacity, showHulls,
-  selectedLoops, rebuildHistory, selectedSolidIndex 
+  objUrl, symmetry, activeTool,
+  onSelectLoop, onSelectSolid,
+  showMesh, showWireframe, meshOpacity,
+  selectedLoops, rebuildHistory, selectedItemId, cursorScale,
+  extractedFeatures
 }) {
   return (
     <Canvas camera={{ position: [5, 5, 5], fov: 45 }} gl={{ antialias: true }} raycaster={{ params: { Line: { threshold: 0.5 } } }}>
@@ -457,21 +406,16 @@ function Viewport({
                 url={objUrl} 
                 symmetry={symmetry} 
                 activeTool={activeTool}
-                activeTab={activeTab}
-                onAnalyze={onAnalyze} 
-                onFeatureExtracted={onFeatureExtracted}
-                onFeatureDelete={onFeatureDelete}
                 onSelectLoop={onSelectLoop}
                 onSelectSolid={onSelectSolid}
-                extractedFeatures={extractedFeatures}
-                hullsData={hullsData} 
                 showMesh={showMesh} 
                 showWireframe={showWireframe}
                 meshOpacity={meshOpacity}
-                showHulls={showHulls} 
                 selectedLoops={selectedLoops}
                 rebuildHistory={rebuildHistory}
-                selectedSolidIndex={selectedSolidIndex}
+                selectedItemId={selectedItemId}
+                cursorScale={cursorScale}
+                extractedFeatures={extractedFeatures}
               />
             </Bounds>
             {symmetry?.x && <mesh rotation={[0, Math.PI / 2, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#ef4444" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
@@ -493,12 +437,18 @@ function Viewport({
 
 // --- APP & UI COMPONENTS ---
 
-// SVG Icons for the Action Ring
 const IconExtrude = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>;
+const IconCylinderFill = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 5v14c0 1.66-4 3-9 3s-9-1.34-9-3V5"></path></svg>;
 const IconLoft = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polygon points="12 12 2 17 12 22 22 17 12 12"></polygon></svg>;
 const IconSheet = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="3 8 12 3 21 8 12 13 3 8"></polygon></svg>;
 const IconClear = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>;
 const IconCut = () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="6" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><line x1="20" y1="4" x2="8.12" y2="15.88"></line><line x1="14.47" y1="14.48" x2="20" y2="20"></line><line x1="8.12" y1="8.12" x2="12" y2="12"></line></svg>;
+const IconEye = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>;
+const IconEyeOff = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>;
+
+const IconSquare = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect></svg>;
+const IconCylinderOutline = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 6c0 1.657 3.582 3 8 3s8-1.343 8-3M4 6c0-1.657 3.582-3 8-3s8 1.343 8 3m-16 0v12c0 1.657 3.582 3 8 3s8-1.343 8-3V6"></path></svg>;
+
 
 function CompactSymmetryToggle({ label, active, onClick, colorClass }) {
   return (
@@ -511,31 +461,49 @@ function CompactSymmetryToggle({ label, active, onClick, colorClass }) {
   );
 }
 
-// v1.0 Context-Aware Action Ring
-function ActionRing({ anchorPos, selectedLoops, selectedSolidIndex, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear }) {
-  // Smart Visibility Requirement: 
-  if ((!selectedLoops || selectedLoops.length === 0) && selectedSolidIndex === null) return null;
+function ActionRing({ anchorPos, selectedLoops, selectedItemId, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear }) {
+  const [pos, setPos] = useState({ x: -1000, y: -1000 });
+
+  useEffect(() => {
+    if (!anchorPos) return;
+    const offset = 120;
+    const ringSize = 120; 
+
+    let targetX = anchorPos.x + offset;
+    let targetY = anchorPos.y + offset;
+
+    if (targetX + ringSize > window.innerWidth) targetX = anchorPos.x - offset; 
+    if (targetY + ringSize > window.innerHeight) targetY = anchorPos.y - offset;
+
+    setPos({ x: targetX, y: targetY });
+  }, [anchorPos]);
+
+  if ((!selectedLoops || selectedLoops.length === 0) && !selectedItemId) return null;
+
+  const isCylinderLoop = selectedLoops.length === 1 && selectedLoops[0].type === 'circle';
+  const extrudeLabel = isCylinderLoop ? 'Cylinder' : 'Extrude';
 
   const radius = 70; 
   const buttons = [
-    { label: 'Extrude', icon: <IconExtrude />, angle: -90, action: onExtrude, disabled: selectedLoops.length !== 1, color: 'text-blue-400' },
+    { label: extrudeLabel, icon: isCylinderLoop ? <IconCylinderFill /> : <IconExtrude />, angle: -90, action: onExtrude, disabled: selectedLoops.length !== 1, color: 'text-blue-400' },
     { label: 'Loft', icon: <IconLoft />, angle: 0, action: onLoft, disabled: selectedLoops.length !== 2, color: 'text-blue-400' },
     { label: 'Sheet', icon: <IconSheet />, angle: 90, action: onSheet, disabled: selectedLoops.length !== 1, color: 'text-green-400' },
     { label: 'Clear', icon: <IconClear />, angle: 180, action: onClear, disabled: false, color: 'text-red-400' },
   ];
 
-  if (selectedSolidIndex !== null) {
-      // Add Boolean trigger capability dynamically
+  if (selectedItemId !== null) {
       buttons.push({ label: 'Cut', icon: <IconCut />, angle: -45, action: onCut, disabled: selectedLoops.length !== 1, color: 'text-orange-400' });
   }
 
   return (
-    <div style={{ left: anchorPos?.x || 0, top: anchorPos?.y || 0 }} className="fixed pointer-events-none z-50 flex items-center justify-center -translate-x-1/2 -translate-y-1/2">
+    <div style={{ left: pos.x, top: pos.y }} className="fixed pointer-events-none z-50 flex items-center justify-center -translate-x-1/2 -translate-y-1/2 transition-all duration-200">
        <div className="absolute w-40 h-40 rounded-full border border-zinc-600/20 bg-zinc-900/30 backdrop-blur-md animate-in zoom-in duration-150 pointer-events-none" />
        
-       {/* HUD-Integrated Dynamic Depth Input */}
-       <div className="absolute pointer-events-auto flex flex-col items-center justify-center w-12 h-12 rounded-full bg-zinc-800/90 border border-zinc-600 shadow-xl backdrop-blur-md animate-in zoom-in">
-         <span className="text-[7px] font-black uppercase text-zinc-400 tracking-tighter leading-none mb-0.5 mt-1">Depth</span>
+       <div className="absolute pointer-events-auto flex flex-col items-center justify-center w-14 h-14 rounded-full bg-zinc-800/90 border border-zinc-600 shadow-xl backdrop-blur-md animate-in zoom-in">
+         {isCylinderLoop && (
+             <span className="text-[7.5px] font-black uppercase text-emerald-400 tracking-tighter leading-none mb-1">R: {selectedLoops[0].radius.toFixed(2)}</span>
+         )}
+         <span className="text-[7px] font-black uppercase text-zinc-400 tracking-tighter leading-none mb-0.5">Depth</span>
          <input 
            type="number" 
            value={extrudeDepth} 
@@ -568,40 +536,27 @@ function ActionRing({ anchorPos, selectedLoops, selectedSolidIndex, extrudeDepth
 }
 
 export default function App() {
-  // Global States
-  const [activeTab, setActiveTab] = useState('rebuild'); // 'prototype' | 'rebuild'
   const [objUrl, setObjUrl] = useState(null);
   const [backendStatus, setBackendStatus] = useState("Waiting for mesh...");
   const [isUploading, setIsUploading] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [mergeExportHulls, setMergeExportHulls] = useState(true);
+  const [cursorScale, setCursorScale] = useState(0.005); 
+  const [sharpnessAngle, setSharpnessAngle] = useState(30);
   
-  // Track continuous mouse movement for general needs
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 }); 
-  // Anchor tracking specifically for static UI elements (Action Ring)
   const [menuAnchor, setMenuAnchor] = useState({ x: 0, y: 0 });
-  
-  // Quick Prototype States
-  const [analysisTooltip, setAnalysisTooltip] = useState(null);
-  const [isGeneratingHulls, setIsGeneratingHulls] = useState(false);
-  const [generationTimer, setGenerationTimer] = useState(0);
-  const timerIntervalRef = useRef(null);
-  const [hullsData, setHullsData] = useState(null);
-  const [activeMode, setActiveMode] = useState('hard-surface');
-  const [maxHulls, setMaxHulls] = useState(250);
-  const [detailLevel, setDetailLevel] = useState(85);
-  const [decimationTarget, setDecimationTarget] = useState(15000);
-  const [skipDecimation, setSkipDecimation] = useState(false);
-  const [activeTool, setActiveTool] = useState('extract'); 
-  const [featuresHistory, setFeaturesHistory] = useState([[]]); 
-  const [historyIndex, setHistoryIndex] = useState(0);
+  const [activeTool, setActiveTool] = useState('rebuild'); 
+
+  // Feature Extraction States
   const [isAutoExtracting, setIsAutoExtracting] = useState(false);
   const [minFeatureSize, setMinFeatureSize] = useState(2.0);
+  const [extractedFeatures, setExtractedFeatures] = useState([]);
 
-  // Precision Rebuild States
+  // Rebuild / Outliner States
   const [selectedLoops, setSelectedLoops] = useState([]);
-  const [rebuildHistory, setRebuildHistory] = useState([]); // Unified Solids + Sheets
-  const [selectedSolidIndex, setSelectedSolidIndex] = useState(null); // Target solid targeting
+  const [rebuildHistory, setRebuildHistory] = useState([]); 
+  const [selectedItemId, setSelectedItemId] = useState(null); 
   const [extrudeDepth, setExtrudeDepth] = useState(5.0);
   const [isCommitting, setIsCommitting] = useState(false);
 
@@ -611,9 +566,7 @@ export default function App() {
   const [showMesh, setShowMesh] = useState(true);
   const [showWireframe, setShowWireframe] = useState(true);
   const [meshOpacity, setMeshOpacity] = useState(0.4);
-  const [showHulls, setShowHulls] = useState(true);
   
-  // LIVE POLLING SYSTEM FOR CONSOLE
   const [serverLogs, setServerLogs] = useState(["System initialized. Ready for operations..."]);
   const consoleEndRef = useRef(null);
 
@@ -639,34 +592,49 @@ export default function App() {
     }
   }, [serverLogs]);
 
-  // PROTOTYPE FUNCTIONS
-  const currentFeatures = featuresHistory[historyIndex];
-
-  const commitFeatures = (newFeatures) => {
-    const newHistory = featuresHistory.slice(0, historyIndex + 1);
-    newHistory.push(newFeatures);
-    setFeaturesHistory(newHistory);
-    setHistoryIndex(newHistory.length - 1);
+  const handleSelectLoop = (loopData, clickPos) => {
+    // If the loop doesn't exist in selection, add it.
+    setSelectedLoops(prev => {
+        if (prev.some(l => l.id === loopData.id)) return prev;
+        return [...prev, loopData];
+    });
+    if (clickPos) setMenuAnchor(clickPos);
+    else setMenuAnchor(mousePos); 
   };
 
-  const handleUndo = () => { if (historyIndex > 0) setHistoryIndex(historyIndex - 1); };
-  const handleRedo = () => { if (historyIndex < featuresHistory.length - 1) setHistoryIndex(historyIndex + 1); };
-
-  const handleFeatureExtracted = (featureData) => {
-    const newFeature = { ...featureData, id: Math.random().toString(36).substr(2, 9) };
-    commitFeatures([...currentFeatures, newFeature]);
+  const handleSelectSolid = (id, clickPos) => {
+    setSelectedItemId(id);
+    if (clickPos) setMenuAnchor(clickPos);
+    else setMenuAnchor(mousePos); 
   };
 
-  const handleFeatureDelete = (id) => {
-    if (activeTool !== 'delete') return;
-    const filtered = currentFeatures.filter(f => f.id !== id);
-    commitFeatures(filtered);
+  const toggleItemVisibility = (id) => {
+    setRebuildHistory(prev => prev.map(geo => 
+      geo.id === id ? { ...geo, visible: geo.visible === false ? true : false } : geo
+    ));
   };
 
-  const handleClearAllFeatures = () => {
-    if (currentFeatures.length === 0) return;
-    commitFeatures([]);
+  const handleUndoGeometry = async () => {
+    if (rebuildHistory.length === 0) return;
+    try {
+      const res = await fetch('http://localhost:8000/undo-geometry', { method: 'POST' });
+      if (res.ok) {
+        setRebuildHistory(prev => prev.slice(0, -1));
+        setSelectedItemId(null);
+      }
+    } catch (err) { console.error(err); }
   };
+
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        handleUndoGeometry();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [rebuildHistory]);
 
   const handleAutoExtract = async () => {
     setIsAutoExtracting(true);
@@ -679,49 +647,13 @@ export default function App() {
       const data = await res.json();
       if (res.ok) {
         const newFeatures = data.features.map(f => ({ ...f, id: Math.random().toString(36).substr(2, 9) }));
-        commitFeatures([...currentFeatures, ...newFeatures]);
+        setExtractedFeatures(prev => [...prev, ...newFeatures]);
       }
     } catch (err) { console.error(err); }
     setIsAutoExtracting(false);
   };
 
-  // REBUILD FUNCTIONS
-  const handleSelectLoop = (loopData, clickPos) => {
-    setSelectedLoops(prev => [...prev, loopData]);
-    if (clickPos) setMenuAnchor(clickPos);
-    else setMenuAnchor(mousePos); 
-  };
-
-  const handleSelectSolid = (idx, clickPos) => {
-    setSelectedSolidIndex(idx);
-    if (clickPos) setMenuAnchor(clickPos);
-    else setMenuAnchor(mousePos); 
-  };
-
-  const handleUndoGeometry = async () => {
-    if (rebuildHistory.length === 0) return;
-    try {
-      const res = await fetch('http://localhost:8000/undo-geometry', { method: 'POST' });
-      if (res.ok) {
-        setRebuildHistory(prev => prev.slice(0, -1));
-        setSelectedSolidIndex(null);
-      }
-    } catch (err) { console.error(err); }
-  };
-
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-        e.preventDefault();
-        if (activeTab === 'rebuild') handleUndoGeometry();
-        else handleUndo();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeTab, rebuildHistory, historyIndex]);
-
-  const executeGeometryOperation = async (endpoint, payload, type) => {
+  const executeGeometryOperation = async (endpoint, payload, type, defaultName) => {
     setIsCommitting(true);
     try {
       const res = await fetch(`http://localhost:8000/${endpoint}`, {
@@ -731,10 +663,17 @@ export default function App() {
       });
       if (res.ok) {
         const geometryData = await res.json();
-        setRebuildHistory(prev => [...prev, { ...geometryData, type }]);
-        // Auto-Reset interaction state
+        setRebuildHistory(prev => [...prev, { 
+          ...geometryData, 
+          type, 
+          id: Math.random().toString(36).substr(2, 9), 
+          visible: true, 
+          name: `${defaultName} ${prev.length + 1}`, 
+          payload, 
+          endpoint 
+        }]);
         setSelectedLoops([]); 
-        setSelectedSolidIndex(null);
+        setSelectedItemId(null);
       } else {
         const errData = await res.json();
         setServerLogs(prev => [...prev, `[Error] ${errData.detail || 'Unknown CAD Engine crash.'}`]);
@@ -745,27 +684,68 @@ export default function App() {
     setIsCommitting(false);
   };
 
-  const handleExtrude = () => executeGeometryOperation('commit-geometry', { operation: 'extrude', loops: selectedLoops, extrude_depth: extrudeDepth }, 'solid');
-  const handleLoft = () => executeGeometryOperation('commit-geometry', { operation: 'loft', loops: selectedLoops }, 'solid');
-  const handleSheet = () => executeGeometryOperation('create-sheet', { operation: 'sheet', loops: selectedLoops }, 'sheet');
+  const handleExtrude = () => executeGeometryOperation('commit-geometry', { operation: 'extrude', loops: selectedLoops, extrude_depth: extrudeDepth }, 'solid', 'Extrude');
+  const handleLoft = () => executeGeometryOperation('commit-geometry', { operation: 'loft', loops: selectedLoops }, 'solid', 'Loft');
+  const handleSheet = () => executeGeometryOperation('create-sheet', { operation: 'sheet', loops: selectedLoops }, 'sheet', 'Sheet');
+
+  const handleUpdateHistoryItem = async (id, newDepth) => {
+    const item = rebuildHistory.find(i => i.id === id);
+    if (!item || !item.payload || item.payload.operation !== 'extrude') return;
+    
+    setIsCommitting(true);
+    try {
+      const res = await fetch(`http://localhost:8000/${item.endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...item.payload, extrude_depth: newDepth })
+      });
+      if (res.ok) {
+        const geo = await res.json();
+        setRebuildHistory(prev => prev.map(geoItem => geoItem.id === id ? { 
+            ...geoItem, 
+            vertices: geo.vertices, 
+            faces: geo.faces, 
+            payload: { ...geoItem.payload, extrude_depth: newDepth } 
+        } : geoItem));
+        setServerLogs(prev => [...prev, `[Success] Entity successfully rebuilt with new parameters.`]);
+      } else {
+        setServerLogs(prev => [...prev, `[Error] Failed to update geometry.`]);
+      }
+    } catch (err) {
+      setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]);
+    }
+    setIsCommitting(false);
+  };
 
   const handleCut = async () => {
+    if (!selectedItemId) return;
+    const targetIndex = rebuildHistory.findIndex(geo => geo.id === selectedItemId);
+    if (targetIndex === -1) return;
+
     setIsCommitting(true);
     try {
       const res = await fetch(`http://localhost:8000/boolean-cut`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ loops: selectedLoops, extrude_depth: extrudeDepth, target_index: selectedSolidIndex })
+        body: JSON.stringify({ loops: selectedLoops, extrude_depth: extrudeDepth, target_index: targetIndex })
       });
       if (res.ok) {
         const geometryData = await res.json();
         setRebuildHistory(prev => {
             const newHistory = [...prev];
-            newHistory[selectedSolidIndex] = { ...geometryData, type: 'solid' };
+            newHistory[targetIndex] = { 
+              ...geometryData, 
+              type: 'solid', 
+              id: prev[targetIndex].id, 
+              visible: prev[targetIndex].visible, 
+              name: prev[targetIndex].name + ' (Cut)',
+              payload: prev[targetIndex].payload,
+              endpoint: prev[targetIndex].endpoint
+            };
             return newHistory;
         });
         setSelectedLoops([]); 
-        setSelectedSolidIndex(null);
+        setSelectedItemId(null);
       } else {
         const errData = await res.json();
         setServerLogs(prev => [...prev, `[Error] ${errData.detail}`]);
@@ -774,20 +754,26 @@ export default function App() {
     setIsCommitting(false);
   };
 
-  // SHARED FUNCTIONS
+  const handlePromoteSheet = () => {
+    if (!selectedItemId) return;
+    setRebuildHistory(prev => prev.map(geo => {
+      if (geo.id === selectedItemId && geo.type === 'sheet') {
+        return { ...geo, type: 'solid', name: geo.name + ' (Solid)' };
+      }
+      return geo;
+    }));
+  };
+
   const handleFileUpload = async (event) => {
     const file = event.target.files[0];
     if (!file || !file.name.toLowerCase().endsWith('.obj')) return;
 
     const url = URL.createObjectURL(file);
     setObjUrl(url);
-    setAnalysisTooltip(null);
-    setHullsData(null);
-    setFeaturesHistory([[]]);
-    setHistoryIndex(0);
     setSelectedLoops([]);
-    setSelectedSolidIndex(null);
+    setSelectedItemId(null);
     setRebuildHistory([]);
+    setExtractedFeatures([]);
 
     const formData = new FormData();
     formData.append('file', file);
@@ -809,94 +795,15 @@ export default function App() {
     event.target.value = ''; 
   };
 
-  const handleSaveProject = () => {
-    const projectData = {
-      hullsData,
-      features: currentFeatures,
-      rebuildHistory,
-      settings: { activeMode, maxHulls, detailLevel, decimationTarget, skipDecimation, minFeatureSize, symmetry, mergeExportHulls }
-    };
-    const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = "RetopoCAD_Session.json";
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const handleLoadProject = (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const data = JSON.parse(e.target.result);
-        if (data.hullsData) setHullsData(data.hullsData);
-        if (data.rebuildHistory) setRebuildHistory(data.rebuildHistory);
-        if (data.features) {
-          setFeaturesHistory([data.features]);
-          setHistoryIndex(0);
-        }
-        if (data.settings) {
-          if (data.settings.activeMode) setActiveMode(data.settings.activeMode);
-          if (data.settings.maxHulls) setMaxHulls(data.settings.maxHulls);
-          if (data.settings.detailLevel) setDetailLevel(data.settings.detailLevel);
-          if (data.settings.decimationTarget) setDecimationTarget(data.settings.decimationTarget);
-          if (data.settings.skipDecimation !== undefined) setSkipDecimation(data.settings.skipDecimation);
-          if (data.settings.minFeatureSize) setMinFeatureSize(data.settings.minFeatureSize);
-          if (data.settings.symmetry) setSymmetry(data.settings.symmetry);
-          if (data.settings.mergeExportHulls !== undefined) setMergeExportHulls(data.settings.mergeExportHulls);
-        }
-      } catch (err) {
-        console.error(err);
-      }
-    };
-    reader.readAsText(file);
-    event.target.value = '';
-  };
-
-  const handleModeChange = (mode) => {
-    setActiveMode(mode);
-    if (mode === 'organic') {
-      setMaxHulls(50); setDetailLevel(40); setDecimationTarget(4000); setSkipDecimation(false);
-    } else {
-      setMaxHulls(250); setDetailLevel(85); setDecimationTarget(15000); setSkipDecimation(false);
-    }
-  };
-
-  const handleGenerateHulls = async () => {
-    setIsGeneratingHulls(true);
-    setGenerationTimer(0);
-    const startTime = Date.now();
-    timerIntervalRef.current = setInterval(() => setGenerationTimer(((Date.now() - startTime) / 1000).toFixed(1)), 100);
-
-    try {
-      const res = await fetch('http://localhost:8000/generate-hulls', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ max_hulls: maxHulls, detail_level: detailLevel, decimation_target: decimationTarget, skip_decimation: skipDecimation })
-      });
-      const data = await res.json();
-      clearInterval(timerIntervalRef.current);
-      if (res.ok) setHullsData(data.hulls);
-    } catch (err) {
-      clearInterval(timerIntervalRef.current);
-    }
-    setIsGeneratingHulls(false);
-  };
-
   const handleExportSTEP = async () => {
-    if (!hullsData && currentFeatures.length === 0 && rebuildHistory.length === 0) return;
+    if (rebuildHistory.length === 0) return;
     setIsExporting(true);
 
     try {
       const res = await fetch('http://localhost:8000/export-step', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        // Append symmetry configuration into payload
-        body: JSON.stringify({ hulls: hullsData || [], features: currentFeatures, merge_hulls: mergeExportHulls, symmetry: symmetry })
+        body: JSON.stringify({ features: [], merge_hulls: mergeExportHulls, symmetry: symmetry })
       });
       
       if (res.ok) {
@@ -917,314 +824,196 @@ export default function App() {
     setMousePos({ x: e.clientX, y: e.clientY });
   };
 
+  const sheets = rebuildHistory.filter(h => h.type === 'sheet');
+  const solids = rebuildHistory.filter(h => h.type === 'solid');
+  const selectedItemData = rebuildHistory.find(geo => geo.id === selectedItemId);
+
+  // Using fixed inset-0 to prevent document scrolling / layout bouncing
   return (
-    <div className="absolute inset-0 flex overflow-hidden bg-zinc-900 text-zinc-100 font-sans" onPointerMove={handleGlobalPointerMove}>
+    <div 
+      className="fixed inset-0 flex flex-row overflow-hidden bg-zinc-900 text-zinc-100 font-sans" 
+      onPointerMove={handleGlobalPointerMove}
+      onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
+    >
       <style>{`
         input[type=number]::-webkit-inner-spin-button, 
         input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
         input[type=number] { -moz-appearance: textfield; }
+        ::-webkit-scrollbar { display: none; }
+        * { -ms-overflow-style: none; scrollbar-width: none; overscroll-behavior: none; }
       `}</style>
       
-      {/* V1.0 CONTEXT-AWARE ACTION RING (Using anchored position instead of live tracking) */}
-      {activeTab === 'rebuild' && (
-        <ActionRing 
-          anchorPos={menuAnchor} 
-          selectedLoops={selectedLoops} 
-          selectedSolidIndex={selectedSolidIndex}
-          extrudeDepth={extrudeDepth}
-          setExtrudeDepth={setExtrudeDepth}
-          onExtrude={handleExtrude}
-          onLoft={handleLoft}
-          onSheet={handleSheet}
-          onCut={handleCut}
-          onClear={() => { setSelectedLoops([]); setSelectedSolidIndex(null); }}
-        />
-      )}
+      <ActionRing 
+        anchorPos={menuAnchor} 
+        selectedLoops={selectedLoops} 
+        selectedItemId={selectedItemId}
+        extrudeDepth={extrudeDepth}
+        setExtrudeDepth={setExtrudeDepth}
+        onExtrude={handleExtrude}
+        onLoft={handleLoft}
+        onSheet={handleSheet}
+        onCut={handleCut}
+        onClear={() => { setSelectedLoops([]); setSelectedItemId(null); }}
+      />
 
-      <div className="w-72 bg-zinc-950 border-r border-zinc-800 flex flex-col z-10 shrink-0 shadow-2xl">
-        
+      {/* LEFT PANEL: OUTLINER */}
+      <div className="w-64 bg-zinc-950 border-r border-zinc-800 flex flex-col z-10 shrink-0 shadow-2xl">
         <div className="p-4 border-b border-zinc-800 flex items-center justify-between shrink-0">
           <h1 className="text-xl font-black tracking-wider text-white">RetopoCAD</h1>
-          {isUploading && <div className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></div>}
+          {isUploading && <div className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></div>}
         </div>
 
-        <div className="flex bg-zinc-900 border-b border-zinc-800 shrink-0">
-          <button 
-            onClick={() => setActiveTab('prototype')} 
-            className={`flex-1 py-2 text-[10px] font-bold uppercase tracking-wider transition-colors border-b-2 ${activeTab === 'prototype' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/50'}`}
-          >
-            Quick Prototype
-          </button>
-          <button 
-            onClick={() => setActiveTab('rebuild')} 
-            className={`flex-1 py-2 text-[10px] font-bold uppercase tracking-wider transition-colors border-b-2 ${activeTab === 'rebuild' ? 'border-amber-500 text-amber-400' : 'border-transparent text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/50'}`}
-          >
-            Precision Rebuild
-          </button>
+        <div className="p-3 border-b border-zinc-800">
+          <label className={`w-full py-2 flex items-center justify-center rounded text-[10px] font-bold text-white cursor-pointer transition-colors shadow ${isUploading ? 'bg-indigo-800 cursor-wait' : 'bg-indigo-600 hover:bg-indigo-500'}`}>
+            {isUploading ? 'WAIT...' : 'IMPORT MESH'}
+            <input type="file" accept=".obj" className="hidden" onChange={handleFileUpload} disabled={isUploading} />
+          </label>
+          {objUrl && <span className="text-[9px] font-mono text-emerald-400 leading-tight block truncate mt-2">{backendStatus}</span>}
         </div>
 
-        <div className="flex flex-col gap-3 p-3 flex-1 overflow-y-auto custom-scrollbar">
-          
-          <div className="bg-zinc-900 border border-zinc-800 rounded p-2 flex flex-col gap-2">
-            <div className="flex justify-between items-center">
-              <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Import Mesh</span>
-              <label className={`px-2 py-1 rounded text-[10px] font-bold text-white cursor-pointer transition-colors shadow ${isUploading ? 'bg-indigo-800 cursor-wait' : 'bg-indigo-600 hover:bg-indigo-500'}`}>
-                {isUploading ? 'WAIT...' : 'UPLOAD .OBJ'}
-                <input type="file" accept=".obj" className="hidden" onChange={handleFileUpload} disabled={isUploading} />
-              </label>
-            </div>
-            {objUrl && <span className="text-[9px] font-mono text-emerald-400 leading-tight block truncate">{backendStatus}</span>}
-
-            <div className="flex gap-1.5 mt-1 pt-2 border-t border-zinc-800">
-              <button onClick={handleSaveProject} disabled={!objUrl} className="flex-1 py-1 rounded text-[9px] font-bold uppercase tracking-wider bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed border border-zinc-700">
-                Save Session
-              </button>
-              <label className={`flex-1 flex items-center justify-center py-1 rounded text-[9px] font-bold uppercase tracking-wider bg-zinc-800 text-zinc-300 transition-colors border border-zinc-700 ${!objUrl ? 'opacity-50 cursor-not-allowed' : 'hover:bg-zinc-700 hover:text-white cursor-pointer'}`}>
-                Load Session
-                <input type="file" accept=".json" onChange={handleLoadProject} disabled={!objUrl} className="hidden" />
-              </label>
-            </div>
+        {objUrl && (
+          <div className="p-3 border-b border-zinc-800 bg-zinc-900/30 flex flex-col gap-2">
+             <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Curves Extraction</span>
+             <div className="flex items-center gap-2">
+               <span className="text-[10px] w-14 text-zinc-400">Min Size</span>
+               <input type="range" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value))} disabled={isAutoExtracting} className="flex-1 accent-emerald-500 h-1" />
+               <input type="number" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value) || 0)} disabled={isAutoExtracting} className="text-[10px] text-emerald-400 w-10 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-emerald-500" />
+             </div>
+             <div className="flex gap-1.5 mt-0.5">
+               <button onClick={handleAutoExtract} disabled={isAutoExtracting} className="flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white border border-emerald-600/50 transition-colors">
+                 Auto Detect
+               </button>
+               <button onClick={() => setExtractedFeatures([])} disabled={isAutoExtracting || extractedFeatures.length === 0} className="flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-red-600/10 text-red-500 hover:bg-red-600 hover:text-white border border-red-600/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                 Clear
+               </button>
+             </div>
           </div>
+        )}
 
-          {/* TAB 1: QUICK PROTOTYPE */}
-          {activeTab === 'prototype' && objUrl && (
-             <div className="flex flex-col gap-3 animate-in fade-in duration-200">
-               <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
-                  <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Curves Extraction</span>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] w-14 text-zinc-400">Min Size</span>
-                    <input type="range" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value))} disabled={isAutoExtracting} className="flex-1 accent-emerald-500 h-1" />
-                    <input type="number" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value) || 0)} disabled={isAutoExtracting} className="text-[10px] text-emerald-400 w-10 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-emerald-500" />
-                  </div>
-                  <div className="flex gap-1.5 mt-0.5">
-                    <button onClick={handleAutoExtract} disabled={isAutoExtracting} className="flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white border border-emerald-600/50 transition-colors">
-                      Auto Detect
-                    </button>
-                    <button onClick={handleClearAllFeatures} disabled={isAutoExtracting || currentFeatures.length === 0} className="flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-red-600/10 text-red-500 hover:bg-red-600 hover:text-white border border-red-600/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
-                      Clear
-                    </button>
-                  </div>
-               </div>
-
-               <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2 relative overflow-hidden">
-                  <div className="flex justify-between items-center mb-0.5">
-                    <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Auto-Blocker</span>
-                  </div>
-                  
-                  <div className="text-[9px] text-red-400 uppercase tracking-widest font-bold border border-red-900/50 bg-red-900/10 p-1.5 rounded flex items-start gap-1.5 leading-tight">
-                    <svg className="w-3 h-3 shrink-0 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
-                    Rough / Experimental. Best for collision meshes. Use Rebuild tab for precision.
-                  </div>
-
-                  <div className="flex bg-zinc-950 rounded border border-zinc-800 p-0.5 mt-1">
-                    <button onClick={() => handleModeChange('organic')} disabled={isGeneratingHulls} className={`flex-1 py-0.5 text-[9px] font-bold uppercase tracking-wide rounded transition-colors ${activeMode === 'organic' ? 'bg-indigo-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>Organic</button>
-                    <button onClick={() => handleModeChange('hard-surface')} disabled={isGeneratingHulls} className={`flex-1 py-0.5 text-[9px] font-bold uppercase tracking-wide rounded transition-colors ${activeMode === 'hard-surface' ? 'bg-indigo-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>Hard Surface</button>
-                  </div>
-                  
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] w-14 text-zinc-400">Blocks</span>
-                    <input type="range" min="1" max="500" value={maxHulls} onChange={(e) => setMaxHulls(parseInt(e.target.value))} disabled={isGeneratingHulls} className="flex-1 accent-indigo-500 h-1" />
-                    <input type="number" min="1" max="500" value={maxHulls} onChange={(e) => setMaxHulls(parseInt(e.target.value) || 0)} disabled={isGeneratingHulls} className="text-[10px] text-indigo-400 w-10 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-indigo-500" />
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] w-14 text-zinc-400">Detail</span>
-                    <input type="range" min="1" max="100" value={detailLevel} onChange={(e) => setDetailLevel(parseInt(e.target.value))} disabled={isGeneratingHulls} className="flex-1 accent-indigo-500 h-1" />
-                    <div className="flex items-center bg-zinc-950 border border-zinc-700 rounded px-1 focus-within:border-indigo-500 w-12 justify-end transition-colors">
-                      <input type="number" min="1" max="100" value={detailLevel} onChange={(e) => setDetailLevel(parseInt(e.target.value) || 0)} disabled={isGeneratingHulls} className="text-[10px] text-indigo-400 w-full text-right font-mono bg-transparent outline-none" />
-                      <span className="text-[10px] text-indigo-400 ml-0.5">%</span>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] w-14 text-zinc-400">Resol.</span>
-                    <input type="range" min="1000" max="30000" step="1000" value={decimationTarget} onChange={(e) => setDecimationTarget(parseInt(e.target.value))} disabled={isGeneratingHulls || skipDecimation} className={`flex-1 accent-indigo-500 h-1 ${skipDecimation ? 'opacity-50 grayscale' : ''}`} />
-                    <input type="number" min="1000" max="100000" step="1000" value={decimationTarget} onChange={(e) => setDecimationTarget(parseInt(e.target.value) || 0)} disabled={isGeneratingHulls || skipDecimation} className={`text-[10px] text-indigo-400 w-14 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-indigo-500 ${skipDecimation ? 'line-through opacity-50' : ''}`} />
-                  </div>
-
-                  <div className="flex items-center gap-2 mt-1">
-                    <input type="checkbox" id="skipDec" checked={skipDecimation} onChange={(e) => setSkipDecimation(e.target.checked)} disabled={isGeneratingHulls} className="accent-red-500 w-3 h-3 rounded bg-zinc-800 border-zinc-700" />
-                    <label htmlFor="skipDec" className="text-[9px] text-zinc-300 uppercase tracking-wide cursor-pointer select-none">Skip Decimation (Raw)</label>
-                  </div>
-                  
-                  <button onClick={handleGenerateHulls} disabled={isGeneratingHulls} className={`w-full py-1.5 mt-1 rounded text-[11px] font-bold uppercase tracking-widest transition-colors flex items-center justify-center gap-2 ${isGeneratingHulls ? 'bg-zinc-800 text-zinc-500 cursor-wait' : 'bg-indigo-600 text-white hover:bg-indigo-500 shadow'}`}>
-                    {isGeneratingHulls ? `Processing (${generationTimer}s)` : 'Generate'}
-                  </button>
-               </div>
-             </div>
-          )}
-
-          {/* TAB 2: PRECISION REBUILD */}
-          {activeTab === 'rebuild' && objUrl && (
-             <div className="flex flex-col gap-3 animate-in fade-in duration-200">
-               <div className="bg-zinc-900 rounded border border-amber-900/50 p-2 flex flex-col gap-2">
-                 <div className="flex justify-between items-center pb-1 border-b border-zinc-800">
-                    <span className="text-[10px] font-bold uppercase text-amber-500 tracking-wider">Selection Stack</span>
-                    <span className="text-[10px] font-mono text-zinc-500 bg-zinc-950 px-2 py-0.5 rounded">{selectedLoops.length} Items</span>
-                 </div>
-                 
-                 <p className="text-[9px] text-zinc-400 italic">Hover mesh to preview loops. Click to add to stack.</p>
-
-                 <div className="min-h-16 max-h-32 overflow-y-auto bg-zinc-950 border border-zinc-800 rounded p-1 flex flex-col gap-1 custom-scrollbar">
-                    {selectedLoops.length === 0 ? (
-                      <span className="text-zinc-600 text-[10px] text-center mt-4">Stack is empty.</span>
-                    ) : (
-                      selectedLoops.map((loop, i) => (
-                        <div key={i} className="flex justify-between items-center bg-zinc-800/50 px-2 py-1 rounded text-[10px] font-mono text-zinc-300">
-                          <span>Loop #{loop.id.split('_')[1]}</span>
-                          <span className="text-amber-500">[{loop.points.length} pts]</span>
-                        </div>
-                      ))
-                    )}
-                 </div>
-               </div>
-               
-               {rebuildHistory.length > 0 && (
-                 <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-1.5">
-                   <div className="flex justify-between items-center mb-1">
-                     <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Built Geometry</span>
-                     <span className="text-[10px] font-mono text-emerald-400 bg-emerald-900/30 px-2 py-0.5 rounded border border-emerald-800">{rebuildHistory.length}</span>
-                   </div>
-                   <div className="flex justify-between items-center px-1">
-                     <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-500">Solids</span>
-                     <span className="text-[11px] font-mono font-bold text-blue-400">{rebuildHistory.filter(h => h.type === 'solid').length}</span>
-                   </div>
-                   <div className="flex justify-between items-center px-1">
-                     <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-500">Surface Sheets</span>
-                     <span className="text-[11px] font-mono font-bold text-green-400">{rebuildHistory.filter(h => h.type === 'sheet').length}</span>
-                   </div>
-                 </div>
-               )}
-             </div>
-          )}
-
-          {/* SHARED EXPORT FOOTER */}
-          {objUrl && (
-             <div className="mt-auto pt-2 border-t border-zinc-800 flex flex-col gap-2">
-                <div className="flex items-center gap-2 px-1">
-                  <input type="checkbox" id="mergeHulls" checked={mergeExportHulls} onChange={(e) => setMergeExportHulls(e.target.checked)} disabled={isExporting} className="accent-emerald-500 w-3 h-3 rounded bg-zinc-800 border-zinc-700" />
-                  <label htmlFor="mergeHulls" className="text-[10px] text-zinc-300 uppercase tracking-wide cursor-pointer select-none">Merge Solids (Boolean)</label>
-                </div>
-                <button onClick={handleExportSTEP} disabled={isExporting || (!hullsData && currentFeatures.length === 0 && rebuildHistory.length === 0)} className={`w-full py-2.5 rounded text-[11px] font-bold uppercase tracking-widest transition-all flex items-center justify-center gap-2 ${isExporting ? 'bg-emerald-900 text-emerald-400 cursor-wait' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-lg shadow-emerald-900/20 disabled:opacity-30 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:shadow-none'}`}>
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                  {isExporting ? 'Building STEP...' : 'Export STEP'}
-                </button>
-             </div>
-          )}
-        </div>
-      </div>
-
-      <div className="flex-1 flex flex-col relative bg-zinc-900">
-        
-        <div className="flex-1 relative overflow-hidden">
-          <Viewport 
-            objUrl={objUrl} 
-            symmetry={symmetry} 
-            activeTool={activeTool}
-            activeTab={activeTab}
-            onAnalyze={(data) => setAnalysisTooltip(data)} 
-            onFeatureExtracted={handleFeatureExtracted}
-            onFeatureDelete={handleFeatureDelete}
-            onSelectLoop={handleSelectLoop}
-            onSelectSolid={handleSelectSolid}
-            extractedFeatures={currentFeatures}
-            hullsData={hullsData} 
-            showMesh={showMesh} 
-            showWireframe={showWireframe}
-            meshOpacity={meshOpacity}
-            showHulls={showHulls} 
-            selectedLoops={selectedLoops}
-            rebuildHistory={rebuildHistory}
-            selectedSolidIndex={selectedSolidIndex}
-          />
-
-          {analysisTooltip && activeTab === 'prototype' && (
-             <div 
-                style={{ left: Math.min(analysisTooltip.x + 15, window.innerWidth - 250), top: Math.min(analysisTooltip.y + 15, window.innerHeight - 150) }} 
-                className="absolute bg-zinc-900/95 backdrop-blur-md border border-zinc-700 rounded-lg shadow-2xl p-3 w-56 z-50 pointer-events-auto"
-             >
-                <div className="flex justify-between items-center mb-2 pb-1 border-b border-zinc-800">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-300">Surface Info</span>
-                  <button onClick={() => setAnalysisTooltip(null)} className="text-zinc-500 hover:text-white">
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                  </button>
-                </div>
-                <div className="flex flex-col gap-1.5 text-xs font-mono">
-                  <div className="flex justify-between">
-                    <span className="text-zinc-400">Type:</span>
-                    <span className={analysisTooltip.type === 'planar' ? 'text-blue-400 font-bold uppercase' : 'text-green-400 font-bold uppercase'}>{analysisTooltip.type}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-zinc-400">Faces:</span>
-                    <span className="text-zinc-200">{analysisTooltip.face_count}</span>
-                  </div>
-                  {analysisTooltip.type === 'cylindrical' && (
-                    <div className="flex justify-between">
-                      <span className="text-zinc-400">Radius:</span>
-                      <span className="text-zinc-200">{analysisTooltip.radius?.toFixed(4)}</span>
-                    </div>
-                  )}
-                  <div className="flex justify-between">
-                    <span className="text-zinc-400">Variance:</span>
-                    <span className="text-zinc-200">{analysisTooltip.variance.toExponential(2)}</span>
-                  </div>
-                </div>
-             </div>
-          )}
-
-          <div className="absolute top-4 left-4 flex flex-col gap-1.5 z-10 items-start">
-            <div className="flex gap-2">
-              <button onClick={() => setShowMesh(!showMesh)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showMesh ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
-                <span className="text-xs font-semibold">Mesh</span>
-              </button>
-
-              <button onClick={() => setShowWireframe(!showWireframe)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showWireframe ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>
-                <span className="text-xs font-semibold">Wireframe</span>
-              </button>
-
-              <button onClick={() => setShowHulls(!showHulls)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showHulls ? 'bg-blue-900/40 border-blue-700 text-blue-100' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" /></svg>
-                <span className="text-xs font-semibold">Solids</span>
-              </button>
+        <div className="flex-1 overflow-y-auto p-2 flex flex-col gap-4">
+          
+          {/* Reference Mesh Folder */}
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-2 px-2 py-1 text-zinc-400 font-bold uppercase tracking-wider text-[10px]">
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+              Reference Mesh
             </div>
-            
-            {showMesh && (
-              <div className="flex items-center gap-3 px-3 py-1.5 bg-zinc-900/80 border border-zinc-800 rounded-md shadow-lg backdrop-blur-md pointer-events-auto">
-                <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wide">Opacity</span>
-                <input type="range" min="0" max="1" step="0.05" value={meshOpacity} onChange={(e) => setMeshOpacity(parseFloat(e.target.value))} className="w-24 accent-zinc-300 h-1" />
-                <input type="number" min="0" max="1" step="0.05" value={meshOpacity} onChange={(e) => setMeshOpacity(parseFloat(e.target.value) || 0)} className="text-[10px] text-zinc-300 w-10 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-zinc-500" />
+            {objUrl && (
+              <div className="flex items-center justify-between px-3 py-1.5 bg-zinc-900 rounded border border-zinc-800 group hover:border-zinc-600 transition-colors">
+                <span className="text-[11px] text-zinc-300">Imported.obj</span>
+                <button onClick={() => setShowMesh(!showMesh)} className="text-zinc-500 hover:text-zinc-300">
+                  {showMesh ? <IconEye /> : <IconEyeOff />}
+                </button>
               </div>
             )}
           </div>
 
-          {activeTab === 'prototype' && (
-            <div className="absolute top-1/2 left-4 -translate-y-1/2 flex flex-col gap-2 z-10 bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-lg shadow-2xl p-2 pointer-events-auto">
-              
-              <button title="Surface Info" onClick={() => setActiveTool('analyze')} className={`p-2.5 rounded-md transition-all ${activeTool === 'analyze' ? 'bg-blue-600 text-white shadow-md' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`}>
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-              </button>
-
-              <button title="Smart Curve Extract (Manual)" onClick={() => setActiveTool('extract')} className={`p-2.5 rounded-md transition-all ${activeTool === 'extract' ? 'bg-emerald-600 text-white shadow-md' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`}>
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
-              </button>
-
-              <div className="w-full h-px bg-zinc-800 my-1"></div>
-
-              <button title="Select & Delete Shape" onClick={() => setActiveTool('delete')} className={`p-2.5 rounded-md transition-all ${activeTool === 'delete' ? 'bg-red-600 text-white shadow-md' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`}>
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
-              </button>
-
-              <div className="w-full h-px bg-zinc-800 my-1"></div>
-
-              <button title="Undo" onClick={handleUndo} disabled={historyIndex === 0} className="p-2.5 rounded-md text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed transition-all">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" /></svg>
-              </button>
-              <button title="Redo" onClick={handleRedo} disabled={historyIndex === featuresHistory.length - 1} className="p-2.5 rounded-md text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed transition-all">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 10h-10a8 8 0 00-8 8v2M21 10l-6 6m6-6l-6-6" /></svg>
-              </button>
-
+          {/* Surface Sheets Folder */}
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-2 px-2 py-1 text-green-500/80 font-bold uppercase tracking-wider text-[10px]">
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+              Surface Sheets
             </div>
-          )}
+            {sheets.length === 0 ? <span className="px-3 text-[10px] text-zinc-600 italic">Empty</span> : sheets.map((geo, i) => {
+              const isCylindrical = geo.payload?.loops?.[0]?.type === 'circle' || geo.sub_type === 'cylinder';
+              return (
+                <div 
+                  key={geo.id} 
+                  onClick={() => setSelectedItemId(geo.id)}
+                  className={`flex items-center justify-between px-3 py-1.5 rounded border cursor-pointer transition-colors ${selectedItemId === geo.id ? 'bg-zinc-800 border-green-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
+                >
+                  <div className="flex items-center gap-2 overflow-hidden">
+                    <span className="text-zinc-500 shrink-0">{isCylindrical ? <IconCylinderOutline /> : <IconSquare />}</span>
+                    <span className="text-[11px] text-zinc-300 font-mono truncate">{geo.name || `Sheet_${geo.id}`}</span>
+                  </div>
+                  <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0">
+                    {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* CAD Solids Folder */}
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-2 px-2 py-1 text-blue-500/80 font-bold uppercase tracking-wider text-[10px]">
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+              CAD Solids
+            </div>
+            {solids.length === 0 ? <span className="px-3 text-[10px] text-zinc-600 italic">Empty</span> : solids.map((geo, i) => {
+              const isCylindrical = geo.payload?.loops?.[0]?.type === 'circle' || geo.sub_type === 'cylinder';
+              return (
+                <div 
+                  key={geo.id} 
+                  onClick={() => setSelectedItemId(geo.id)}
+                  className={`flex items-center justify-between px-3 py-1.5 rounded border cursor-pointer transition-colors ${selectedItemId === geo.id ? 'bg-zinc-800 border-blue-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
+                >
+                  <div className="flex items-center gap-2 overflow-hidden">
+                    <span className="text-zinc-500 shrink-0">{isCylindrical ? <IconCylinderOutline /> : <IconSquare />}</span>
+                    <span className="text-[11px] text-zinc-300 font-mono truncate">{geo.name || `Solid_${geo.id}`}</span>
+                  </div>
+                  <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0">
+                    {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+        </div>
+
+        {objUrl && (
+           <div className="p-3 border-t border-zinc-800 flex flex-col gap-2">
+              <div className="flex items-center gap-2 px-1">
+                <input type="checkbox" id="mergeHulls" checked={mergeExportHulls} onChange={(e) => setMergeExportHulls(e.target.checked)} disabled={isExporting} className="accent-indigo-500 w-3 h-3 rounded bg-zinc-800 border-zinc-700" />
+                <label htmlFor="mergeHulls" className="text-[10px] text-zinc-300 uppercase tracking-wide cursor-pointer select-none">Merge Geometry</label>
+              </div>
+              <button onClick={handleExportSTEP} disabled={isExporting || rebuildHistory.length === 0} className={`w-full py-2 rounded text-[11px] font-bold uppercase tracking-widest transition-all flex items-center justify-center gap-2 ${isExporting ? 'bg-indigo-900 text-indigo-400 cursor-wait' : 'bg-indigo-600 text-white hover:bg-indigo-500 shadow-lg shadow-indigo-900/20 disabled:opacity-30 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:shadow-none'}`}>
+                {isExporting ? 'Building STEP...' : 'Export STEP'}
+              </button>
+           </div>
+        )}
+      </div>
+
+      {/* CENTER PANEL: VIEWPORT */}
+      <div className="flex-1 flex flex-col relative bg-zinc-900 overflow-hidden">
+        
+        <div className="flex-1 relative">
+          <Viewport 
+            objUrl={objUrl} 
+            symmetry={symmetry} 
+            activeTool={activeTool}
+            onSelectLoop={handleSelectLoop}
+            onSelectSolid={handleSelectSolid}
+            showMesh={showMesh} 
+            showWireframe={showWireframe}
+            meshOpacity={meshOpacity}
+            selectedLoops={selectedLoops}
+            rebuildHistory={rebuildHistory}
+            selectedItemId={selectedItemId}
+            cursorScale={cursorScale}
+            extractedFeatures={extractedFeatures}
+          />
+
+          <div className="absolute top-4 left-4 flex gap-2 z-10 items-start">
+            <button onClick={() => setShowWireframe(!showWireframe)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showWireframe ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>
+              <span className="text-xs font-semibold">Wireframe</span>
+            </button>
+            
+            {showMesh && (
+              <>
+                <div className="flex items-center gap-3 px-3 py-1.5 bg-zinc-900/80 border border-zinc-800 rounded-md shadow-lg backdrop-blur-md pointer-events-auto">
+                  <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wide">Opacity</span>
+                  <input type="range" min="0" max="1" step="0.05" value={meshOpacity} onChange={(e) => setMeshOpacity(parseFloat(e.target.value))} className="w-20 accent-zinc-300 h-1" />
+                </div>
+                <div className="flex items-center gap-3 px-3 py-1.5 bg-zinc-900/80 border border-zinc-800 rounded-md shadow-lg backdrop-blur-md pointer-events-auto">
+                  <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wide">Cursor</span>
+                  <input type="range" min="0.001" max="0.02" step="0.001" value={cursorScale} onChange={(e) => setCursorScale(parseFloat(e.target.value))} className="w-16 accent-zinc-300 h-1" />
+                </div>
+              </>
+            )}
+          </div>
 
           <div className="absolute top-4 right-4 bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-md shadow-2xl p-2 w-40 z-10 flex flex-col gap-1.5 pointer-events-auto">
             <span className="text-[9px] font-bold text-zinc-400 uppercase tracking-widest border-b border-zinc-800/50 pb-1.5 mb-0.5 text-center">Mirror Planes</span>
@@ -1235,13 +1024,13 @@ export default function App() {
         </div>
 
         <div className="h-28 bg-[#0a0a0c] border-t border-zinc-800 shrink-0 flex flex-col shadow-[inset_0_4px_6px_rgba(0,0,0,0.5)]">
-          <div className="flex items-center justify-between px-3 py-1 bg-zinc-900 border-b border-zinc-800">
+          <div className="flex items-center px-3 py-1 bg-zinc-900 border-b border-zinc-800">
             <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 flex items-center gap-2">
               <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
               Output Console
             </span>
           </div>
-          <div className="flex-1 p-2 overflow-y-auto custom-scrollbar font-mono text-[11px] text-zinc-400 leading-relaxed flex flex-col justify-start">
+          <div className="flex-1 p-2 overflow-y-auto font-mono text-[11px] text-zinc-400 leading-relaxed flex flex-col justify-start">
             {serverLogs.map((log, i) => (
               <div key={i} className={log.includes('[Error]') ? 'text-red-400' : log.includes('[Success]') || log.includes('[CAD]') ? 'text-emerald-400' : log.includes('[Warning]') ? 'text-yellow-400' : ''}>
                 <span className="opacity-30 select-none mr-2">{'>'}</span>{log}
@@ -1250,7 +1039,113 @@ export default function App() {
             <div ref={consoleEndRef} />
           </div>
         </div>
+      </div>
 
+      {/* RIGHT PANEL: INSPECTOR */}
+      <div className="w-64 bg-zinc-950 border-l border-zinc-800 flex flex-col z-10 shrink-0 shadow-2xl">
+        <div className="p-4 border-b border-zinc-800">
+          <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-300">Inspector</h2>
+        </div>
+
+        <div className="p-4 flex-1 overflow-y-auto">
+          {!selectedItemId ? (
+            <div className="flex flex-col gap-3">
+              <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-2">
+                <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Environment</span>
+                <div className="flex flex-col gap-1 mt-2">
+                  <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
+                    <span>Sharpness (Dihedral)</span>
+                    <span className="text-white">{sharpnessAngle}°</span>
+                  </div>
+                  <input 
+                    type="range" 
+                    min="0" max="180" 
+                    value={sharpnessAngle} 
+                    onChange={(e) => setSharpnessAngle(parseInt(e.target.value))} 
+                    className="w-full accent-indigo-500 h-1 mt-1" 
+                  />
+                </div>
+              </div>
+              <div className="text-[10px] text-zinc-600 mt-4 text-center italic px-4">
+                Select an object in the viewport or outliner to view its properties.
+              </div>
+            </div>
+          ) : selectedItemData ? (
+            <div className="flex flex-col gap-3">
+              <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-3">
+                
+                <div className="flex justify-between items-center border-b border-zinc-800 pb-2">
+                  <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Classification</span>
+                  <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${selectedItemData.type === 'sheet' ? 'bg-green-900/30 text-green-400 border border-green-800' : 'bg-blue-900/30 text-blue-400 border border-blue-800'}`}>
+                    {selectedItemData.type}
+                  </span>
+                </div>
+
+                <div className="flex flex-col gap-1 pt-1">
+                  <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">History & Properties</span>
+                  
+                  <div className="flex justify-between items-center bg-zinc-950 p-2 rounded border border-zinc-800 mt-1">
+                    <span className="text-[10px] font-mono text-zinc-500">Name</span>
+                    <input 
+                      className="text-[10px] font-mono text-zinc-300 bg-transparent text-right outline-none w-32 border-b border-transparent focus:border-indigo-500 transition-colors"
+                      value={selectedItemData.name || `${selectedItemData.type}_${selectedItemData.id}`}
+                      onChange={(e) => setRebuildHistory(prev => prev.map(geo => geo.id === selectedItemId ? { ...geo, name: e.target.value } : geo))}
+                    />
+                  </div>
+
+                  <div className="flex justify-between items-center bg-zinc-950 p-2 rounded border border-zinc-800 mt-1">
+                    <span className="text-[10px] font-mono text-zinc-500">Faces Count</span>
+                    <span className="text-[10px] font-mono text-zinc-300">{selectedItemData.faces?.length || 0}</span>
+                  </div>
+                </div>
+
+                {selectedItemData.payload && selectedItemData.payload.operation === 'extrude' && (
+                  <div className="mt-4 pt-4 border-t border-zinc-800 flex flex-col gap-2">
+                      <div className="flex items-center justify-between">
+                          <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Rebuild Param</span>
+                          {isCommitting && <span className="text-[8px] text-indigo-400 animate-pulse uppercase tracking-wider">Building...</span>}
+                      </div>
+                      
+                      <div className="flex items-center justify-between bg-zinc-950 p-2 rounded border border-zinc-800">
+                         <span className="text-[10px] font-mono text-zinc-500">Depth</span>
+                         <input 
+                           type="number"
+                           className="w-16 bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[10px] text-zinc-300 outline-none focus:border-indigo-500 text-right font-mono"
+                           defaultValue={selectedItemData.payload.extrude_depth}
+                           onBlur={(e) => {
+                               const newDepth = parseFloat(e.target.value) || 0;
+                               if (newDepth !== selectedItemData.payload.extrude_depth) {
+                                    handleUpdateHistoryItem(selectedItemId, newDepth);
+                               }
+                           }}
+                           onKeyDown={(e) => {
+                               if (e.key === 'Enter') e.target.blur();
+                           }}
+                           disabled={isCommitting}
+                           step="0.1"
+                         />
+                      </div>
+                      <span className="text-[8px] text-zinc-600 italic text-right pr-1">Press Enter to re-run Extrude logic</span>
+                  </div>
+                )}
+
+                {selectedItemData.type === 'sheet' && (
+                  <div className="mt-4 pt-4 border-t border-zinc-800">
+                    <button 
+                      onClick={handlePromoteSheet}
+                      className="w-full py-2 bg-blue-600/20 text-blue-400 hover:bg-blue-600 hover:text-white border border-blue-600/50 rounded text-[10px] font-bold uppercase tracking-wider transition-colors"
+                    >
+                      Promote to Solid
+                    </button>
+                    <p className="text-[9px] text-zinc-500 text-center mt-2">Applies thickness and moves to CAD Solids</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="text-[10px] text-zinc-600 text-center italic">Object not found.</div>
+          )}
+        </div>
       </div>
     </div>
   );

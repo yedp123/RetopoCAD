@@ -128,7 +128,7 @@ function GhostModel({
   url, symmetry, activeTool, activeTab, 
   onAnalyze, onFeatureExtracted, onFeatureDelete, onSelectLoop, onSelectSolid,
   extractedFeatures, hullsData, showMesh, showWireframe, meshOpacity, showHulls,
-  selectedLoops, rebuildHistory, selectedSolidIndex 
+  selectedLoops, rebuildHistory, selectedSolidIndex, cursorScale
 }) {
   const obj = useLoader(OBJLoader, url);
   const cursorGroupRef = useRef(); 
@@ -168,7 +168,9 @@ function GhostModel({
     const size = new THREE.Vector3();
     box.getSize(size);
     const maxDimension = Math.max(size.x, size.y, size.z);
-    const calculatedRadius = maxDimension * 0.015;
+    
+    // Applying the user-controlled cursor scale here
+    const calculatedRadius = maxDimension * (cursorScale || 0.015);
 
     obj.traverse((child) => {
       if (child.isMesh && child.geometry) {
@@ -186,7 +188,7 @@ function GhostModel({
     });
     
     return { meshes: extracted, cursorRadius: calculatedRadius, centerOffset: center };
-  }, [obj]);
+  }, [obj, cursorScale]);
 
   const hullMaterial = useMemo(() => new THREE.MeshStandardMaterial({
     color: "#3b82f6", 
@@ -440,7 +442,7 @@ export default function Viewport({
   objUrl, symmetry, activeTool, activeTab, 
   onAnalyze, onFeatureExtracted, onFeatureDelete, onSelectLoop, onSelectSolid,
   extractedFeatures, hullsData, showMesh, showWireframe, meshOpacity, showHulls,
-  selectedLoops, rebuildHistory, selectedSolidIndex 
+  selectedLoops, rebuildHistory, selectedSolidIndex, cursorScale
 }) {
   return (
     <Canvas camera={{ position: [5, 5, 5], fov: 45 }} gl={{ antialias: true }} raycaster={{ params: { Line: { threshold: 0.5 } } }}>
@@ -473,6 +475,7 @@ export default function Viewport({
                 selectedLoops={selectedLoops}
                 rebuildHistory={rebuildHistory}
                 selectedSolidIndex={selectedSolidIndex}
+                cursorScale={cursorScale}
               />
             </Bounds>
             {symmetry?.x && <mesh rotation={[0, Math.PI / 2, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#ef4444" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
