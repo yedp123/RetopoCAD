@@ -1,22 +1,15 @@
 # **RetopoCAD 🚀**
 
+<img width="1920" height="919" alt="image" src="https://github.com/user-attachments/assets/98b8b2b7-43f7-4ed3-a696-ac9698477518" />
+
+
 **An experimental, browser-based tool to bridge the gap between messy high-poly meshes and clean Solid CAD.**
-
-RetopoCAD allows you to upload high-density .obj files (like kitbashed concepts, 3D scans, or ZBrush sculpts), automatically convert them into mathematically solid blockouts, extract analytical curves (circles/planar shapes), and export the entire package directly to a .step file.
-
-This creates a seamless bridge into modern CAD software like **Plasticity** or **Fusion 360** without having to manually retopologize your mesh click-by-click.
 
 ## **⚠️ Highly Experimental**
 
-This project was developed as a rapid prototype and MVP. It relies on intense mathematical operations, floating-point geometry sewing, and C++ bindings. While the export functions feature "robust fallbacks," edge cases with corrupted meshes, zero-thickness geometry, or highly complex triangulations may cause unexpected behavior. **Save your sessions often\!**
-
 ## **Features**
 
-* **Auto-Blocker:** Uses Approximate Convex Decomposition to slice organic and hard-surface meshes into watertight CAD blocks.  
-* **Smart Curve Extraction:** Click on any flat panel or cylindrical hole. The Python backend will analyze the surface curvature variance to automatically fit a perfectly mathematical 2D Circle or trace the polygon boundary into a 1D CAD sketch.  
-* **Batch Auto-Extract:** Scans the entire mesh and automatically extracts all valid curves that meet your minimum size threshold.  
-* **Live STEP Export:** Compiles triangulated hulls via the OpenCASCADE sewing API into solid BREP bodies, merges them via Boolean Unions, and injects your 2D sketches into a single .step file.  
-* **Session Management:** Save your blocks, settings, and curves to a lightweight .json file to easily pick up where you left off.
+wip
 
 ## **Tech Stack & Credits**
 
