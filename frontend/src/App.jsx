@@ -27,7 +27,7 @@ function CompactSymmetryToggle({ label, active, onClick, colorClass }) {
   );
 }
 
-function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis }) {
+function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive }) {
   const [pos, setPos] = useState({ x: -1000, y: -1000 });
   const isEditingExtrude = selectedItemData?.payload?.operation === 'extrude';
   const [localDepth, setLocalDepth] = useState(extrudeDepth);
@@ -78,7 +78,14 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
   if (selectedLoops.length > 0) {
       buttons.push({ label: extrudeLabel, icon: isCylinderLoop ? <IconCylinderFill /> : <IconExtrude />, angle: -90, action: onExtrude, disabled: selectedLoops.length !== 1, color: 'text-blue-400' });
       buttons.push({ label: 'Loft', icon: <IconLoft />, angle: 0, action: onLoft, disabled: selectedLoops.length !== 2, color: 'text-blue-400' });
-      buttons.push({ label: 'Sheet', icon: <IconSheet />, angle: 90, action: onSheet, disabled: selectedLoops.length !== 1, color: 'text-green-400' });
+      
+      // Dynamic Sheet / Create Primitive button
+      if (patchAnalysis) {
+          buttons.push({ label: 'Create\nPrimitive', icon: <IconExtrude />, angle: 90, action: onCreatePrimitive, disabled: false, color: 'text-emerald-400' });
+      } else {
+          buttons.push({ label: 'Sheet', icon: <IconSheet />, angle: 90, action: onSheet, disabled: selectedLoops.length !== 1, color: 'text-green-400' });
+      }
+      
       buttons.push({ label: 'Extract\nCurve', icon: <IconWave />, angle: 180, action: onExtractCurve, disabled: selectedLoops.length === 0, color: 'text-purple-400' });
       
       if (selectedItemData) {
@@ -333,6 +340,47 @@ export default function App() {
     setIsCommitting(false);
   };
 
+  const handleCreatePrimitive = async () => {
+    if (selectedLoops.length === 0 || !patchAnalysis) return;
+    const loop = selectedLoops[0];
+    if (!loop.patch_faces) return;
+    
+    setIsCommitting(true);
+    try {
+        const payload = {
+            patch_faces: loop.patch_faces,
+            primitive_type: patchAnalysis.type,
+            sharpness_angle: sharpnessAngle,
+            symmetry: symmetry
+        };
+        
+        const res = await fetch(`http://localhost:8000/create-primitive`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        
+        if (res.ok) {
+            const geometryData = await res.json();
+            const type = patchAnalysis.type === 'plane' ? 'sheet' : 'solid';
+            const defaultName = patchAnalysis.type.charAt(0).toUpperCase() + patchAnalysis.type.slice(1);
+            setRebuildHistory(prev => [...prev, { 
+              ...geometryData, type, id: Math.random().toString(36).substr(2, 9), 
+              visible: true, name: `${defaultName} ${prev.length + 1}`, payload: { operation: 'primitive', primitive_type: patchAnalysis.type }, endpoint: 'create-primitive' 
+            }]);
+            setSelectedLoops([]); 
+            setSelectedItemId(null);
+            setPatchAnalysis(null);
+        } else {
+            const errData = await res.json();
+            setServerLogs(prev => [...prev, `[Error] ${errData.detail}`]);
+        }
+    } catch (err) {
+        setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]);
+    }
+    setIsCommitting(false);
+  };
+
   const handleAutoExtract = async () => {
     setIsAutoExtracting(true);
     try {
@@ -358,7 +406,6 @@ export default function App() {
     if (clickPos) setMenuAnchor(clickPos);
     else setMenuAnchor(mousePos); 
 
-    // Automatically trigger curvature analysis when selecting a patch
     if (loopData.clickPoint) {
       try {
         const res = await fetch(`http://localhost:8000/classify-patch`, {
@@ -663,6 +710,7 @@ export default function App() {
         onUpdateDepth={handleUpdateHistoryItemDepth}
         patchAnalysis={patchAnalysis}
         setPatchAnalysis={setPatchAnalysis}
+        onCreatePrimitive={handleCreatePrimitive}
       />
 
       {/* LEFT COLUMN: OUTLINER */}

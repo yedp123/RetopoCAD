@@ -75,6 +75,12 @@ class BooleanCutParams(BaseModel):
     extrude_depth: float
     target_index: int
 
+class CreatePrimitiveParams(BaseModel):
+    patch_faces: list
+    primitive_type: str
+    sharpness_angle: float = 30.0
+    symmetry: dict = None
+
 @app.get("/api/logs")
 async def get_logs():
     return {"logs": state.live_logs}
@@ -124,7 +130,6 @@ def get_patch_components(mesh, sharpness_angle_deg):
     angles = mesh.face_adjacency_angles
     smooth_edges = adjacency[angles < threshold_rad]
     return list(trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces))))
-
 
 def perform_fitting_race(mesh, target_pt, sharpness_angle):
     import scipy.optimize
@@ -234,7 +239,6 @@ async def analyze_surface(params: Point3D):
     target_pt = np.array([[params.x, params.y, params.z]])
     return perform_fitting_race(state.mesh, target_pt, params.sharpness_angle)
 
-
 @app.post("/scout-loop")
 async def scout_loop(params: Point3D):
     if state.mesh is None:
@@ -338,6 +342,122 @@ def resample_loop(points, target_count=100):
         
     return resampled.tolist()
 
+@app.post("/create-primitive")
+async def create_primitive(params: CreatePrimitiveParams):
+    try:
+        import build123d as b3d
+        import scipy.optimize
+        import networkx as nx
+    except ImportError:
+        raise HTTPException(status_code=500, detail="build123d missing")
+
+    broadcast_log(f"[System] Committing {params.primitive_type.upper()} primitive to Stack...")
+    mesh = state.mesh
+    if not mesh:
+        raise HTTPException(status_code=400, detail="No mesh loaded.")
+
+    try:
+        patch_faces = params.patch_faces
+        patch_verts_idx = np.unique(mesh.faces[patch_faces])
+        pts = mesh.vertices[patch_verts_idx]
+        
+        solid = None
+        
+        if params.primitive_type == 'cylinder':
+            # Use normals to find the main cylinder axis safely
+            region_normals = mesh.face_normals[patch_faces]
+            cov_normals = np.cov(region_normals.T)
+            evals, evecs = np.linalg.eigh(cov_normals)
+            axis = evecs[:, 0] # direction of least normal variance is the axis
+            
+            if np.abs(axis[0]) < 0.9:
+                u = np.cross(axis, [1, 0, 0])
+            else:
+                u = np.cross(axis, [0, 1, 0])
+            u = u / np.linalg.norm(u)
+            v = np.cross(axis, u)
+            
+            centroid = np.mean(pts, axis=0)
+            p2d = np.column_stack((np.dot(pts - centroid, u), np.dot(pts - centroid, v)))
+            
+            def calc_R(c): return np.sqrt((p2d[:, 0] - c[0])**2 + (p2d[:, 1] - c[1])**2)
+            def cyl_obj(c): Ri = calc_R(c); return Ri - Ri.mean()
+            
+            c2d_guess = np.mean(p2d, axis=0)
+            res_cyl = scipy.optimize.least_squares(cyl_obj, c2d_guess)
+            center_2d = res_cyl.x
+            radius = float(np.mean(calc_R(center_2d)))
+            
+            # Find bounds along the axis to set height
+            center_3d = centroid + center_2d[0]*u + center_2d[1]*v
+            h_vals = np.dot(pts - center_3d, axis)
+            h_min, h_max = np.min(h_vals), np.max(h_vals)
+            height = float((h_max - h_min) * 1.2) # Extended by 20% for easy boolean clipping
+            
+            midpoint = center_3d + axis * (h_max + h_min) / 2.0
+            loc = b3d.Plane(origin=b3d.Vector(midpoint), z_dir=b3d.Vector(axis)).location
+            solid = loc * b3d.Cylinder(radius=radius, height=height)
+
+        elif params.primitive_type == 'sphere':
+            centroid = np.mean(pts, axis=0)
+            def sphere_obj(c):
+                r = np.linalg.norm(pts - c, axis=1)
+                return r - np.mean(r)
+            res_sph = scipy.optimize.least_squares(sphere_obj, centroid)
+            r_sph = float(np.mean(np.linalg.norm(pts - res_sph.x, axis=1)))
+            loc = b3d.Location(b3d.Vector(res_sph.x))
+            solid = loc * b3d.Sphere(radius=r_sph)
+
+        elif params.primitive_type == 'plane':
+            faces = mesh.faces[patch_faces]
+            edges = trimesh.geometry.faces_to_edges(faces)
+            edges_sorted = np.sort(edges, axis=1)
+            unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
+            boundary_edges = unique_edges[counts == 1]
+            
+            G = nx.Graph()
+            G.add_edges_from(boundary_edges)
+            loops = list(nx.connected_components(G))
+            best_loop = max(loops, key=len)
+            subgraph = G.subgraph(best_loop)
+            try:
+                cycle = nx.find_cycle(subgraph)
+                ordered_nodes = [u for u, v in cycle]
+            except:
+                ordered_nodes = list(nx.dfs_preorder_nodes(subgraph))
+                
+            ordered_points = mesh.vertices[ordered_nodes]
+            processed_loop = apply_pca_firewall(ordered_points)
+            
+            pts_vec = [b3d.Vector(p) for p in processed_loop]
+            if (pts_vec[0] - pts_vec[-1]).length > 1e-5:
+                pts_vec.append(pts_vec[0])
+                
+            wire = b3d.Wire.make_polygon(pts_vec)
+            solid = b3d.Face(wire)
+        
+        else:
+            raise ValueError(f"Unknown primitive type: {params.primitive_type}")
+
+        state.rebuild_geometry.append(solid)
+
+        fd, path = tempfile.mkstemp(suffix=".stl")
+        os.close(fd)
+        try:
+            from build123d.exporters3d import export_stl
+            export_stl(solid, path)
+            tmesh = trimesh.load(path, file_type='stl')
+            broadcast_log(f"[Success] Primitive generated. Returning {len(tmesh.faces)} faces.")
+            return {"vertices": tmesh.vertices.tolist(), "faces": tmesh.faces.tolist()}
+        finally:
+            try: os.remove(path)
+            except: pass
+            
+    except Exception as e:
+        err_msg = str(e)
+        broadcast_log(f"[Error] Failed to build Primitive: {err_msg}")
+        raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
+
 @app.post("/create-sheet")
 async def create_sheet(params: CommitGeometryParams):
     try:
@@ -353,7 +473,6 @@ async def create_sheet(params: CommitGeometryParams):
     try:
         processed_loop = params.loops[0]['points']
         
-        # CRITICAL: Only apply firewall if explicitly flagged as planar
         if params.loops[0].get('type') == 'planar':
             processed_loop = apply_pca_firewall(processed_loop)
             broadcast_log("[System] Planar Firewall Applied: Flattening loop.")
@@ -403,7 +522,6 @@ async def commit_geometry(params: CommitGeometryParams):
         if not params.loops:
             raise ValueError("No loops provided.")
 
-        # CRITICAL: Selectively apply firewall based on loop type
         processed_loops = []
         for loop_data in params.loops:
             if loop_data.get('type') == 'planar':
@@ -488,7 +606,6 @@ async def boolean_cut(params: BooleanCutParams):
         if params.target_index >= len(state.rebuild_geometry) or params.target_index < 0:
             raise ValueError("Target solid not found.")
 
-        # CRITICAL: Always firewall before building the tool if planar
         processed_loop = params.loops[0]['points']
         if params.loops[0].get('type') == 'planar':
             processed_loop = apply_pca_firewall(processed_loop)
@@ -528,7 +645,6 @@ async def boolean_cut(params: BooleanCutParams):
     except Exception as e:
         broadcast_log(f"[Error] Failed to Boolean Cut: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Geometry Error: {str(e)}")
-
 
 @app.post("/extract-feature")
 async def extract_feature(params: FeatureParams):
@@ -615,12 +731,10 @@ async def extract_feature(params: FeatureParams):
 
                     is_circle = True
                     return {
-                        "id": patch_id,
                         "type": "circle",
                         "center": center_3d.tolist(),
                         "radius": radius,
-                        "normal": normal.tolist(),
-                        "patch_faces": target_region.tolist()
+                        "normal": normal.tolist()
                     }
             except:
                 pass
@@ -635,11 +749,9 @@ async def extract_feature(params: FeatureParams):
                 
             ordered_points = mesh.vertices[ordered_nodes]
             return {
-                "id": patch_id,
                 "type": "planar",
                 "points": ordered_points.tolist(),
-                "normal": region_normal.tolist(),
-                "patch_faces": target_region.tolist()
+                "normal": region_normal.tolist()
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail="Failed to trace shape boundary.")
