@@ -13,6 +13,8 @@ wip
 
 ## **Tech Stack & Credits**
 
+A special thanks to [Andrea Pozzetti](https://github.com/PozzettiAndrea) for his constant advices, expertise and guidance, this project wouldn't have been possible without him!
+
 This tool stands on the shoulders of giants. It was built using:
 
 * **Frontend:** React, React Three Fiber (Three.js), TailwindCSS, Vite.  
