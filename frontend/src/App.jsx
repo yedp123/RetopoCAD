@@ -26,13 +26,24 @@ function CompactSymmetryToggle({ label, active, onClick, colorClass }) {
   );
 }
 
-function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem }) {
+function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth }) {
   const [pos, setPos] = useState({ x: -1000, y: -1000 });
+  const isEditingExtrude = selectedItemData?.payload?.operation === 'extrude';
+  const [localDepth, setLocalDepth] = useState(extrudeDepth);
+
+  // Sync local depth state cleanly
+  useEffect(() => {
+    if (isEditingExtrude) {
+        setLocalDepth(selectedItemData.payload.extrude_depth);
+    } else {
+        setLocalDepth(extrudeDepth);
+    }
+  }, [selectedItemData, extrudeDepth, isEditingExtrude]);
 
   useEffect(() => {
     if (!anchorPos) return;
     const offset = 120;
-    const ringSize = 120; 
+    const ringSize = 135; 
 
     let targetX = anchorPos.x + offset;
     let targetY = anchorPos.y + offset;
@@ -59,7 +70,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
   const extrudeLabel = isCylinderLoop ? 'Cylinder' : 'Extrude';
 
   const radius = 70; 
-  const outerRadius = 110;
+  const outerRadius = 135; // Increased orbit to clear inner buttons
   const buttons = [];
   const outerButtons = [];
 
@@ -68,7 +79,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
       buttons.push({ label: extrudeLabel, icon: isCylinderLoop ? <IconCylinderFill /> : <IconExtrude />, angle: -90, action: onExtrude, disabled: selectedLoops.length !== 1, color: 'text-blue-400' });
       buttons.push({ label: 'Loft', icon: <IconLoft />, angle: 0, action: onLoft, disabled: selectedLoops.length !== 2, color: 'text-blue-400' });
       buttons.push({ label: 'Sheet', icon: <IconSheet />, angle: 90, action: onSheet, disabled: selectedLoops.length !== 1, color: 'text-green-400' });
-      buttons.push({ label: 'Extract', icon: <IconWave />, angle: 180, action: onExtractCurve, disabled: selectedLoops.length === 0, color: 'text-purple-400' });
+      buttons.push({ label: 'Extract\nCurve', icon: <IconWave />, angle: 180, action: onExtractCurve, disabled: selectedLoops.length === 0, color: 'text-purple-400' });
       
       if (selectedItemData) {
           buttons.push({ label: 'Cut', icon: <IconCut />, angle: -45, action: onCut, disabled: selectedLoops.length !== 1, color: 'text-orange-400' });
@@ -83,37 +94,48 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
   // Outer tools
   if (selectedLoops.length > 0 || selectedItemData) {
       outerButtons.push({ label: 'Delete', icon: <IconTrash />, angle: -45, action: onDeleteItem, disabled: !selectedItemData, color: 'text-red-500' });
-      outerButtons.push({ label: 'Clear', icon: <IconClear />, angle: 45, action: onClear, disabled: false, color: 'text-zinc-400' });
+      outerButtons.push({ label: 'Clear\nSelection', icon: <IconClear />, angle: 45, action: onClear, disabled: false, color: 'text-zinc-400' });
   }
 
   return (
     <div style={{ left: pos.x, top: pos.y }} className="fixed pointer-events-none z-50 flex items-center justify-center -translate-x-1/2 -translate-y-1/2 transition-all duration-200">
        {selectionString && (
           <div className="absolute bottom-[130px] flex items-center justify-center pointer-events-none w-64 text-center">
-            <span className="bg-amber-500 text-zinc-950 font-black px-3 py-1 rounded border border-amber-400 text-[10px] uppercase tracking-widest shadow-[0_0_15px_rgba(245,158,11,0.3)]">
+            <span className={`font-black px-3 py-1 rounded text-[10px] uppercase tracking-widest ${isEditingExtrude ? 'bg-amber-600 text-white border border-amber-500 shadow-[0_0_15px_rgba(217,119,6,0.5)]' : 'bg-amber-500 text-zinc-950 border border-amber-400 shadow-[0_0_15px_rgba(245,158,11,0.3)]'}`}>
               {selectionString}
             </span>
           </div>
        )}
 
-       {/* Removed the 240px wide outer background as requested, kept only the inner ring backdrop */}
        <div className="absolute w-[160px] h-[160px] rounded-full border border-zinc-600/30 bg-zinc-900/40 backdrop-blur-md animate-in zoom-in duration-150 pointer-events-none" />
        
-       <div className="absolute pointer-events-auto flex flex-col items-center justify-center w-14 h-14 rounded-full bg-zinc-800/90 border border-zinc-600 shadow-xl backdrop-blur-md animate-in zoom-in">
+       <div className={`absolute pointer-events-auto flex flex-col items-center justify-center w-14 h-14 rounded-full border shadow-xl backdrop-blur-md animate-in zoom-in transition-colors ${isEditingExtrude ? 'bg-zinc-800/95 border-amber-500/50' : 'bg-zinc-800/90 border-zinc-600'}`}>
          {isCylinderLoop && (
              <span className="text-[7.5px] font-black uppercase text-emerald-400 tracking-tighter leading-none mb-1">R: {selectedLoops[0].radius.toFixed(2)}</span>
          )}
-         <span className="text-[7px] font-black uppercase text-zinc-400 tracking-tighter leading-none mb-0.5 mt-0.5">Depth</span>
+         <span className={`text-[7px] font-black uppercase tracking-tighter leading-none mb-0.5 mt-0.5 ${isEditingExtrude ? 'text-amber-400' : 'text-zinc-400'}`}>Depth</span>
          <input 
            type="number" 
-           value={extrudeDepth} 
-           onChange={(e) => setExtrudeDepth(parseFloat(e.target.value) || 0)}
-           className="w-10 bg-transparent text-center text-[10px] font-mono text-white outline-none focus:bg-zinc-700/50 rounded"
+           value={localDepth} 
+           onChange={(e) => setLocalDepth(parseFloat(e.target.value) || 0)}
+           onBlur={(e) => {
+               if (isEditingExtrude) {
+                   if (localDepth !== selectedItemData.payload.extrude_depth) {
+                       onUpdateDepth(selectedItemData.id, localDepth);
+                   }
+               } else {
+                   setExtrudeDepth(localDepth);
+               }
+           }}
+           onKeyDown={(e) => {
+               if (e.key === 'Enter') e.target.blur();
+           }}
+           className={`w-10 bg-transparent text-center text-[10px] font-mono outline-none focus:bg-zinc-700/50 rounded transition-colors ${isEditingExtrude ? 'text-amber-400 font-bold' : 'text-white'}`}
            step="0.5"
          />
        </div>
 
-       {/* Render Outer Buttons (No Circular Background) */}
+       {/* Render Outer Buttons */}
        {outerButtons.map((btn, i) => {
           const rad = (btn.angle * Math.PI) / 180;
           const x = Math.cos(rad) * outerRadius;
@@ -128,7 +150,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
                  ${btn.disabled ? 'text-zinc-600/50 cursor-not-allowed opacity-50' : `hover:scale-110 hover:text-white ${btn.color}`}`}
              >
                <span className="mb-0.5 pointer-events-none scale-125">{btn.icon}</span>
-               <span className="text-[7px] font-black uppercase tracking-tighter pointer-events-none mt-1 leading-none">{btn.label}</span>
+               <span className="text-[6.5px] font-black uppercase tracking-tighter pointer-events-none mt-1 leading-none text-center whitespace-pre-line">{btn.label}</span>
              </button>
           );
        })}
@@ -148,7 +170,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
                  ${btn.disabled ? 'bg-zinc-800/80 text-zinc-600 border-zinc-700/50 cursor-not-allowed' : `bg-zinc-800/90 border-zinc-600 hover:bg-zinc-700 hover:scale-110 hover:border-zinc-300 ${btn.color}`}`}
              >
                <span className="mb-0.5 pointer-events-none">{btn.icon}</span>
-               <span className="text-[7px] font-black uppercase tracking-tighter text-zinc-300 pointer-events-none">{btn.label}</span>
+               <span className="text-[6.5px] font-black uppercase tracking-tighter text-zinc-300 pointer-events-none text-center whitespace-pre-line leading-tight mt-0.5">{btn.label}</span>
              </button>
           );
        })}
@@ -582,6 +604,7 @@ export default function App() {
         onExtractCurve={handleExtractCurveFromRing}
         onDeleteItem={() => handleDeleteGeometry(selectedItemId)}
         onClear={() => { setSelectedLoops([]); setSelectedItemId(null); }}
+        onUpdateDepth={handleUpdateHistoryItemDepth}
       />
 
       {/* LEFT COLUMN: OUTLINER */}
