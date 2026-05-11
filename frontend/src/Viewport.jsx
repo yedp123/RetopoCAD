@@ -32,6 +32,7 @@ function HullMesh({ vertices, faces, centerOffset, material }) {
 function SplashHighlight({ feature, originalMeshes, centerOffset }) {
   const result = useMemo(() => {
     if (!feature) return null;
+    
     if (feature.patch_vertices && feature.patch_faces) {
         try {
             const geo = new THREE.BufferGeometry();
@@ -44,21 +45,27 @@ function SplashHighlight({ feature, originalMeshes, centerOffset }) {
                 geo.translate(-centerOffset.x, -centerOffset.y, -centerOffset.z);
             }
             return { geo, meshParams: null };
-        } catch(e) { return null; }
+        } catch(e) {
+            return null;
+        }
     }
+
     if (feature.patch_faces && originalMeshes && originalMeshes.length > 0) {
         try {
           const baseMesh = originalMeshes[0];
           const baseGeo = baseMesh.geometry;
           const posAttr = baseGeo.getAttribute('position');
           const indexAttr = baseGeo.getIndex();
+          
           const newPos = [];
+          
           for (let i = 0; i < feature.patch_faces.length; i++) {
             const faceIdx = feature.patch_faces[i];
             if (indexAttr) {
               const a = indexAttr.getX(faceIdx * 3);
               const b = indexAttr.getX(faceIdx * 3 + 1);
               const c = indexAttr.getX(faceIdx * 3 + 2);
+              
               if (a !== undefined && b !== undefined && c !== undefined) {
                 newPos.push(
                   posAttr.getX(a), posAttr.getY(a), posAttr.getZ(a),
@@ -70,6 +77,7 @@ function SplashHighlight({ feature, originalMeshes, centerOffset }) {
               const a = faceIdx * 3;
               const b = faceIdx * 3 + 1;
               const c = faceIdx * 3 + 2;
+              
               if (a < posAttr.count && c < posAttr.count) {
                 newPos.push(
                   posAttr.getX(a), posAttr.getY(a), posAttr.getZ(a),
@@ -79,13 +87,19 @@ function SplashHighlight({ feature, originalMeshes, centerOffset }) {
               }
             }
           }
+          
           if (newPos.length === 0) return null;
+
           const geo = new THREE.BufferGeometry();
           geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(newPos), 3));
           geo.computeVertexNormals();
           return { geo, meshParams: baseMesh };
-        } catch(e) { return null; }
+        } catch(e) {
+          console.error("Splash build error", e);
+          return null;
+        }
     }
+    
     return null;
   }, [feature, originalMeshes, centerOffset]);
 
@@ -96,10 +110,16 @@ function SplashHighlight({ feature, originalMeshes, centerOffset }) {
   }, [feature.id]);
 
   const material = useMemo(() => new THREE.MeshBasicMaterial({
-    color: color, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false, depthTest: true
+    color: color,
+    transparent: true,
+    opacity: 0.45,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    depthTest: true
   }), [color]);
 
   if (!result || !result.geo) return null;
+
   if (result.meshParams) {
       return <mesh geometry={result.geo} material={material} position={result.meshParams.position} rotation={result.meshParams.rotation} scale={result.meshParams.scale} />;
   }
@@ -122,7 +142,9 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, origina
 
   const geometry = useMemo(() => {
     if (!points.length) return null;
-    try { return new THREE.BufferGeometry().setFromPoints(points); } catch(e) { return null; }
+    try {
+        return new THREE.BufferGeometry().setFromPoints(points);
+    } catch(e) { return null; }
   }, [points]);
   
   const quaternion = useMemo(() => {
@@ -143,7 +165,9 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, origina
     <group>
       {finalHover && <SplashHighlight feature={feature} originalMeshes={originalMeshes} centerOffset={centerOffset} />}
       <line 
-        geometry={geometry} position={pos} quaternion={quaternion}
+        geometry={geometry} 
+        position={pos} 
+        quaternion={quaternion}
         onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
         onPointerOut={() => setHovered(false)}
         onClick={(e) => {
@@ -169,7 +193,9 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSe
     if (!points?.length) return null;
     try {
         const pts = points.map(p => new THREE.Vector3(...p));
-        if (centerOffset) pts.forEach(p => p.sub(centerOffset));
+        if (centerOffset) {
+            pts.forEach(p => p.sub(centerOffset));
+        }
         if (pts.length > 0) pts.push(pts[0].clone()); 
         return new THREE.BufferGeometry().setFromPoints(pts);
     } catch (e) { return null; }
@@ -216,13 +242,16 @@ function GhostModel({
   const [scoutLoop, setScoutLoop] = useState(null);
   const scoutTimeout = useRef(null);
   
-  useEffect(() => { return () => URL.revokeObjectURL(url); }, [url]);
+  useEffect(() => {
+    return () => URL.revokeObjectURL(url);
+  }, [url]);
 
   const activeScales = useMemo(() => {
     const scales = [];
     const xArr = symmetry.x ? [1, -1] : [1];
     const yArr = symmetry.y ? [1, -1] : [1];
     const zArr = symmetry.z ? [1, -1] : [1];
+    
     for (let x of xArr) {
       for (let y of yArr) {
         for (let z of zArr) {
@@ -252,19 +281,50 @@ function GhostModel({
         geom.translate(-center.x, -center.y, -center.z);
         geom.computeBoundingBox();
         geom.computeBoundingSphere();
-        extracted.push({ geometry: geom, position: child.position.clone(), rotation: child.rotation.clone(), scale: child.scale.clone() });
+        extracted.push({ 
+           geometry: geom, 
+           position: child.position.clone(), 
+           rotation: child.rotation.clone(), 
+           scale: child.scale.clone() 
+        });
       }
     });
     
     return { meshes: extracted, cursorRadius: calculatedRadius, centerOffset: center };
   }, [obj, cursorScale]);
 
-  const solidMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: "#3b82f6", transparent: true, opacity: 0.8, roughness: 0.3, metalness: 0.1, side: THREE.DoubleSide }), []);
-  const sheetMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: "#4ade80", transparent: true, opacity: 0.8, roughness: 0.3, metalness: 0.1, side: THREE.DoubleSide }), []);
-  const selectedSolidMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: "#f97316", emissive: "#ea580c", emissiveIntensity: 0.4, transparent: true, opacity: 0.9, roughness: 0.2, metalness: 0.3, side: THREE.DoubleSide }), []);
+  const solidMaterial = useMemo(() => new THREE.MeshStandardMaterial({
+    color: "#3b82f6", 
+    transparent: true,
+    opacity: 0.8,
+    roughness: 0.3,
+    metalness: 0.1,
+    side: THREE.DoubleSide
+  }), []);
+
+  const sheetMaterial = useMemo(() => new THREE.MeshStandardMaterial({
+    color: "#4ade80", 
+    transparent: true,
+    opacity: 0.8,
+    roughness: 0.3,
+    metalness: 0.1,
+    side: THREE.DoubleSide
+  }), []);
+
+  const selectedSolidMaterial = useMemo(() => new THREE.MeshStandardMaterial({
+    color: "#f97316", 
+    emissive: "#ea580c",
+    emissiveIntensity: 0.4,
+    transparent: true,
+    opacity: 0.9,
+    roughness: 0.2,
+    metalness: 0.3,
+    side: THREE.DoubleSide
+  }), []);
 
   const handlePointerMove = (e) => {
     e.stopPropagation(); 
+
     if (cursorGroupRef.current) {
       const worldPoint = e.point.clone();
       const localPoint = cursorGroupRef.current.worldToLocal(worldPoint);
@@ -302,7 +362,9 @@ function GhostModel({
 
   const handlePointerOut = () => {
     if (cursorRef.current) cursorRef.current.visible = false;
-    mirroredCursorRefs.current.forEach(ref => { if (ref) ref.visible = false; });
+    mirroredCursorRefs.current.forEach(ref => {
+      if (ref) ref.visible = false;
+    });
     setScoutLoop(null);
     clearTimeout(scoutTimeout.current);
   };
@@ -318,7 +380,6 @@ function GhostModel({
       const worldPoint = e.point.clone();
       const localPoint = cursorGroupRef.current.worldToLocal(worldPoint);
       const rawPoint = localPoint.clone().add(centerOffset);
-      // Attach the physical 3D click point so we can use it to perfectly extract curves via backend later
       onSelectLoop({ ...scoutLoop, clickPoint: { x: rawPoint.x, y: rawPoint.y, z: rawPoint.z } }, { x: screenX, y: screenY });
       setScoutLoop(null);
     }
@@ -367,7 +428,12 @@ function GhostModel({
                   if (onSelectSolid) onSelectSolid(geo.id, { x: screenX, y: screenY }); 
                }}
              >
-               <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={centerOffset} material={mat} />
+               <HullMesh 
+                 vertices={geo.vertices} 
+                 faces={geo.faces} 
+                 centerOffset={centerOffset} 
+                 material={mat} 
+               />
              </group>
            );
         })}
@@ -396,7 +462,12 @@ function GhostModel({
                  
                return (
                  <group key={`mirror-geo-${mirrorKey}-${idx}`} visible={isVisible}>
-                     <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={centerOffset} material={geo.type === 'sheet' ? sheetMaterial : solidMaterial} />
+                     <HullMesh 
+                       vertices={geo.vertices} 
+                       faces={geo.faces} 
+                       centerOffset={centerOffset} 
+                       material={geo.type === 'sheet' ? sheetMaterial : solidMaterial} 
+                     />
                  </group>
                );
             })}
@@ -410,6 +481,7 @@ function GhostModel({
             <sphereGeometry args={[cursorRadius, 16, 16]} />
             <meshBasicMaterial color="#3b82f6" depthTest={false} /> 
           </mesh>
+
           {activeScales?.map((scale, i) => (
             <mesh key={`cursor-${scale.join(',')}`} ref={(el) => { if(el) mirroredCursorRefs.current[i] = el; }} visible={false} renderOrder={1}>
               <sphereGeometry args={[cursorRadius, 16, 16]} />
@@ -472,6 +544,7 @@ export default function Viewport({
       <GizmoHelper alignment="bottom-right" margin={[60, 60]}>
         <GizmoViewport axisColors={['#ef4444', '#22c55e', '#3b82f6']} labelColor="white" />
       </GizmoHelper>
+
     </Canvas>
   );
 }

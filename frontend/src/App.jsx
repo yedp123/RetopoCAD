@@ -68,6 +68,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
       buttons.push({ label: extrudeLabel, icon: isCylinderLoop ? <IconCylinderFill /> : <IconExtrude />, angle: -90, action: onExtrude, disabled: selectedLoops.length !== 1, color: 'text-blue-400' });
       buttons.push({ label: 'Loft', icon: <IconLoft />, angle: 0, action: onLoft, disabled: selectedLoops.length !== 2, color: 'text-blue-400' });
       buttons.push({ label: 'Sheet', icon: <IconSheet />, angle: 90, action: onSheet, disabled: selectedLoops.length !== 1, color: 'text-green-400' });
+      buttons.push({ label: 'Extract', icon: <IconWave />, angle: 180, action: onExtractCurve, disabled: selectedLoops.length === 0, color: 'text-purple-400' });
       
       if (selectedItemData) {
           buttons.push({ label: 'Cut', icon: <IconCut />, angle: -45, action: onCut, disabled: selectedLoops.length !== 1, color: 'text-orange-400' });
@@ -79,12 +80,11 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
       buttons.push({ label: 'Cut', icon: <IconCut />, angle: -45, action: onCut, disabled: true, color: 'text-orange-400' });
   }
 
-  buttons.push({ label: 'Clear', icon: <IconClear />, angle: 180, action: onClear, disabled: false, color: 'text-zinc-400' });
-
   // Outer tools
-  outerButtons.push({ label: 'Extract Curve', icon: <IconWave />, angle: -135, action: onExtractCurve, disabled: selectedLoops.length === 0, color: 'text-purple-400' });
-  outerButtons.push({ label: 'Delete', icon: <IconTrash />, angle: -45, action: onDeleteItem, disabled: !selectedItemData, color: 'text-red-500' });
-
+  if (selectedLoops.length > 0 || selectedItemData) {
+      outerButtons.push({ label: 'Delete', icon: <IconTrash />, angle: -45, action: onDeleteItem, disabled: !selectedItemData, color: 'text-red-500' });
+      outerButtons.push({ label: 'Clear', icon: <IconClear />, angle: 45, action: onClear, disabled: false, color: 'text-zinc-400' });
+  }
 
   return (
     <div style={{ left: pos.x, top: pos.y }} className="fixed pointer-events-none z-50 flex items-center justify-center -translate-x-1/2 -translate-y-1/2 transition-all duration-200">
@@ -96,7 +96,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
           </div>
        )}
 
-       <div className="absolute w-[240px] h-[240px] rounded-full border border-zinc-600/10 bg-zinc-900/10 backdrop-blur-sm animate-in zoom-in duration-200 pointer-events-none" />
+       {/* Removed the 240px wide outer background as requested, kept only the inner ring backdrop */}
        <div className="absolute w-[160px] h-[160px] rounded-full border border-zinc-600/30 bg-zinc-900/40 backdrop-blur-md animate-in zoom-in duration-150 pointer-events-none" />
        
        <div className="absolute pointer-events-auto flex flex-col items-center justify-center w-14 h-14 rounded-full bg-zinc-800/90 border border-zinc-600 shadow-xl backdrop-blur-md animate-in zoom-in">
@@ -113,7 +113,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
          />
        </div>
 
-       {/* Render Outer Buttons */}
+       {/* Render Outer Buttons (No Circular Background) */}
        {outerButtons.map((btn, i) => {
           const rad = (btn.angle * Math.PI) / 180;
           const x = Math.cos(rad) * outerRadius;
@@ -124,11 +124,11 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
                onClick={(e) => { e.stopPropagation(); btn.action(); }}
                disabled={btn.disabled}
                style={{ transform: `translate(${x}px, ${y}px)` }}
-               className={`absolute pointer-events-auto flex flex-col items-center justify-center w-12 h-12 rounded-full transition-all shadow-xl backdrop-blur-md border 
-                 ${btn.disabled ? 'bg-zinc-800/50 text-zinc-600 border-zinc-700/30 cursor-not-allowed' : `bg-zinc-800/90 border-zinc-500 hover:bg-zinc-700 hover:scale-110 hover:border-zinc-300 ${btn.color}`}`}
+               className={`absolute pointer-events-auto flex flex-col items-center justify-center w-12 h-12 transition-all drop-shadow-2xl 
+                 ${btn.disabled ? 'text-zinc-600/50 cursor-not-allowed opacity-50' : `hover:scale-110 hover:text-white ${btn.color}`}`}
              >
-               <span className="mb-0.5 pointer-events-none scale-90">{btn.icon}</span>
-               <span className="text-[6.5px] font-black uppercase tracking-tighter text-zinc-300 pointer-events-none">{btn.label}</span>
+               <span className="mb-0.5 pointer-events-none scale-125">{btn.icon}</span>
+               <span className="text-[7px] font-black uppercase tracking-tighter pointer-events-none mt-1 leading-none">{btn.label}</span>
              </button>
           );
        })}
@@ -174,14 +174,12 @@ export default function App() {
   const [isAutoExtracting, setIsAutoExtracting] = useState(false);
   const [minFeatureSize, setMinFeatureSize] = useState(2.0);
 
-  // Precision Rebuild States
   const [selectedLoops, setSelectedLoops] = useState([]);
   const [rebuildHistory, setRebuildHistory] = useState([]); 
   const [selectedItemId, setSelectedItemId] = useState(null); 
   const [extrudeDepth, setExtrudeDepth] = useState(5.0);
   const [isCommitting, setIsCommitting] = useState(false);
 
-  // Viewport & Folder Visibility Overrides
   const [symmetry, setSymmetry] = useState({ x: false, y: false, z: false });
   const toggleSymmetry = (axis) => setSymmetry(prev => ({ ...prev, [axis]: !prev[axis] }));
   const [showMesh, setShowMesh] = useState(true);
@@ -227,7 +225,6 @@ export default function App() {
   const handleUndo = () => { if (historyIndex > 0) setHistoryIndex(historyIndex - 1); };
   const handleRedo = () => { if (historyIndex < featuresHistory.length - 1) setHistoryIndex(historyIndex + 1); };
 
-  // Setup Hotkeys for Curve Undo/Redo
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.ctrlKey || e.metaKey) {
@@ -282,7 +279,7 @@ export default function App() {
           if (res.ok) {
             newFeatures.push(await res.json());
           } else {
-            newFeatures.push(loop); // fallback if backend fails circle fit
+            newFeatures.push(loop); 
           }
         } catch (e) { newFeatures.push(loop); }
       } else {

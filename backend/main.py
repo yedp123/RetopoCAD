@@ -26,7 +26,7 @@ app.add_middleware(
 class AppState:
     mesh = None
     live_logs = []
-    rebuild_geometry = [] # Unified stack for analytical Solids and Sheets
+    rebuild_geometry = [] 
 
 state = AppState()
 
@@ -82,7 +82,7 @@ async def get_logs():
 async def upload_mesh(file: UploadFile = File(...)):
     try:
         state.live_logs = [] 
-        state.rebuild_geometry = [] # Clear history on new upload
+        state.rebuild_geometry = [] 
         broadcast_log(f"[System] Receiving {file.filename}...")
         contents = await file.read()
         mesh = trimesh.load(io.BytesIO(contents), file_type='obj', force='mesh')
@@ -95,7 +95,6 @@ async def upload_mesh(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Failed to load mesh: {str(e)}")
 
 def get_patch_components(mesh, sharpness_angle_deg):
-    """Dynamic Real-Time Segmentation based on UI Sharpness Slider"""
     if mesh is None: return []
     threshold_rad = np.radians(sharpness_angle_deg)
     adjacency = mesh.face_adjacency
@@ -103,10 +102,8 @@ def get_patch_components(mesh, sharpness_angle_deg):
     smooth_edges = adjacency[angles < threshold_rad]
     return list(trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces))))
 
-
 @app.post("/classify-patch")
 async def classify_patch(params: ClassifyParams):
-    """The Primitive Classifier - Fits Plane, Sphere, and Cylinder in a race."""
     if state.mesh is None:
         raise HTTPException(status_code=400, detail="No mesh loaded.")
         
@@ -122,7 +119,6 @@ async def classify_patch(params: ClassifyParams):
     components = get_patch_components(mesh, params.sharpness_angle)
     target_region = next((comp for comp in components if start_face in comp), [start_face])
     
-    # Get unique vertices of the patch
     patch_verts_idx = np.unique(mesh.faces[target_region])
     pts = mesh.vertices[patch_verts_idx]
     
@@ -131,12 +127,10 @@ async def classify_patch(params: ClassifyParams):
         
     centroid = np.mean(pts, axis=0)
     
-    # 1. Fit Plane
     _, _, vh = np.linalg.svd(pts - centroid)
     normal = vh[2, :]
     plane_err = float(np.mean(np.abs(np.dot(pts - centroid, normal))))
     
-    # 2. Fit Sphere
     def sphere_obj(c):
         r = np.linalg.norm(pts - c, axis=1)
         return r - np.mean(r)
@@ -148,7 +142,6 @@ async def classify_patch(params: ClassifyParams):
     if r_sph > 10000 or r_sph < 1e-4: 
         sphere_err = float('inf')
         
-    # 3. Fit Cylinder
     u = vh[0, :]
     v = vh[1, :]
     p2d = np.column_stack((np.dot(pts - centroid, u), np.dot(pts - centroid, v)))
@@ -161,7 +154,6 @@ async def classify_patch(params: ClassifyParams):
     r_cyl = np.mean(radii)
     cyl_err = float(np.std(radii))
     
-    # Hallucination Firewall
     max_allowed_radius = max(100.0, np.ptp(pts)*10)
     if r_cyl > max_allowed_radius or r_cyl < 1e-4:
         cyl_err = float('inf')
@@ -234,6 +226,9 @@ async def scout_loop(params: Point3D):
         components = get_patch_components(mesh, params.sharpness_angle)
         target_region = next((comp for comp in components if start_face in comp), [start_face])
         
+        # Consistent ID for Color Splash stability
+        patch_id = f"patch_{min(target_region)}"
+        
         faces = mesh.faces[target_region]
         edges = trimesh.geometry.faces_to_edges(faces)
         edges_sorted = np.sort(edges, axis=1)
@@ -266,27 +261,19 @@ async def scout_loop(params: Point3D):
             
         ordered_points = mesh.vertices[ordered_nodes]
         return {
-            "id": f"scout_{np.random.randint(100000)}",
+            "id": patch_id,
             "type": "planar",
-            "points": ordered_points.tolist()
+            "points": ordered_points.tolist(),
+            "patch_faces": target_region.tolist() # Feed the UI Color Splash
         }
     except Exception as e:
         raise HTTPException(status_code=500)
 
-@app.post("/undo-geometry")
-async def undo_geometry():
-    if len(state.rebuild_geometry) > 0:
-        state.rebuild_geometry.pop()
-        broadcast_log("[System] Undo: Restored previous geometry state.")
-        return {"success": True}
-    return {"success": False, "message": "Nothing to undo."}
-
 def apply_pca_firewall(points):
-    """PLANAR FIREWALL: Best-fit plane projection via SVD"""
     pts = np.array(points)
     centroid = np.mean(pts, axis=0)
     _, _, vh = np.linalg.svd(pts - centroid)
-    normal = vh[2, :] # normal vector is the last row of Vh
+    normal = vh[2, :] 
     proj_pts = []
     for p in pts:
         dist = np.dot(p - centroid, normal)
@@ -294,12 +281,10 @@ def apply_pca_firewall(points):
     return proj_pts
 
 def resample_loop(points, target_count=100):
-    """Uniformly resamples a 3D loop using linear interpolation to standardize vertex counts."""
     pts = np.array(points)
     if len(pts) < 2:
         return points
     
-    # Calculate segment lengths including the closing edge
     diffs = np.diff(pts, axis=0)
     diffs = np.vstack([diffs, pts[0] - pts[-1]])
     
@@ -313,7 +298,6 @@ def resample_loop(points, target_count=100):
     target_dists = np.linspace(0, total_len, target_count, endpoint=False)
     resampled = np.zeros((target_count, 3))
     
-    # Interpolate for x, y, z individually
     for i in range(3):
         resampled[:, i] = np.interp(target_dists, cum_dists, np.append(pts[:, i], pts[0, i]))
         
@@ -332,7 +316,6 @@ async def create_sheet(params: CommitGeometryParams):
         raise ValueError("Creating a sheet requires exactly 1 loop.")
 
     try:
-        # CRITICAL: Always use firewall
         processed_loop = apply_pca_firewall(params.loops[0]['points'])
         
         pts = [b3d.Vector(p) for p in processed_loop]
@@ -342,7 +325,6 @@ async def create_sheet(params: CommitGeometryParams):
         wire = b3d.Wire.make_polygon(pts)
         sheet_face = b3d.Face(wire)
 
-        # Store in unified backend stack
         state.rebuild_geometry.append(sheet_face)
 
         fd, path = tempfile.mkstemp(suffix=".stl")
@@ -381,18 +363,14 @@ async def commit_geometry(params: CommitGeometryParams):
         if not params.loops:
             raise ValueError("No loops provided.")
 
-        # CRITICAL: Run every loop through the mathematical firewall
         processed_loops = []
         for loop_data in params.loops:
             processed_loops.append(apply_pca_firewall(loop_data['points']))
 
-        # ALIGNMENT AND RESAMPLING FOR LOFT
         if params.operation == 'loft' and len(processed_loops) == 2:
-            # Uniformly resample both loops to precisely match vertices
             pts1 = resample_loop(processed_loops[0], 100)
             pts2 = resample_loop(processed_loops[1], 100)
             
-            # Anti-Twist: Align start points of Loop B to Loop A
             p0 = np.array(pts1[0])
             dists = [np.linalg.norm(np.array(p) - p0) for p in pts2]
             best_idx = np.argmin(dists)
@@ -410,7 +388,6 @@ async def commit_geometry(params: CommitGeometryParams):
 
         solid = None
         
-        # Graceful Kernel Error Catching
         try:
             if params.operation == 'extrude' and len(faces) == 1:
                 solid = b3d.extrude(faces[0], amount=params.extrude_depth)
@@ -426,7 +403,6 @@ async def commit_geometry(params: CommitGeometryParams):
 
         state.rebuild_geometry.append(solid)
 
-        # Tessellate solid back to React so it can be previewed
         fd, path = tempfile.mkstemp(suffix=".stl")
         os.close(fd)
         
@@ -467,7 +443,6 @@ async def boolean_cut(params: BooleanCutParams):
         if params.target_index >= len(state.rebuild_geometry) or params.target_index < 0:
             raise ValueError("Target solid not found.")
 
-        # CRITICAL: Always firewall before building the tool
         processed_loop = apply_pca_firewall(params.loops[0]['points'])
         
         pts = [b3d.Vector(p) for p in processed_loop]
@@ -479,7 +454,6 @@ async def boolean_cut(params: BooleanCutParams):
         tool_extrusion = b3d.extrude(face, amount=params.extrude_depth)
         target_solid = state.rebuild_geometry[params.target_index]
         
-        # Perform explicit boolean cut, catching kernel errors with a robust fallback
         try:
             result_solid = target_solid - tool_extrusion
         except Exception:
@@ -488,10 +462,8 @@ async def boolean_cut(params: BooleanCutParams):
             cut_algo.Build()
             result_solid = b3d.Shape.cast(cut_algo.Shape())
         
-        # Override the solid in history with the exact cut version
         state.rebuild_geometry[params.target_index] = result_solid
 
-        # Re-tessellate and return to React
         fd, path = tempfile.mkstemp(suffix=".stl")
         os.close(fd)
         try:
@@ -530,6 +502,9 @@ async def extract_feature(params: FeatureParams):
     start_face = face_ids[0]
     components = get_patch_components(mesh, params.sharpness_angle)
     target_region = next((comp for comp in components if start_face in comp), [start_face])
+    
+    patch_id = f"patch_{min(target_region)}"
+    
     region_normals = mesh.face_normals[target_region]
     region_normal = np.mean(region_normals, axis=0)
     
@@ -591,10 +566,12 @@ async def extract_feature(params: FeatureParams):
 
                     is_circle = True
                     return {
+                        "id": patch_id,
                         "type": "circle",
                         "center": center_3d.tolist(),
                         "radius": radius,
-                        "normal": normal.tolist()
+                        "normal": normal.tolist(),
+                        "patch_faces": target_region.tolist()
                     }
             except:
                 pass
@@ -609,9 +586,11 @@ async def extract_feature(params: FeatureParams):
                 
             ordered_points = mesh.vertices[ordered_nodes]
             return {
+                "id": patch_id,
                 "type": "planar",
                 "points": ordered_points.tolist(),
-                "normal": region_normal.tolist()
+                "normal": region_normal.tolist(),
+                "patch_faces": target_region.tolist()
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail="Failed to trace shape boundary.")
@@ -853,11 +832,9 @@ async def export_step(payload: dict):
     merge_hulls = payload.get("merge_hulls", False)
     symmetry = payload.get("symmetry", {"x": False, "y": False, "z": False})
     
-    # 1. Inject perfectly pure analytical geometry (Solids & Sheets) from precision rebuild
     for shape in state.rebuild_geometry:
         shapes.append(shape)
         
-    # 2. Process CoACD Hulls using the robust original logic
     hulls = payload.get("hulls", [])
     hull_solids = []
     
@@ -918,7 +895,6 @@ async def export_step(payload: dict):
     else:
         shapes.extend(hull_solids)
             
-    # 3. Process Extracted Sketched Features
     features = payload.get("features", [])
     if features:
         broadcast_log(f"[System] Compiling {len(features)} CAD sketches...")
@@ -941,7 +917,6 @@ async def export_step(payload: dict):
             
     shapes = [s for s in shapes if s is not None and hasattr(s, 'wrapped')]
 
-    # 4. Symmetry Logic across all collected shapes
     if any([symmetry.get('x'), symmetry.get('y'), symmetry.get('z')]):
         broadcast_log("[System] Applying structural symmetry arrays using build123d.mirror()...")
         
@@ -964,7 +939,6 @@ async def export_step(payload: dict):
         broadcast_log("[Error] No geometry found to export.")
         raise HTTPException(status_code=400, detail="No geometry found to export.")
         
-    # 5. Native build123d robust export
     broadcast_log("[System] Writing STEP file to disk...")
     fd, path = tempfile.mkstemp(suffix=".step")
     os.close(fd)
