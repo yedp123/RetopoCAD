@@ -1,5 +1,6 @@
 import uvicorn
 import trimesh
+import trimesh.curvature
 import numpy as np
 import io
 import tempfile
@@ -26,7 +27,7 @@ app.add_middleware(
 class AppState:
     mesh = None
     live_logs = []
-    rebuild_geometry = [] 
+    rebuild_geometry = [] # Unified stack for analytical Solids and Sheets
 
 state = AppState()
 
@@ -103,7 +104,6 @@ async def upload_mesh(file: UploadFile = File(...)):
         mesh.remove_unreferenced_vertices()
         
         # 4. FIX NORMALS: Ensure all adjacent faces are pointing outwards!
-        # Without this, flat surfaces might read as 180-degree angles.
         trimesh.repair.fix_normals(mesh)
         trimesh.repair.fix_inversion(mesh)
         # ---------------------------------------
@@ -117,6 +117,7 @@ async def upload_mesh(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Failed to load mesh: {str(e)}")
 
 def get_patch_components(mesh, sharpness_angle_deg):
+    """Dynamic Real-Time Segmentation based on UI Sharpness Slider"""
     if mesh is None: return []
     threshold_rad = np.radians(sharpness_angle_deg)
     adjacency = mesh.face_adjacency
@@ -124,35 +125,35 @@ def get_patch_components(mesh, sharpness_angle_deg):
     smooth_edges = adjacency[angles < threshold_rad]
     return list(trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces))))
 
-@app.post("/classify-patch")
-async def classify_patch(params: ClassifyParams):
-    if state.mesh is None:
-        raise HTTPException(status_code=400, detail="No mesh loaded.")
-        
+
+def perform_fitting_race(mesh, target_pt, sharpness_angle):
     import scipy.optimize
-    mesh = state.mesh
-    target_pt = np.array([[params.x, params.y, params.z]])
     
     _, _, face_ids = mesh.nearest.on_surface(target_pt)
     if len(face_ids) == 0:
         raise HTTPException(status_code=404)
         
     start_face = face_ids[0]
-    components = get_patch_components(mesh, params.sharpness_angle)
+    components = get_patch_components(mesh, sharpness_angle)
     target_region = next((comp for comp in components if start_face in comp), [start_face])
     
+    # Get unique vertices of the patch
     patch_verts_idx = np.unique(mesh.faces[target_region])
     pts = mesh.vertices[patch_verts_idx]
     
     if len(pts) < 4:
-        return {"best_match": "planar", "errors": {"plane": 0, "cylinder": 999, "sphere": 999}}
+        return {"best_match": "plane", "errors": {"plane": 0, "cylinder": 999, "sphere": 999}, "radius": 0.0, "face_count": len(target_region)}
         
     centroid = np.mean(pts, axis=0)
     
+    # --- 1. THE FITTING RACE ---
+    
+    # Fit Plane
     _, _, vh = np.linalg.svd(pts - centroid)
     normal = vh[2, :]
     plane_err = float(np.mean(np.abs(np.dot(pts - centroid, normal))))
     
+    # Fit Sphere
     def sphere_obj(c):
         r = np.linalg.norm(pts - c, axis=1)
         return r - np.mean(r)
@@ -160,10 +161,10 @@ async def classify_patch(params: ClassifyParams):
     res_sph = scipy.optimize.least_squares(sphere_obj, centroid)
     r_sph = np.mean(np.linalg.norm(pts - res_sph.x, axis=1))
     sphere_err = float(np.std(np.linalg.norm(pts - res_sph.x, axis=1)))
-    
     if r_sph > 10000 or r_sph < 1e-4: 
         sphere_err = float('inf')
         
+    # Fit Cylinder
     u = vh[0, :]
     v = vh[1, :]
     p2d = np.column_stack((np.dot(pts - centroid, u), np.dot(pts - centroid, v)))
@@ -176,6 +177,7 @@ async def classify_patch(params: ClassifyParams):
     r_cyl = np.mean(radii)
     cyl_err = float(np.std(radii))
     
+    # Hallucination Firewall
     max_allowed_radius = max(100.0, np.ptp(pts)*10)
     if r_cyl > max_allowed_radius or r_cyl < 1e-4:
         cyl_err = float('inf')
@@ -186,50 +188,52 @@ async def classify_patch(params: ClassifyParams):
         "sphere": sphere_err
     }
     
-    best_match = min(errors, key=errors.get)
-    
+    # --- 2. GAUSSIAN CURVATURE CLASSIFICATION ---
+    try:
+        calc_radius = max(np.ptp(pts, axis=0).max() * 0.15, 1e-3)
+        gaussian_curv = trimesh.curvature.discrete_gaussian_curvature_measure(mesh, pts, calc_radius)
+        mean_curv = trimesh.curvature.discrete_mean_curvature_measure(mesh, pts, calc_radius)
+
+        avg_gauss = float(np.mean(np.abs(gaussian_curv)))
+        avg_mean = float(np.mean(np.abs(mean_curv)))
+        std_gauss = float(np.std(gaussian_curv))
+
+        gauss_zero_tol = 0.05
+        mean_high_tol = 0.05
+
+        if avg_gauss < gauss_zero_tol and avg_mean < mean_high_tol:
+            best_match = "plane"
+        elif avg_gauss < gauss_zero_tol and avg_mean >= mean_high_tol:
+            best_match = "cylinder"
+        elif avg_gauss >= gauss_zero_tol and std_gauss < (avg_gauss * 1.5):
+            best_match = "sphere"
+        else:
+            best_match = min(errors, key=errors.get) # Fallback to strict error race
+    except Exception as e:
+        broadcast_log(f"[Warning] Curvature analysis failed: {str(e)}")
+        best_match = min(errors, key=errors.get)
+
     return {
         "best_match": best_match,
         "errors": errors,
-        "radius": float(r_cyl) if best_match == 'cylinder' else float(r_sph) if best_match == 'sphere' else None
+        "radius": float(r_cyl) if best_match == 'cylinder' else float(r_sph) if best_match == 'sphere' else 0.0,
+        "face_count": len(target_region)
     }
 
+@app.post("/classify-patch")
+async def classify_patch(params: ClassifyParams):
+    if state.mesh is None:
+        raise HTTPException(status_code=400, detail="No mesh loaded.")
+    target_pt = np.array([[params.x, params.y, params.z]])
+    return perform_fitting_race(state.mesh, target_pt, params.sharpness_angle)
 
 @app.post("/analyze-surface")
 async def analyze_surface(params: Point3D):
     if state.mesh is None:
         raise HTTPException(status_code=400, detail="No mesh loaded.")
-    
-    mesh = state.mesh
     target_pt = np.array([[params.x, params.y, params.z]])
-    
-    closest_points, distances, face_ids = mesh.nearest.on_surface(target_pt)
-    if len(face_ids) == 0:
-        raise HTTPException(status_code=404, detail="Could not snap to a face.")
-        
-    start_face = face_ids[0]
-    components = get_patch_components(mesh, params.sharpness_angle)
-    target_region = next((comp for comp in components if start_face in comp), [start_face])
+    return perform_fitting_race(state.mesh, target_pt, params.sharpness_angle)
 
-    region_normals = mesh.face_normals[target_region]
-    variance = np.var(region_normals, axis=0).sum()
-    submesh = mesh.submesh([target_region], append=True)
-    
-    if variance < 1e-2:
-        return {
-            "type": "planar", "face_count": len(target_region),
-            "variance": float(variance)
-        }
-    else:
-        try:
-            cyl = submesh.bounding_cylinder
-            radius = cyl.primitive.radius if hasattr(cyl, 'primitive') else cyl.radius
-            return {
-                "type": "cylindrical", "face_count": len(target_region),
-                "radius": float(radius), "variance": float(variance)
-            }
-        except Exception:
-            return {"type": "complex_curved", "face_count": len(target_region), "variance": float(variance)}
 
 @app.post("/scout-loop")
 async def scout_loop(params: Point3D):
@@ -247,9 +251,6 @@ async def scout_loop(params: Point3D):
         start_face = face_ids[0]
         components = get_patch_components(mesh, params.sharpness_angle)
         target_region = next((comp for comp in components if start_face in comp), [start_face])
-        
-        # Consistent ID for Color Splash stability
-        patch_id = f"patch_{min(target_region)}"
         
         faces = mesh.faces[target_region]
         edges = trimesh.geometry.faces_to_edges(faces)
@@ -282,24 +283,31 @@ async def scout_loop(params: Point3D):
             ordered_nodes = list(nx.dfs_preorder_nodes(best_subgraph))
             
         ordered_points = mesh.vertices[ordered_nodes]
-        
-        patch_id = f"patch_{min(target_region)}" # Stable ID so colors don't flicker
+        patch_id = f"patch_{min(target_region)}"
         
         return {
-            "id": patch_id, 
+            "id": patch_id,
             "type": "planar",
             "points": ordered_points.tolist(),
-            "patch_faces": target_region.tolist() # <-- THIS feeds the Color Splash!
+            "patch_faces": target_region.tolist()
         }
-        
     except Exception as e:
         raise HTTPException(status_code=500)
 
+@app.post("/undo-geometry")
+async def undo_geometry():
+    if len(state.rebuild_geometry) > 0:
+        state.rebuild_geometry.pop()
+        broadcast_log("[System] Undo: Restored previous geometry state.")
+        return {"success": True}
+    return {"success": False, "message": "Nothing to undo."}
+
 def apply_pca_firewall(points):
+    """PLANAR FIREWALL: Best-fit plane projection via SVD"""
     pts = np.array(points)
     centroid = np.mean(pts, axis=0)
     _, _, vh = np.linalg.svd(pts - centroid)
-    normal = vh[2, :] 
+    normal = vh[2, :] # normal vector is the last row of Vh
     proj_pts = []
     for p in pts:
         dist = np.dot(p - centroid, normal)
@@ -307,6 +315,7 @@ def apply_pca_firewall(points):
     return proj_pts
 
 def resample_loop(points, target_count=100):
+    """Uniformly resamples a 3D loop using linear interpolation to standardize vertex counts."""
     pts = np.array(points)
     if len(pts) < 2:
         return points
@@ -342,7 +351,12 @@ async def create_sheet(params: CommitGeometryParams):
         raise ValueError("Creating a sheet requires exactly 1 loop.")
 
     try:
-        processed_loop = apply_pca_firewall(params.loops[0]['points'])
+        processed_loop = params.loops[0]['points']
+        
+        # CRITICAL: Only apply firewall if explicitly flagged as planar
+        if params.loops[0].get('type') == 'planar':
+            processed_loop = apply_pca_firewall(processed_loop)
+            broadcast_log("[System] Planar Firewall Applied: Flattening loop.")
         
         pts = [b3d.Vector(p) for p in processed_loop]
         if (pts[0] - pts[-1]).length > 1e-5:
@@ -389,9 +403,14 @@ async def commit_geometry(params: CommitGeometryParams):
         if not params.loops:
             raise ValueError("No loops provided.")
 
+        # CRITICAL: Selectively apply firewall based on loop type
         processed_loops = []
         for loop_data in params.loops:
-            processed_loops.append(apply_pca_firewall(loop_data['points']))
+            if loop_data.get('type') == 'planar':
+                processed_loops.append(apply_pca_firewall(loop_data['points']))
+                broadcast_log("[System] Planar Firewall Applied: Flattening planar loop.")
+            else:
+                processed_loops.append(loop_data['points'])
 
         if params.operation == 'loft' and len(processed_loops) == 2:
             pts1 = resample_loop(processed_loops[0], 100)
@@ -469,7 +488,11 @@ async def boolean_cut(params: BooleanCutParams):
         if params.target_index >= len(state.rebuild_geometry) or params.target_index < 0:
             raise ValueError("Target solid not found.")
 
-        processed_loop = apply_pca_firewall(params.loops[0]['points'])
+        # CRITICAL: Always firewall before building the tool if planar
+        processed_loop = params.loops[0]['points']
+        if params.loops[0].get('type') == 'planar':
+            processed_loop = apply_pca_firewall(processed_loop)
+            broadcast_log("[System] Planar Firewall Applied: Flattening loop.")
         
         pts = [b3d.Vector(p) for p in processed_loop]
         if (pts[0] - pts[-1]).length > 1e-5:
@@ -591,7 +614,6 @@ async def extract_feature(params: FeatureParams):
                     if np.dot(normal, region_normal) < 0: normal = -normal
 
                     is_circle = True
-                    patch_id = f"patch_{min(target_region)}"
                     return {
                         "id": patch_id,
                         "type": "circle",
@@ -612,7 +634,6 @@ async def extract_feature(params: FeatureParams):
                 ordered_nodes = list(nx.dfs_preorder_nodes(best_subgraph))
                 
             ordered_points = mesh.vertices[ordered_nodes]
-            patch_id = f"patch_{min(target_region)}"
             return {
                 "id": patch_id,
                 "type": "planar",
@@ -860,9 +881,11 @@ async def export_step(payload: dict):
     merge_hulls = payload.get("merge_hulls", False)
     symmetry = payload.get("symmetry", {"x": False, "y": False, "z": False})
     
+    # 1. Inject perfectly pure analytical geometry (Solids & Sheets) from precision rebuild
     for shape in state.rebuild_geometry:
         shapes.append(shape)
         
+    # 2. Process CoACD Hulls using the robust original logic
     hulls = payload.get("hulls", [])
     hull_solids = []
     
@@ -923,6 +946,7 @@ async def export_step(payload: dict):
     else:
         shapes.extend(hull_solids)
             
+    # 3. Process Extracted Sketched Features
     features = payload.get("features", [])
     if features:
         broadcast_log(f"[System] Compiling {len(features)} CAD sketches...")
@@ -945,6 +969,7 @@ async def export_step(payload: dict):
             
     shapes = [s for s in shapes if s is not None and hasattr(s, 'wrapped')]
 
+    # 4. Symmetry Logic across all collected shapes
     if any([symmetry.get('x'), symmetry.get('y'), symmetry.get('z')]):
         broadcast_log("[System] Applying structural symmetry arrays using build123d.mirror()...")
         
@@ -967,6 +992,7 @@ async def export_step(payload: dict):
         broadcast_log("[Error] No geometry found to export.")
         raise HTTPException(status_code=400, detail="No geometry found to export.")
         
+    # 5. Native build123d robust export
     broadcast_log("[System] Writing STEP file to disk...")
     fd, path = tempfile.mkstemp(suffix=".step")
     os.close(fd)

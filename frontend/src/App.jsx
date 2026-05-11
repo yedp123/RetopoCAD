@@ -12,6 +12,7 @@ const IconEye = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none
 const IconEyeOff = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>;
 const IconSquare = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect></svg>;
 const IconCylinderOutline = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 6c0 1.657 3.582 3 8 3s8-1.343 8-3M4 6c0-1.657 3.582-3 8-3s8 1.343 8 3m-16 0v12c0 1.657 3.582 3 8 3s8-1.343 8-3V6"></path></svg>;
+const IconSphere = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path><path d="M2 12h20"></path></svg>;
 const IconWave = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 12c-2.66 0-4.33-3-7-3s-4.34 3-7 3-4.33-3-7-3"></path></svg>;
 const IconTrash = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>;
 
@@ -26,12 +27,11 @@ function CompactSymmetryToggle({ label, active, onClick, colorClass }) {
   );
 }
 
-function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth }) {
+function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis }) {
   const [pos, setPos] = useState({ x: -1000, y: -1000 });
   const isEditingExtrude = selectedItemData?.payload?.operation === 'extrude';
   const [localDepth, setLocalDepth] = useState(extrudeDepth);
 
-  // Sync local depth state cleanly
   useEffect(() => {
     if (isEditingExtrude) {
         setLocalDepth(selectedItemData.payload.extrude_depth);
@@ -70,7 +70,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
   const extrudeLabel = isCylinderLoop ? 'Cylinder' : 'Extrude';
 
   const radius = 70; 
-  const outerRadius = 135; // Increased orbit to clear inner buttons
+  const outerRadius = 135; 
   const buttons = [];
   const outerButtons = [];
 
@@ -99,13 +99,27 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
 
   return (
     <div style={{ left: pos.x, top: pos.y }} className="fixed pointer-events-none z-50 flex items-center justify-center -translate-x-1/2 -translate-y-1/2 transition-all duration-200">
-       {selectionString && (
-          <div className="absolute bottom-[130px] flex items-center justify-center pointer-events-none w-64 text-center">
+       
+       <div className="absolute bottom-[130px] flex flex-col items-center gap-1.5 pointer-events-none w-64 text-center">
+          {selectionString && (
             <span className={`font-black px-3 py-1 rounded text-[10px] uppercase tracking-widest ${isEditingExtrude ? 'bg-amber-600 text-white border border-amber-500 shadow-[0_0_15px_rgba(217,119,6,0.5)]' : 'bg-amber-500 text-zinc-950 border border-amber-400 shadow-[0_0_15px_rgba(245,158,11,0.3)]'}`}>
               {selectionString}
             </span>
-          </div>
-       )}
+          )}
+          
+          {patchAnalysis && selectedLoops.length === 1 && (
+             <div className="flex flex-col items-center gap-1 pointer-events-auto mt-1">
+                <span className="text-[9px] font-bold text-zinc-300 uppercase tracking-wider bg-zinc-900/80 px-2 py-0.5 rounded border border-zinc-700 backdrop-blur-md shadow-lg">
+                   Suggested: <span className="text-amber-400">{patchAnalysis.type}</span>
+                </span>
+                <div className="flex gap-1.5 mt-0.5">
+                   <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'plane'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'plane' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Plane"><IconSquare /></button>
+                   <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'cylinder'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'cylinder' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Cylinder"><IconCylinderOutline /></button>
+                   <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'sphere'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'sphere' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Sphere"><IconSphere /></button>
+                </div>
+             </div>
+          )}
+       </div>
 
        <div className="absolute w-[160px] h-[160px] rounded-full border border-zinc-600/30 bg-zinc-900/40 backdrop-blur-md animate-in zoom-in duration-150 pointer-events-none" />
        
@@ -135,7 +149,6 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
          />
        </div>
 
-       {/* Render Outer Buttons */}
        {outerButtons.map((btn, i) => {
           const rad = (btn.angle * Math.PI) / 180;
           const x = Math.cos(rad) * outerRadius;
@@ -155,7 +168,6 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
           );
        })}
 
-       {/* Render Inner Buttons */}
        {buttons.map((btn, i) => {
           const rad = (btn.angle * Math.PI) / 180;
           const x = Math.cos(rad) * radius;
@@ -201,6 +213,8 @@ export default function App() {
   const [selectedItemId, setSelectedItemId] = useState(null); 
   const [extrudeDepth, setExtrudeDepth] = useState(5.0);
   const [isCommitting, setIsCommitting] = useState(false);
+  
+  const [patchAnalysis, setPatchAnalysis] = useState(null);
 
   const [symmetry, setSymmetry] = useState({ x: false, y: false, z: false });
   const toggleSymmetry = (axis) => setSymmetry(prev => ({ ...prev, [axis]: !prev[axis] }));
@@ -315,6 +329,7 @@ export default function App() {
     }
     
     setSelectedLoops([]);
+    setPatchAnalysis(null);
     setIsCommitting(false);
   };
 
@@ -335,13 +350,40 @@ export default function App() {
     setIsAutoExtracting(false);
   };
 
-  const handleSelectLoop = (loopData, clickPos) => {
+  const handleSelectLoop = async (loopData, clickPos) => {
     setSelectedLoops(prev => {
         if (prev.some(l => l.id === loopData.id)) return prev;
         return [...prev, loopData];
     });
     if (clickPos) setMenuAnchor(clickPos);
     else setMenuAnchor(mousePos); 
+
+    // Automatically trigger curvature analysis when selecting a patch
+    if (loopData.clickPoint) {
+      try {
+        const res = await fetch(`http://localhost:8000/classify-patch`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            x: loopData.clickPoint.x, 
+            y: loopData.clickPoint.y, 
+            z: loopData.clickPoint.z, 
+            sharpness_angle: sharpnessAngle 
+          })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setPatchAnalysis({
+            type: data.best_match,
+            errors: data.errors,
+            radius: data.radius,
+            face_count: data.face_count
+          });
+        }
+      } catch (err) {
+        console.error("Analysis fetch error:", err);
+      }
+    }
   };
 
   const handleSelectSolid = (id, clickPos) => {
@@ -372,6 +414,7 @@ export default function App() {
         }]);
         setSelectedLoops([]); 
         setSelectedItemId(null);
+        setPatchAnalysis(null);
       } else {
         const errData = await res.json();
         setServerLogs(prev => [...prev, `[Error] ${errData.detail || 'Unknown CAD Engine crash.'}`]);
@@ -380,7 +423,14 @@ export default function App() {
     setIsCommitting(false);
   };
 
-  const handleExtrude = () => executeGeometryOperation('commit-geometry', { operation: 'extrude', loops: selectedLoops, extrude_depth: extrudeDepth }, 'solid', 'Extrude');
+  const handleExtrude = () => {
+      const payloadLoops = selectedLoops.map(loop => ({
+          ...loop,
+          type: patchAnalysis && selectedLoops.length === 1 ? patchAnalysis.type : loop.type
+      }));
+      executeGeometryOperation('commit-geometry', { operation: 'extrude', loops: payloadLoops, extrude_depth: extrudeDepth }, 'solid', 'Extrude');
+  };
+  
   const handleLoft = () => executeGeometryOperation('commit-geometry', { operation: 'loft', loops: selectedLoops }, 'solid', 'Loft');
   const handleSheet = () => executeGeometryOperation('create-sheet', { operation: 'sheet', loops: selectedLoops }, 'sheet', 'Sheet');
 
@@ -441,10 +491,14 @@ export default function App() {
 
     setIsCommitting(true);
     try {
+      const payloadLoops = selectedLoops.map(loop => ({
+          ...loop,
+          type: patchAnalysis && selectedLoops.length === 1 ? patchAnalysis.type : loop.type
+      }));
       const res = await fetch(`http://localhost:8000/boolean-cut`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ loops: selectedLoops, extrude_depth: extrudeDepth, target_index: targetIndex })
+        body: JSON.stringify({ loops: payloadLoops, extrude_depth: extrudeDepth, target_index: targetIndex })
       });
       if (res.ok) {
         const geometryData = await res.json();
@@ -458,6 +512,7 @@ export default function App() {
         });
         setSelectedLoops([]); 
         setSelectedItemId(null);
+        setPatchAnalysis(null);
       } else {
         const errData = await res.json();
         setServerLogs(prev => [...prev, `[Error] ${errData.detail}`]);
@@ -489,6 +544,7 @@ export default function App() {
     setHistoryIndex(0);
     setSelectedLoops([]);
     setSelectedItemId(null);
+    setPatchAnalysis(null);
     setRebuildHistory([]);
 
     const formData = new FormData();
@@ -603,8 +659,10 @@ export default function App() {
         onPromote={handlePromoteSheet}
         onExtractCurve={handleExtractCurveFromRing}
         onDeleteItem={() => handleDeleteGeometry(selectedItemId)}
-        onClear={() => { setSelectedLoops([]); setSelectedItemId(null); }}
+        onClear={() => { setSelectedLoops([]); setSelectedItemId(null); setPatchAnalysis(null); }}
         onUpdateDepth={handleUpdateHistoryItemDepth}
+        patchAnalysis={patchAnalysis}
+        setPatchAnalysis={setPatchAnalysis}
       />
 
       {/* LEFT COLUMN: OUTLINER */}
@@ -927,6 +985,42 @@ export default function App() {
                 )}
              </div>
           </div>
+
+          {patchAnalysis && (
+            <div className="bg-zinc-900 rounded border border-blue-900/50 p-3 flex flex-col gap-2">
+               <div className="flex justify-between items-center pb-1 border-b border-zinc-800">
+                  <span className="text-[10px] font-bold uppercase text-blue-400 tracking-wider">Surface Analysis</span>
+                  <span className="text-[10px] font-bold bg-blue-900/30 text-blue-400 border border-blue-800 px-1.5 py-0.5 rounded uppercase tracking-widest">{patchAnalysis.type}</span>
+               </div>
+               <div className="flex justify-between items-center text-[10px] font-mono text-zinc-300">
+                  <span className="text-zinc-500">Face Count</span>
+                  <span>{patchAnalysis.face_count}</span>
+               </div>
+               {patchAnalysis.radius > 0 && (
+                  <div className="flex justify-between items-center text-[10px] font-mono text-zinc-300">
+                     <span className="text-zinc-500">Radius</span>
+                     <span>{patchAnalysis.radius.toFixed(4)}</span>
+                  </div>
+               )}
+               <div className="mt-1 pt-2 border-t border-zinc-800">
+                  <span className="text-[9px] font-bold text-zinc-500 uppercase tracking-widest">Fitting Errors</span>
+                  <div className="flex flex-col gap-1 mt-1.5 text-[10px] font-mono">
+                     <div className="flex justify-between items-center">
+                        <span className="text-zinc-400">Plane</span>
+                        <span className={patchAnalysis.type === 'plane' ? 'text-amber-400 font-bold bg-amber-900/20 px-1 rounded' : 'text-zinc-300'}>{patchAnalysis.errors?.plane?.toExponential(2) || 'N/A'}</span>
+                     </div>
+                     <div className="flex justify-between items-center">
+                        <span className="text-zinc-400">Cylinder</span>
+                        <span className={patchAnalysis.type === 'cylinder' ? 'text-amber-400 font-bold bg-amber-900/20 px-1 rounded' : 'text-zinc-300'}>{patchAnalysis.errors?.cylinder?.toExponential(2) || 'N/A'}</span>
+                     </div>
+                     <div className="flex justify-between items-center">
+                        <span className="text-zinc-400">Sphere</span>
+                        <span className={patchAnalysis.type === 'sphere' ? 'text-amber-400 font-bold bg-amber-900/20 px-1 rounded' : 'text-zinc-300'}>{patchAnalysis.errors?.sphere?.toExponential(2) || 'N/A'}</span>
+                     </div>
+                  </div>
+               </div>
+            </div>
+          )}
 
           {selectedItemData ? (
             <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-3">
