@@ -82,13 +82,35 @@ async def get_logs():
 async def upload_mesh(file: UploadFile = File(...)):
     try:
         state.live_logs = [] 
-        state.rebuild_geometry = [] 
+        state.rebuild_geometry = [] # Clear history on new upload
         broadcast_log(f"[System] Receiving {file.filename}...")
         contents = await file.read()
+        
+        # Load the mesh
         mesh = trimesh.load(io.BytesIO(contents), file_type='obj', force='mesh')
+        
+        # --- THE AGGRESSIVE CAD FIX ---
+        broadcast_log("[System] Running Aggressive CAD Cleanup...")
+        
+        # 1. Round vertices to 4 decimal places to eliminate microscopic CAD export gaps
+        mesh.vertices = np.round(mesh.vertices, decimals=4)
+        
+        # 2. Weld the now-mathematically-identical vertices together
+        mesh.merge_vertices()
+        
+        # 3. Clean up any weird zero-area faces created by the merge
+        mesh.update_faces(mesh.nondegenerate_faces())
+        mesh.remove_unreferenced_vertices()
+        
+        # 4. FIX NORMALS: Ensure all adjacent faces are pointing outwards!
+        # Without this, flat surfaces might read as 180-degree angles.
+        trimesh.repair.fix_normals(mesh)
+        trimesh.repair.fix_inversion(mesh)
+        # ---------------------------------------
+        
         state.mesh = mesh
         
-        broadcast_log(f"[Success] Python parsed mesh. Faces: {len(mesh.faces):,}")
+        broadcast_log(f"[Success] Python parsed and welded mesh. Faces: {len(mesh.faces):,}")
         return {"message": "Mesh successfully loaded", "faces": len(mesh.faces)}
     except Exception as e:
         broadcast_log(f"[Error] Failed to load mesh: {str(e)}")
@@ -260,12 +282,16 @@ async def scout_loop(params: Point3D):
             ordered_nodes = list(nx.dfs_preorder_nodes(best_subgraph))
             
         ordered_points = mesh.vertices[ordered_nodes]
+        
+        patch_id = f"patch_{min(target_region)}" # Stable ID so colors don't flicker
+        
         return {
-            "id": patch_id,
+            "id": patch_id, 
             "type": "planar",
             "points": ordered_points.tolist(),
-            "patch_faces": target_region.tolist() # Feed the UI Color Splash
+            "patch_faces": target_region.tolist() # <-- THIS feeds the Color Splash!
         }
+        
     except Exception as e:
         raise HTTPException(status_code=500)
 
@@ -565,6 +591,7 @@ async def extract_feature(params: FeatureParams):
                     if np.dot(normal, region_normal) < 0: normal = -normal
 
                     is_circle = True
+                    patch_id = f"patch_{min(target_region)}"
                     return {
                         "id": patch_id,
                         "type": "circle",
@@ -585,6 +612,7 @@ async def extract_feature(params: FeatureParams):
                 ordered_nodes = list(nx.dfs_preorder_nodes(best_subgraph))
                 
             ordered_points = mesh.vertices[ordered_nodes]
+            patch_id = f"patch_{min(target_region)}"
             return {
                 "id": patch_id,
                 "type": "planar",
