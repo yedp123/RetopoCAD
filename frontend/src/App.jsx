@@ -1,442 +1,7 @@
-import React, { useState, useRef, useEffect, Suspense, useMemo } from 'react';
-import { Canvas, useLoader } from '@react-three/fiber';
-import { OrbitControls, Bounds, Edges, Grid, GizmoHelper, GizmoViewport } from '@react-three/drei';
-import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
-import * as THREE from 'three';
+import React, { useState, useRef, useEffect, Suspense } from 'react';
+import Viewport from './Viewport';
 
-// --- VIEWPORT COMPONENTS ---
-
-function HullMesh({ vertices, faces, centerOffset, material }) {
-  const geometry = useMemo(() => {
-    if (!vertices?.length || !faces?.length) return null;
-    try {
-        const geo = new THREE.BufferGeometry();
-        const verts = new Float32Array(vertices.flat());
-        const indices = new Uint32Array(faces.flat());
-        geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
-        geo.setIndex(new THREE.BufferAttribute(indices, 1));
-        geo.computeVertexNormals();
-        if (centerOffset) {
-            geo.translate(-centerOffset.x, -centerOffset.y, -centerOffset.z);
-        }
-        return geo;
-    } catch (e) {
-        console.error("Geometry build error:", e);
-        return null;
-    }
-  }, [vertices, faces, centerOffset]);
-
-  if (!geometry) return null;
-  return <mesh geometry={geometry} material={material} />;
-}
-
-function CircleCurve({ feature, centerOffset, customColor, hoveredOverride, onSelect }) {
-  const [hovered, setHovered] = useState(false);
-  const { id, center, normal, radius } = feature;
-
-  const points = useMemo(() => {
-    if (!center || !normal || radius === undefined) return [];
-    const pts = [];
-    for (let i = 0; i <= 64; i++) {
-      const theta = (i / 64) * Math.PI * 2;
-      pts.push(new THREE.Vector3(Math.cos(theta) * radius, Math.sin(theta) * radius, 0));
-    }
-    return pts;
-  }, [radius, center, normal]);
-
-  const geometry = useMemo(() => {
-    if (!points.length) return null;
-    try {
-        return new THREE.BufferGeometry().setFromPoints(points);
-    } catch(e) { return null; }
-  }, [points]);
-  
-  const quaternion = useMemo(() => {
-    if (!normal) return new THREE.Quaternion();
-    const up = new THREE.Vector3(0, 0, 1);
-    const n = new THREE.Vector3(...normal).normalize();
-    return new THREE.Quaternion().setFromUnitVectors(up, n);
-  }, [normal]);
-
-  if (!geometry || !center) return null;
-
-  const pos = new THREE.Vector3(...center);
-  if (centerOffset) pos.sub(centerOffset);
-  
-  const color = customColor ? customColor : (hovered ? '#10b981' : '#059669');
-  const finalHover = hoveredOverride !== undefined ? hoveredOverride : hovered;
-
-  return (
-    <line 
-      geometry={geometry} 
-      position={pos} 
-      quaternion={quaternion}
-      onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
-      onPointerOut={() => setHovered(false)}
-      onClick={(e) => {
-        e.stopPropagation();
-        if (onSelect) {
-            const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
-            const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
-            onSelect(feature, { x: screenX, y: screenY });
-        }
-      }}
-    >
-      <lineBasicMaterial color={color} linewidth={finalHover ? 3 : 2} depthTest={false} />
-    </line>
-  );
-}
-
-function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSelect }) {
-  const [hovered, setHovered] = useState(false);
-  const { id, points } = feature;
-
-  const geometry = useMemo(() => {
-    if (!points?.length) return null;
-    try {
-        const pts = points.map(p => new THREE.Vector3(...p));
-        if (centerOffset) {
-            pts.forEach(p => p.sub(centerOffset));
-        }
-        if (pts.length > 0) pts.push(pts[0].clone()); 
-        return new THREE.BufferGeometry().setFromPoints(pts);
-    } catch (e) { return null; }
-  }, [points, centerOffset]);
-
-  if (!geometry) return null;
-
-  const color = customColor ? customColor : (hovered ? '#10b981' : '#059669');
-  const finalHover = hoveredOverride !== undefined ? hoveredOverride : hovered;
-
-  return (
-    <line 
-      geometry={geometry}
-      onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
-      onPointerOut={() => setHovered(false)}
-      onClick={(e) => {
-        e.stopPropagation();
-        if (onSelect) {
-            const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
-            const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
-            onSelect(feature, { x: screenX, y: screenY });
-        }
-      }}
-    >
-      <lineBasicMaterial color={color} linewidth={finalHover ? 3 : 2} depthTest={false} />
-    </line>
-  );
-}
-
-function GhostModel({ 
-  url, symmetry, activeTool, 
-  onSelectLoop, onSelectSolid,
-  showMesh, showWireframe, meshOpacity,
-  selectedLoops, rebuildHistory, selectedItemId, cursorScale,
-  extractedFeatures
-}) {
-  const obj = useLoader(OBJLoader, url);
-  const cursorGroupRef = useRef(); 
-  const cursorRef = useRef();
-  const mirroredCursorRefs = useRef([]); 
-  
-  const [scoutLoop, setScoutLoop] = useState(null);
-  const scoutTimeout = useRef(null);
-  
-  useEffect(() => {
-    return () => URL.revokeObjectURL(url);
-  }, [url]);
-
-  const activeScales = useMemo(() => {
-    const scales = [];
-    const xArr = symmetry.x ? [1, -1] : [1];
-    const yArr = symmetry.y ? [1, -1] : [1];
-    const zArr = symmetry.z ? [1, -1] : [1];
-    
-    for (let x of xArr) {
-      for (let y of yArr) {
-        for (let z of zArr) {
-          if (x === 1 && y === 1 && z === 1) continue; 
-          scales.push([x, y, z]);
-        }
-      }
-    }
-    return scales;
-  }, [symmetry]);
-
-  const { meshes, cursorRadius, centerOffset } = useMemo(() => {
-    const extracted = [];
-    const box = new THREE.Box3().setFromObject(obj);
-    const center = new THREE.Vector3();
-    box.getCenter(center);
-    
-    const size = new THREE.Vector3();
-    box.getSize(size);
-    const maxDimension = Math.max(size.x, size.y, size.z);
-    
-    const calculatedRadius = maxDimension * (cursorScale || 0.005);
-
-    obj.traverse((child) => {
-      if (child.isMesh && child.geometry) {
-        const geom = child.geometry.clone();
-        geom.translate(-center.x, -center.y, -center.z);
-        geom.computeBoundingBox();
-        geom.computeBoundingSphere();
-        extracted.push({ 
-           geometry: geom, 
-           position: child.position.clone(), 
-           rotation: child.rotation.clone(), 
-           scale: child.scale.clone() 
-        });
-      }
-    });
-    
-    return { meshes: extracted, cursorRadius: calculatedRadius, centerOffset: center };
-  }, [obj, cursorScale]);
-
-  const solidMaterial = useMemo(() => new THREE.MeshStandardMaterial({
-    color: "#3b82f6", 
-    transparent: true,
-    opacity: 0.8,
-    roughness: 0.3,
-    metalness: 0.1,
-    side: THREE.DoubleSide
-  }), []);
-
-  const sheetMaterial = useMemo(() => new THREE.MeshStandardMaterial({
-    color: "#4ade80", 
-    transparent: true,
-    opacity: 0.8,
-    roughness: 0.3,
-    metalness: 0.1,
-    side: THREE.DoubleSide
-  }), []);
-
-  const selectedMaterial = useMemo(() => new THREE.MeshStandardMaterial({
-    color: "#f97316", 
-    emissive: "#ea580c",
-    emissiveIntensity: 0.4,
-    transparent: true,
-    opacity: 0.9,
-    roughness: 0.2,
-    metalness: 0.3,
-    side: THREE.DoubleSide
-  }), []);
-
-  const handlePointerMove = (e) => {
-    e.stopPropagation(); 
-
-    if (cursorGroupRef.current) {
-      const worldPoint = e.point.clone();
-      const localPoint = cursorGroupRef.current.worldToLocal(worldPoint);
-      const rawPoint = localPoint.clone().add(centerOffset);
-      
-      if (cursorRef.current) {
-        cursorRef.current.position.copy(localPoint);
-        cursorRef.current.visible = true;
-      }
-      
-      mirroredCursorRefs.current.forEach((ref, index) => {
-        if (ref && activeScales[index]) {
-          const scale = activeScales[index];
-          ref.position.set(localPoint.x * scale[0], localPoint.y * scale[1], localPoint.z * scale[2]);
-          ref.visible = true;
-        }
-      });
-
-      if (activeTool !== 'analyze') {
-        clearTimeout(scoutTimeout.current);
-        scoutTimeout.current = setTimeout(async () => {
-          try {
-            const res = await fetch(`http://localhost:8000/scout-loop`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ x: rawPoint.x, y: rawPoint.y, z: rawPoint.z })
-            });
-            if (res.ok) {
-              const data = await res.json();
-              setScoutLoop(data);
-            }
-          } catch(err) {}
-        }, 50); 
-      }
-    }
-  };
-
-  const handlePointerOut = () => {
-    if (cursorRef.current) cursorRef.current.visible = false;
-    mirroredCursorRefs.current.forEach(ref => {
-      if (ref) ref.visible = false;
-    });
-    setScoutLoop(null);
-    clearTimeout(scoutTimeout.current);
-  };
-
-  const handleClick = async (e) => {
-    e.stopPropagation(); 
-    if (!cursorGroupRef.current) return;
-
-    const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
-    const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
-
-    if (scoutLoop) {
-      onSelectLoop(scoutLoop, { x: screenX, y: screenY });
-      setScoutLoop(null);
-    }
-  };
-
-  return (
-    <group ref={cursorGroupRef}>
-      <group>
-        {showMesh && meshes?.map((mesh, index) => (
-          <mesh key={`base-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onClick={handleClick}>
-            <meshStandardMaterial color="#cccccc" transparent opacity={meshOpacity} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
-            {showWireframe && <Edges raycast={() => null} threshold={15} color="#18181b" />}
-          </mesh>
-        ))}
-
-        {extractedFeatures?.map((feat) => {
-          const isSelected = selectedLoops?.some(l => l.id === feat.id);
-          if (isSelected) return null; 
-          return feat.type === 'circle' 
-            ? <CircleCurve key={feat.id} feature={feat} centerOffset={centerOffset} onSelect={onSelectLoop} />
-            : <PlanarCurve key={feat.id} feature={feat} centerOffset={centerOffset} onSelect={onSelectLoop} />
-        })}
-
-        {scoutLoop && <PlanarCurve feature={scoutLoop} centerOffset={centerOffset} customColor="#f97316" hoveredOverride={true} />}
-        
-        {selectedLoops?.map((feat, idx) => (
-          <PlanarCurve key={`sel-${feat.id}-${idx}`} feature={feat} centerOffset={centerOffset} customColor="#38bdf8" hoveredOverride={true} />
-        ))}
-        
-        {rebuildHistory?.map((geo) => {
-            if (geo.visible === false) return null;
-            const isSelected = geo.id === selectedItemId;
-            const mat = geo.type === 'sheet' ? (isSelected ? selectedMaterial : sheetMaterial) : (isSelected ? selectedMaterial : solidMaterial);
-            return (
-              <group 
-                key={`geo-${geo.id}`} 
-                onClick={(e) => { 
-                  e.stopPropagation(); 
-                  const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
-                  const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
-                  if (onSelectSolid) onSelectSolid(geo.id, { x: screenX, y: screenY }); 
-                }}
-              >
-                <HullMesh 
-                  vertices={geo.vertices} 
-                  faces={geo.faces} 
-                  centerOffset={centerOffset} 
-                  material={mat} 
-                />
-              </group>
-            );
-        })}
-      </group>
-
-      {activeScales?.map((scale) => {
-        const mirrorKey = scale.join(',');
-        return (
-          <group key={`mirror-group-${mirrorKey}`} scale={scale}>
-            {showMesh && meshes?.map((mesh, index) => (
-              <mesh key={`mirror-${mirrorKey}-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale}>
-                <meshStandardMaterial color="#cccccc" transparent opacity={meshOpacity} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
-                {showWireframe && <Edges raycast={() => null} threshold={15} color="#18181b" />}
-              </mesh>
-            ))}
-            {extractedFeatures?.map((feat) => {
-              return feat.type === 'circle' 
-                ? <CircleCurve key={`mirror-circ-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} />
-                : <PlanarCurve key={`mirror-plan-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} />
-            })}
-            {rebuildHistory?.map((geo) => {
-               if (geo.visible === false) return null;
-               return (
-                 <HullMesh 
-                   key={`mirror-geo-${mirrorKey}-${geo.id}`} 
-                   vertices={geo.vertices} 
-                   faces={geo.faces} 
-                   centerOffset={centerOffset} 
-                   material={geo.type === 'sheet' ? sheetMaterial : solidMaterial} 
-                 />
-               );
-            })}
-          </group>
-        );
-      })}
-
-      {showMesh && (
-        <>
-          <mesh ref={cursorRef} visible={false} renderOrder={1}>
-            <sphereGeometry args={[cursorRadius, 16, 16]} />
-            <meshBasicMaterial color="#3b82f6" depthTest={false} /> 
-          </mesh>
-
-          {activeScales?.map((scale, i) => (
-            <mesh key={`cursor-${scale.join(',')}`} ref={(el) => { if(el) mirroredCursorRefs.current[i] = el; }} visible={false} renderOrder={1}>
-              <sphereGeometry args={[cursorRadius, 16, 16]} />
-              <meshBasicMaterial color="#ef4444" depthTest={false} />
-            </mesh>
-          ))}
-        </>
-      )}
-    </group>
-  );
-}
-
-function Viewport({ 
-  objUrl, symmetry, activeTool,
-  onSelectLoop, onSelectSolid,
-  showMesh, showWireframe, meshOpacity,
-  selectedLoops, rebuildHistory, selectedItemId, cursorScale,
-  extractedFeatures
-}) {
-  return (
-    <Canvas camera={{ position: [5, 5, 5], fov: 45 }} gl={{ antialias: true }} raycaster={{ params: { Line: { threshold: 0.5 } } }}>
-      <color attach="background" args={['#18181b']} />
-      <ambientLight intensity={0.4} />
-      <hemisphereLight skyColor="#ffffff" groundColor="#444444" intensity={0.6} />
-      <directionalLight position={[10, 10, 10]} castShadow />
-      <Grid infiniteGrid fadeDistance={50} sectionColor="#3f3f46" cellColor="#27272a" position={[0, -0.01, 0]} />
-
-      <Suspense fallback={null}>
-        {objUrl && (
-          <>
-            <Bounds fit clip margin={1.2}>
-              <GhostModel 
-                url={objUrl} 
-                symmetry={symmetry} 
-                activeTool={activeTool}
-                onSelectLoop={onSelectLoop}
-                onSelectSolid={onSelectSolid}
-                showMesh={showMesh} 
-                showWireframe={showWireframe}
-                meshOpacity={meshOpacity}
-                selectedLoops={selectedLoops}
-                rebuildHistory={rebuildHistory}
-                selectedItemId={selectedItemId}
-                cursorScale={cursorScale}
-                extractedFeatures={extractedFeatures}
-              />
-            </Bounds>
-            {symmetry?.x && <mesh rotation={[0, Math.PI / 2, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#ef4444" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
-            {symmetry?.y && <mesh rotation={[-Math.PI / 2, 0, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#22c55e" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
-            {symmetry?.z && <mesh rotation={[0, 0, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#3b82f6" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
-          </>
-        )}
-      </Suspense>
-
-      <OrbitControls makeDefault enablePan={true} />
-
-      <GizmoHelper alignment="bottom-right" margin={[60, 60]}>
-        <GizmoViewport axisColors={['#ef4444', '#22c55e', '#3b82f6']} labelColor="white" />
-      </GizmoHelper>
-
-    </Canvas>
-  );
-}
-
-// --- APP & UI COMPONENTS ---
-
+// --- ICONS ---
 const IconExtrude = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>;
 const IconCylinderFill = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 5v14c0 1.66-4 3-9 3s-9-1.34-9-3V5"></path></svg>;
 const IconLoft = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polygon points="12 12 2 17 12 22 22 17 12 12"></polygon></svg>;
@@ -445,10 +10,10 @@ const IconClear = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="no
 const IconCut = () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="6" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><line x1="20" y1="4" x2="8.12" y2="15.88"></line><line x1="14.47" y1="14.48" x2="20" y2="20"></line><line x1="8.12" y1="8.12" x2="12" y2="12"></line></svg>;
 const IconEye = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>;
 const IconEyeOff = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>;
-
 const IconSquare = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect></svg>;
 const IconCylinderOutline = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 6c0 1.657 3.582 3 8 3s8-1.343 8-3M4 6c0-1.657 3.582-3 8-3s8 1.343 8 3m-16 0v12c0 1.657 3.582 3 8 3s8-1.343 8-3V6"></path></svg>;
-
+const IconWave = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 12c-2.66 0-4.33-3-7-3s-4.34 3-7 3-4.33-3-7-3"></path></svg>;
+const IconTrash = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>;
 
 function CompactSymmetryToggle({ label, active, onClick, colorClass }) {
   return (
@@ -461,7 +26,7 @@ function CompactSymmetryToggle({ label, active, onClick, colorClass }) {
   );
 }
 
-function ActionRing({ anchorPos, selectedLoops, selectedItemId, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear }) {
+function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem }) {
   const [pos, setPos] = useState({ x: -1000, y: -1000 });
 
   useEffect(() => {
@@ -478,32 +43,67 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemId, extrudeDepth, se
     setPos({ x: targetX, y: targetY });
   }, [anchorPos]);
 
-  if ((!selectedLoops || selectedLoops.length === 0) && !selectedItemId) return null;
+  if ((!selectedLoops || selectedLoops.length === 0) && !selectedItemData) return null;
+
+  const planeCount = selectedLoops.filter(l => l.type !== 'circle').length;
+  const circleCount = selectedLoops.filter(l => l.type === 'circle').length;
+  let selectionText = [];
+  if (planeCount > 0) selectionText.push(`${planeCount} Plane${planeCount > 1 ? 's' : ''}`);
+  if (circleCount > 0) selectionText.push(`${circleCount} Cylinder${circleCount > 1 ? 's' : ''}`);
+  if (selectedItemData && selectedLoops.length === 0) {
+      selectionText.push(`1 ${selectedItemData.type === 'sheet' ? 'Sheet' : 'Solid'}`);
+  }
+  const selectionString = selectionText.length > 0 ? `Selected: ${selectionText.join(', ')}` : '';
 
   const isCylinderLoop = selectedLoops.length === 1 && selectedLoops[0].type === 'circle';
   const extrudeLabel = isCylinderLoop ? 'Cylinder' : 'Extrude';
 
   const radius = 70; 
-  const buttons = [
-    { label: extrudeLabel, icon: isCylinderLoop ? <IconCylinderFill /> : <IconExtrude />, angle: -90, action: onExtrude, disabled: selectedLoops.length !== 1, color: 'text-blue-400' },
-    { label: 'Loft', icon: <IconLoft />, angle: 0, action: onLoft, disabled: selectedLoops.length !== 2, color: 'text-blue-400' },
-    { label: 'Sheet', icon: <IconSheet />, angle: 90, action: onSheet, disabled: selectedLoops.length !== 1, color: 'text-green-400' },
-    { label: 'Clear', icon: <IconClear />, angle: 180, action: onClear, disabled: false, color: 'text-red-400' },
-  ];
+  const outerRadius = 110;
+  const buttons = [];
+  const outerButtons = [];
 
-  if (selectedItemId !== null) {
-      buttons.push({ label: 'Cut', icon: <IconCut />, angle: -45, action: onCut, disabled: selectedLoops.length !== 1, color: 'text-orange-400' });
+  // Inner tools
+  if (selectedLoops.length > 0) {
+      buttons.push({ label: extrudeLabel, icon: isCylinderLoop ? <IconCylinderFill /> : <IconExtrude />, angle: -90, action: onExtrude, disabled: selectedLoops.length !== 1, color: 'text-blue-400' });
+      buttons.push({ label: 'Loft', icon: <IconLoft />, angle: 0, action: onLoft, disabled: selectedLoops.length !== 2, color: 'text-blue-400' });
+      buttons.push({ label: 'Sheet', icon: <IconSheet />, angle: 90, action: onSheet, disabled: selectedLoops.length !== 1, color: 'text-green-400' });
+      
+      if (selectedItemData) {
+          buttons.push({ label: 'Cut', icon: <IconCut />, angle: -45, action: onCut, disabled: selectedLoops.length !== 1, color: 'text-orange-400' });
+      }
+  } else if (selectedItemData) {
+      if (selectedItemData.type === 'sheet') {
+          buttons.push({ label: 'Extrude', icon: <IconExtrude />, angle: -90, action: () => onPromote(selectedItemData.id), disabled: false, color: 'text-emerald-400' });
+      }
+      buttons.push({ label: 'Cut', icon: <IconCut />, angle: -45, action: onCut, disabled: true, color: 'text-orange-400' });
   }
+
+  buttons.push({ label: 'Clear', icon: <IconClear />, angle: 180, action: onClear, disabled: false, color: 'text-zinc-400' });
+
+  // Outer tools
+  outerButtons.push({ label: 'Extract Curve', icon: <IconWave />, angle: -135, action: onExtractCurve, disabled: selectedLoops.length === 0, color: 'text-purple-400' });
+  outerButtons.push({ label: 'Delete', icon: <IconTrash />, angle: -45, action: onDeleteItem, disabled: !selectedItemData, color: 'text-red-500' });
+
 
   return (
     <div style={{ left: pos.x, top: pos.y }} className="fixed pointer-events-none z-50 flex items-center justify-center -translate-x-1/2 -translate-y-1/2 transition-all duration-200">
-       <div className="absolute w-40 h-40 rounded-full border border-zinc-600/20 bg-zinc-900/30 backdrop-blur-md animate-in zoom-in duration-150 pointer-events-none" />
+       {selectionString && (
+          <div className="absolute bottom-[130px] flex items-center justify-center pointer-events-none w-64 text-center">
+            <span className="bg-amber-500 text-zinc-950 font-black px-3 py-1 rounded border border-amber-400 text-[10px] uppercase tracking-widest shadow-[0_0_15px_rgba(245,158,11,0.3)]">
+              {selectionString}
+            </span>
+          </div>
+       )}
+
+       <div className="absolute w-[240px] h-[240px] rounded-full border border-zinc-600/10 bg-zinc-900/10 backdrop-blur-sm animate-in zoom-in duration-200 pointer-events-none" />
+       <div className="absolute w-[160px] h-[160px] rounded-full border border-zinc-600/30 bg-zinc-900/40 backdrop-blur-md animate-in zoom-in duration-150 pointer-events-none" />
        
        <div className="absolute pointer-events-auto flex flex-col items-center justify-center w-14 h-14 rounded-full bg-zinc-800/90 border border-zinc-600 shadow-xl backdrop-blur-md animate-in zoom-in">
          {isCylinderLoop && (
              <span className="text-[7.5px] font-black uppercase text-emerald-400 tracking-tighter leading-none mb-1">R: {selectedLoops[0].radius.toFixed(2)}</span>
          )}
-         <span className="text-[7px] font-black uppercase text-zinc-400 tracking-tighter leading-none mb-0.5">Depth</span>
+         <span className="text-[7px] font-black uppercase text-zinc-400 tracking-tighter leading-none mb-0.5 mt-0.5">Depth</span>
          <input 
            type="number" 
            value={extrudeDepth} 
@@ -513,13 +113,34 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemId, extrudeDepth, se
          />
        </div>
 
+       {/* Render Outer Buttons */}
+       {outerButtons.map((btn, i) => {
+          const rad = (btn.angle * Math.PI) / 180;
+          const x = Math.cos(rad) * outerRadius;
+          const y = Math.sin(rad) * outerRadius;
+          return (
+             <button
+               key={`outer-${i}`}
+               onClick={(e) => { e.stopPropagation(); btn.action(); }}
+               disabled={btn.disabled}
+               style={{ transform: `translate(${x}px, ${y}px)` }}
+               className={`absolute pointer-events-auto flex flex-col items-center justify-center w-12 h-12 rounded-full transition-all shadow-xl backdrop-blur-md border 
+                 ${btn.disabled ? 'bg-zinc-800/50 text-zinc-600 border-zinc-700/30 cursor-not-allowed' : `bg-zinc-800/90 border-zinc-500 hover:bg-zinc-700 hover:scale-110 hover:border-zinc-300 ${btn.color}`}`}
+             >
+               <span className="mb-0.5 pointer-events-none scale-90">{btn.icon}</span>
+               <span className="text-[6.5px] font-black uppercase tracking-tighter text-zinc-300 pointer-events-none">{btn.label}</span>
+             </button>
+          );
+       })}
+
+       {/* Render Inner Buttons */}
        {buttons.map((btn, i) => {
           const rad = (btn.angle * Math.PI) / 180;
           const x = Math.cos(rad) * radius;
           const y = Math.sin(rad) * radius;
           return (
              <button
-               key={i}
+               key={`inner-${i}`}
                onClick={(e) => { e.stopPropagation(); btn.action(); }}
                disabled={btn.disabled}
                style={{ transform: `translate(${x}px, ${y}px)` }}
@@ -537,6 +158,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemId, extrudeDepth, se
 
 export default function App() {
   const [objUrl, setObjUrl] = useState(null);
+  const [fileName, setFileName] = useState("Imported.obj");
   const [backendStatus, setBackendStatus] = useState("Waiting for mesh...");
   const [isUploading, setIsUploading] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -546,26 +168,29 @@ export default function App() {
   
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 }); 
   const [menuAnchor, setMenuAnchor] = useState({ x: 0, y: 0 });
-  const [activeTool, setActiveTool] = useState('rebuild'); 
-
-  // Feature Extraction States
+  
+  const [featuresHistory, setFeaturesHistory] = useState([[]]); 
+  const [historyIndex, setHistoryIndex] = useState(0);
   const [isAutoExtracting, setIsAutoExtracting] = useState(false);
   const [minFeatureSize, setMinFeatureSize] = useState(2.0);
-  const [extractedFeatures, setExtractedFeatures] = useState([]);
 
-  // Rebuild / Outliner States
+  // Precision Rebuild States
   const [selectedLoops, setSelectedLoops] = useState([]);
   const [rebuildHistory, setRebuildHistory] = useState([]); 
   const [selectedItemId, setSelectedItemId] = useState(null); 
   const [extrudeDepth, setExtrudeDepth] = useState(5.0);
   const [isCommitting, setIsCommitting] = useState(false);
 
-  // Viewport Overrides
+  // Viewport & Folder Visibility Overrides
   const [symmetry, setSymmetry] = useState({ x: false, y: false, z: false });
   const toggleSymmetry = (axis) => setSymmetry(prev => ({ ...prev, [axis]: !prev[axis] }));
   const [showMesh, setShowMesh] = useState(true);
+  const [showSheetsFolder, setShowSheetsFolder] = useState(true);
+  const [showSolidsFolder, setShowSolidsFolder] = useState(true);
+  const [showCurvesFolder, setShowCurvesFolder] = useState(true);
   const [showWireframe, setShowWireframe] = useState(true);
   const [meshOpacity, setMeshOpacity] = useState(0.4);
+  const [hiddenCurveIds, setHiddenCurveIds] = useState([]);
   
   const [serverLogs, setServerLogs] = useState(["System initialized. Ready for operations..."]);
   const consoleEndRef = useRef(null);
@@ -587,13 +212,111 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (consoleEndRef.current) {
-      consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
+    if (consoleEndRef.current) consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
   }, [serverLogs]);
 
+  const currentFeatures = featuresHistory[historyIndex];
+
+  const commitFeatures = (newFeatures) => {
+    const newHistory = featuresHistory.slice(0, historyIndex + 1);
+    newHistory.push(newFeatures);
+    setFeaturesHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+  };
+
+  const handleUndo = () => { if (historyIndex > 0) setHistoryIndex(historyIndex - 1); };
+  const handleRedo = () => { if (historyIndex < featuresHistory.length - 1) setHistoryIndex(historyIndex + 1); };
+
+  // Setup Hotkeys for Curve Undo/Redo
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key.toLowerCase() === 'z') {
+          e.preventDefault();
+          if (historyIndex > 0) setHistoryIndex(prev => prev - 1);
+        } else if (e.key.toLowerCase() === 'y') {
+          e.preventDefault();
+          if (historyIndex < featuresHistory.length - 1) setHistoryIndex(prev => prev + 1);
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [historyIndex, featuresHistory.length]);
+
+  const handleDeleteFeature = (id) => {
+    const filtered = currentFeatures.filter(f => f.id !== id);
+    commitFeatures(filtered);
+  };
+
+  const handleDeleteGeometry = (id) => {
+    setRebuildHistory(prev => prev.filter(geo => geo.id !== id));
+    if (selectedItemId === id) setSelectedItemId(null);
+  };
+
+  const handleClearAllFeatures = () => {
+    if (currentFeatures.length === 0) return;
+    commitFeatures([]);
+  };
+
+  const toggleCurveVisibility = (id) => {
+    setHiddenCurveIds(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]);
+  };
+
+  const handleExtractCurveFromRing = async () => {
+    if (selectedLoops.length === 0) return;
+    setIsCommitting(true);
+    const newFeatures = [];
+    
+    for (const loop of selectedLoops) {
+      if (loop.clickPoint) {
+        try {
+          const res = await fetch(`http://localhost:8000/extract-feature`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+              x: loop.clickPoint.x, y: loop.clickPoint.y, z: loop.clickPoint.z, 
+              sharpness_angle: sharpnessAngle 
+            })
+          });
+          if (res.ok) {
+            newFeatures.push(await res.json());
+          } else {
+            newFeatures.push(loop); // fallback if backend fails circle fit
+          }
+        } catch (e) { newFeatures.push(loop); }
+      } else {
+         newFeatures.push(loop);
+      }
+    }
+
+    if (newFeatures.length > 0) {
+      const mapped = newFeatures.map(f => ({ ...f, id: Math.random().toString(36).substr(2, 9) }));
+      commitFeatures([...currentFeatures, ...mapped]);
+    }
+    
+    setSelectedLoops([]);
+    setIsCommitting(false);
+  };
+
+  const handleAutoExtract = async () => {
+    setIsAutoExtracting(true);
+    try {
+      const res = await fetch('http://localhost:8000/auto-extract', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ min_size: minFeatureSize, sharpness_angle: sharpnessAngle })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        const newFeatures = data.features.map(f => ({ ...f, id: Math.random().toString(36).substr(2, 9) }));
+        commitFeatures([...currentFeatures, ...newFeatures]);
+      }
+    } catch (err) { console.error(err); }
+    setIsAutoExtracting(false);
+  };
+
   const handleSelectLoop = (loopData, clickPos) => {
-    // If the loop doesn't exist in selection, add it.
     setSelectedLoops(prev => {
         if (prev.some(l => l.id === loopData.id)) return prev;
         return [...prev, loopData];
@@ -614,45 +337,6 @@ export default function App() {
     ));
   };
 
-  const handleUndoGeometry = async () => {
-    if (rebuildHistory.length === 0) return;
-    try {
-      const res = await fetch('http://localhost:8000/undo-geometry', { method: 'POST' });
-      if (res.ok) {
-        setRebuildHistory(prev => prev.slice(0, -1));
-        setSelectedItemId(null);
-      }
-    } catch (err) { console.error(err); }
-  };
-
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-        e.preventDefault();
-        handleUndoGeometry();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [rebuildHistory]);
-
-  const handleAutoExtract = async () => {
-    setIsAutoExtracting(true);
-    try {
-      const res = await fetch('http://localhost:8000/auto-extract', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ min_size: minFeatureSize })
-      });
-      const data = await res.json();
-      if (res.ok) {
-        const newFeatures = data.features.map(f => ({ ...f, id: Math.random().toString(36).substr(2, 9) }));
-        setExtractedFeatures(prev => [...prev, ...newFeatures]);
-      }
-    } catch (err) { console.error(err); }
-    setIsAutoExtracting(false);
-  };
-
   const executeGeometryOperation = async (endpoint, payload, type, defaultName) => {
     setIsCommitting(true);
     try {
@@ -664,13 +348,8 @@ export default function App() {
       if (res.ok) {
         const geometryData = await res.json();
         setRebuildHistory(prev => [...prev, { 
-          ...geometryData, 
-          type, 
-          id: Math.random().toString(36).substr(2, 9), 
-          visible: true, 
-          name: `${defaultName} ${prev.length + 1}`, 
-          payload, 
-          endpoint 
+          ...geometryData, type, id: Math.random().toString(36).substr(2, 9), 
+          visible: true, name: `${defaultName} ${prev.length + 1}`, payload, endpoint 
         }]);
         setSelectedLoops([]); 
         setSelectedItemId(null);
@@ -678,9 +357,7 @@ export default function App() {
         const errData = await res.json();
         setServerLogs(prev => [...prev, `[Error] ${errData.detail || 'Unknown CAD Engine crash.'}`]);
       }
-    } catch (err) { 
-        setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]); 
-    }
+    } catch (err) { setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]); }
     setIsCommitting(false);
   };
 
@@ -688,7 +365,7 @@ export default function App() {
   const handleLoft = () => executeGeometryOperation('commit-geometry', { operation: 'loft', loops: selectedLoops }, 'solid', 'Loft');
   const handleSheet = () => executeGeometryOperation('create-sheet', { operation: 'sheet', loops: selectedLoops }, 'sheet', 'Sheet');
 
-  const handleUpdateHistoryItem = async (id, newDepth) => {
+  const handleUpdateHistoryItemDepth = async (id, newDepth) => {
     const item = rebuildHistory.find(i => i.id === id);
     if (!item || !item.payload || item.payload.operation !== 'extrude') return;
     
@@ -702,23 +379,44 @@ export default function App() {
       if (res.ok) {
         const geo = await res.json();
         setRebuildHistory(prev => prev.map(geoItem => geoItem.id === id ? { 
-            ...geoItem, 
-            vertices: geo.vertices, 
-            faces: geo.faces, 
-            payload: { ...geoItem.payload, extrude_depth: newDepth } 
+            ...geoItem, vertices: geo.vertices, faces: geo.faces, payload: { ...geoItem.payload, extrude_depth: newDepth } 
         } : geoItem));
-        setServerLogs(prev => [...prev, `[Success] Entity successfully rebuilt with new parameters.`]);
+        setServerLogs(prev => [...prev, `[Success] Entity successfully rebuilt with new depth.`]);
       } else {
         setServerLogs(prev => [...prev, `[Error] Failed to update geometry.`]);
       }
-    } catch (err) {
-      setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]);
-    }
+    } catch (err) { setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]); }
+    setIsCommitting(false);
+  };
+
+  const handleUpdateHistoryItemRadius = async (id, newRadius) => {
+    const item = rebuildHistory.find(i => i.id === id);
+    if (!item || !item.payload || !item.payload.loops || item.payload.loops[0].type !== 'circle') return;
+    
+    setIsCommitting(true);
+    const newPayload = { ...item.payload };
+    newPayload.loops = [{ ...newPayload.loops[0], radius: newRadius }];
+    
+    try {
+      const res = await fetch(`http://localhost:8000/${item.endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newPayload)
+      });
+      if (res.ok) {
+        const geo = await res.json();
+        setRebuildHistory(prev => prev.map(geoItem => geoItem.id === id ? { 
+            ...geoItem, vertices: geo.vertices, faces: geo.faces, payload: newPayload 
+        } : geoItem));
+        setServerLogs(prev => [...prev, `[Success] Entity successfully rebuilt with new radius.`]);
+      } else {
+        setServerLogs(prev => [...prev, `[Error] Failed to update geometry radius.`]);
+      }
+    } catch (err) { setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]); }
     setIsCommitting(false);
   };
 
   const handleCut = async () => {
-    if (!selectedItemId) return;
     const targetIndex = rebuildHistory.findIndex(geo => geo.id === selectedItemId);
     if (targetIndex === -1) return;
 
@@ -734,13 +432,8 @@ export default function App() {
         setRebuildHistory(prev => {
             const newHistory = [...prev];
             newHistory[targetIndex] = { 
-              ...geometryData, 
-              type: 'solid', 
-              id: prev[targetIndex].id, 
-              visible: prev[targetIndex].visible, 
-              name: prev[targetIndex].name + ' (Cut)',
-              payload: prev[targetIndex].payload,
-              endpoint: prev[targetIndex].endpoint
+              ...geometryData, type: 'solid', id: prev[targetIndex].id, visible: prev[targetIndex].visible, 
+              name: prev[targetIndex].name + ' (Cut)', payload: prev[targetIndex].payload, endpoint: prev[targetIndex].endpoint
             };
             return newHistory;
         });
@@ -754,14 +447,16 @@ export default function App() {
     setIsCommitting(false);
   };
 
-  const handlePromoteSheet = () => {
-    if (!selectedItemId) return;
+  const handlePromoteSheet = (idToPromote) => {
+    const targetId = typeof idToPromote === 'string' ? idToPromote : selectedItemId;
+    if (!targetId) return;
     setRebuildHistory(prev => prev.map(geo => {
-      if (geo.id === selectedItemId && geo.type === 'sheet') {
-        return { ...geo, type: 'solid', name: geo.name + ' (Solid)' };
+      if (geo.id === targetId && geo.type === 'sheet') {
+        return { ...geo, type: 'solid', name: (geo.name || `Sheet_${geo.id}`).replace('Sheet', 'Solid') };
       }
       return geo;
     }));
+    setSelectedItemId(null);
   };
 
   const handleFileUpload = async (event) => {
@@ -770,10 +465,12 @@ export default function App() {
 
     const url = URL.createObjectURL(file);
     setObjUrl(url);
+    setFileName(file.name);
+    setFeaturesHistory([[]]);
+    setHistoryIndex(0);
     setSelectedLoops([]);
     setSelectedItemId(null);
     setRebuildHistory([]);
-    setExtractedFeatures([]);
 
     const formData = new FormData();
     formData.append('file', file);
@@ -788,22 +485,57 @@ export default function App() {
       } else {
         setBackendStatus(`Error: ${data.detail}`);
       }
-    } catch (err) {
-      setBackendStatus("Connection Error!");
-    }
+    } catch (err) { setBackendStatus("Connection Error!"); }
     setIsUploading(false);
     event.target.value = ''; 
   };
 
+  const handleSaveProject = () => {
+    const projectData = {
+      features: currentFeatures, rebuildHistory,
+      settings: { minFeatureSize, symmetry, mergeExportHulls, cursorScale, sharpnessAngle }
+    };
+    const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = "RetopoCAD_Session.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleLoadProject = (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (data.rebuildHistory) setRebuildHistory(data.rebuildHistory);
+        if (data.features) { setFeaturesHistory([data.features]); setHistoryIndex(0); }
+        if (data.settings) {
+          if (data.settings.minFeatureSize) setMinFeatureSize(data.settings.minFeatureSize);
+          if (data.settings.symmetry) setSymmetry(data.settings.symmetry);
+          if (data.settings.mergeExportHulls !== undefined) setMergeExportHulls(data.settings.mergeExportHulls);
+          if (data.settings.cursorScale) setCursorScale(data.settings.cursorScale);
+          if (data.settings.sharpnessAngle) setSharpnessAngle(data.settings.sharpnessAngle);
+        }
+      } catch (err) { console.error(err); }
+    };
+    reader.readAsText(file);
+    event.target.value = '';
+  };
+
   const handleExportSTEP = async () => {
-    if (rebuildHistory.length === 0) return;
+    if (currentFeatures.length === 0 && rebuildHistory.length === 0) return;
     setIsExporting(true);
 
     try {
       const res = await fetch('http://localhost:8000/export-step', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ features: [], merge_hulls: mergeExportHulls, symmetry: symmetry })
+        body: JSON.stringify({ hulls: [], features: currentFeatures, merge_hulls: mergeExportHulls, symmetry: symmetry })
       });
       
       if (res.ok) {
@@ -820,15 +552,12 @@ export default function App() {
     setIsExporting(false);
   };
 
-  const handleGlobalPointerMove = (e) => {
-    setMousePos({ x: e.clientX, y: e.clientY });
-  };
+  const handleGlobalPointerMove = (e) => setMousePos({ x: e.clientX, y: e.clientY });
 
   const sheets = rebuildHistory.filter(h => h.type === 'sheet');
   const solids = rebuildHistory.filter(h => h.type === 'solid');
   const selectedItemData = rebuildHistory.find(geo => geo.id === selectedItemId);
 
-  // Using fixed inset-0 to prevent document scrolling / layout bouncing
   return (
     <div 
       className="fixed inset-0 flex flex-row overflow-hidden bg-zinc-900 text-zinc-100 font-sans" 
@@ -836,8 +565,7 @@ export default function App() {
       onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
     >
       <style>{`
-        input[type=number]::-webkit-inner-spin-button, 
-        input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+        input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
         input[type=number] { -moz-appearance: textfield; }
         ::-webkit-scrollbar { display: none; }
         * { -ms-overflow-style: none; scrollbar-width: none; overscroll-behavior: none; }
@@ -846,173 +574,265 @@ export default function App() {
       <ActionRing 
         anchorPos={menuAnchor} 
         selectedLoops={selectedLoops} 
-        selectedItemId={selectedItemId}
+        selectedItemData={selectedItemData}
         extrudeDepth={extrudeDepth}
         setExtrudeDepth={setExtrudeDepth}
         onExtrude={handleExtrude}
         onLoft={handleLoft}
         onSheet={handleSheet}
         onCut={handleCut}
+        onPromote={handlePromoteSheet}
+        onExtractCurve={handleExtractCurveFromRing}
+        onDeleteItem={() => handleDeleteGeometry(selectedItemId)}
         onClear={() => { setSelectedLoops([]); setSelectedItemId(null); }}
       />
 
-      {/* LEFT PANEL: OUTLINER */}
+      {/* LEFT COLUMN: OUTLINER */}
       <div className="w-64 bg-zinc-950 border-r border-zinc-800 flex flex-col z-10 shrink-0 shadow-2xl">
+        
         <div className="p-4 border-b border-zinc-800 flex items-center justify-between shrink-0">
           <h1 className="text-xl font-black tracking-wider text-white">RetopoCAD</h1>
-          {isUploading && <div className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></div>}
+          {isUploading && <div className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></div>}
         </div>
 
-        <div className="p-3 border-b border-zinc-800">
-          <label className={`w-full py-2 flex items-center justify-center rounded text-[10px] font-bold text-white cursor-pointer transition-colors shadow ${isUploading ? 'bg-indigo-800 cursor-wait' : 'bg-indigo-600 hover:bg-indigo-500'}`}>
-            {isUploading ? 'WAIT...' : 'IMPORT MESH'}
-            <input type="file" accept=".obj" className="hidden" onChange={handleFileUpload} disabled={isUploading} />
-          </label>
-          {objUrl && <span className="text-[9px] font-mono text-emerald-400 leading-tight block truncate mt-2">{backendStatus}</span>}
-        </div>
-
-        {objUrl && (
-          <div className="p-3 border-b border-zinc-800 bg-zinc-900/30 flex flex-col gap-2">
-             <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Curves Extraction</span>
-             <div className="flex items-center gap-2">
-               <span className="text-[10px] w-14 text-zinc-400">Min Size</span>
-               <input type="range" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value))} disabled={isAutoExtracting} className="flex-1 accent-emerald-500 h-1" />
-               <input type="number" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value) || 0)} disabled={isAutoExtracting} className="text-[10px] text-emerald-400 w-10 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-emerald-500" />
-             </div>
-             <div className="flex gap-1.5 mt-0.5">
-               <button onClick={handleAutoExtract} disabled={isAutoExtracting} className="flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white border border-emerald-600/50 transition-colors">
-                 Auto Detect
-               </button>
-               <button onClick={() => setExtractedFeatures([])} disabled={isAutoExtracting || extractedFeatures.length === 0} className="flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-red-600/10 text-red-500 hover:bg-red-600 hover:text-white border border-red-600/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
-                 Clear
-               </button>
-             </div>
-          </div>
-        )}
-
-        <div className="flex-1 overflow-y-auto p-2 flex flex-col gap-4">
+        <div className="flex flex-col gap-3 p-3 flex-1 overflow-y-auto">
           
-          {/* Reference Mesh Folder */}
-          <div className="flex flex-col gap-1">
-            <div className="flex items-center gap-2 px-2 py-1 text-zinc-400 font-bold uppercase tracking-wider text-[10px]">
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
-              Reference Mesh
+          <div className="bg-zinc-900 border border-zinc-800 rounded p-2 flex flex-col gap-2">
+            <div className="flex justify-between items-center">
+              <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Import Mesh</span>
+              <label className={`px-2 py-1 rounded text-[10px] font-bold text-white cursor-pointer transition-colors shadow ${isUploading ? 'bg-indigo-800 cursor-wait' : 'bg-indigo-600 hover:bg-indigo-500'}`}>
+                {isUploading ? 'WAIT...' : 'UPLOAD .OBJ'}
+                <input type="file" accept=".obj" className="hidden" onChange={handleFileUpload} disabled={isUploading} />
+              </label>
             </div>
-            {objUrl && (
-              <div className="flex items-center justify-between px-3 py-1.5 bg-zinc-900 rounded border border-zinc-800 group hover:border-zinc-600 transition-colors">
-                <span className="text-[11px] text-zinc-300">Imported.obj</span>
-                <button onClick={() => setShowMesh(!showMesh)} className="text-zinc-500 hover:text-zinc-300">
-                  {showMesh ? <IconEye /> : <IconEyeOff />}
-                </button>
-              </div>
-            )}
-          </div>
+            {objUrl && <span className="text-[9px] font-mono text-emerald-400 leading-tight block truncate">{backendStatus}</span>}
 
-          {/* Surface Sheets Folder */}
-          <div className="flex flex-col gap-1">
-            <div className="flex items-center gap-2 px-2 py-1 text-green-500/80 font-bold uppercase tracking-wider text-[10px]">
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
-              Surface Sheets
-            </div>
-            {sheets.length === 0 ? <span className="px-3 text-[10px] text-zinc-600 italic">Empty</span> : sheets.map((geo, i) => {
-              const isCylindrical = geo.payload?.loops?.[0]?.type === 'circle' || geo.sub_type === 'cylinder';
-              return (
-                <div 
-                  key={geo.id} 
-                  onClick={() => setSelectedItemId(geo.id)}
-                  className={`flex items-center justify-between px-3 py-1.5 rounded border cursor-pointer transition-colors ${selectedItemId === geo.id ? 'bg-zinc-800 border-green-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
-                >
-                  <div className="flex items-center gap-2 overflow-hidden">
-                    <span className="text-zinc-500 shrink-0">{isCylindrical ? <IconCylinderOutline /> : <IconSquare />}</span>
-                    <span className="text-[11px] text-zinc-300 font-mono truncate">{geo.name || `Sheet_${geo.id}`}</span>
-                  </div>
-                  <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0">
-                    {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* CAD Solids Folder */}
-          <div className="flex flex-col gap-1">
-            <div className="flex items-center gap-2 px-2 py-1 text-blue-500/80 font-bold uppercase tracking-wider text-[10px]">
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
-              CAD Solids
-            </div>
-            {solids.length === 0 ? <span className="px-3 text-[10px] text-zinc-600 italic">Empty</span> : solids.map((geo, i) => {
-              const isCylindrical = geo.payload?.loops?.[0]?.type === 'circle' || geo.sub_type === 'cylinder';
-              return (
-                <div 
-                  key={geo.id} 
-                  onClick={() => setSelectedItemId(geo.id)}
-                  className={`flex items-center justify-between px-3 py-1.5 rounded border cursor-pointer transition-colors ${selectedItemId === geo.id ? 'bg-zinc-800 border-blue-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
-                >
-                  <div className="flex items-center gap-2 overflow-hidden">
-                    <span className="text-zinc-500 shrink-0">{isCylindrical ? <IconCylinderOutline /> : <IconSquare />}</span>
-                    <span className="text-[11px] text-zinc-300 font-mono truncate">{geo.name || `Solid_${geo.id}`}</span>
-                  </div>
-                  <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0">
-                    {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-
-        </div>
-
-        {objUrl && (
-           <div className="p-3 border-t border-zinc-800 flex flex-col gap-2">
-              <div className="flex items-center gap-2 px-1">
-                <input type="checkbox" id="mergeHulls" checked={mergeExportHulls} onChange={(e) => setMergeExportHulls(e.target.checked)} disabled={isExporting} className="accent-indigo-500 w-3 h-3 rounded bg-zinc-800 border-zinc-700" />
-                <label htmlFor="mergeHulls" className="text-[10px] text-zinc-300 uppercase tracking-wide cursor-pointer select-none">Merge Geometry</label>
-              </div>
-              <button onClick={handleExportSTEP} disabled={isExporting || rebuildHistory.length === 0} className={`w-full py-2 rounded text-[11px] font-bold uppercase tracking-widest transition-all flex items-center justify-center gap-2 ${isExporting ? 'bg-indigo-900 text-indigo-400 cursor-wait' : 'bg-indigo-600 text-white hover:bg-indigo-500 shadow-lg shadow-indigo-900/20 disabled:opacity-30 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:shadow-none'}`}>
-                {isExporting ? 'Building STEP...' : 'Export STEP'}
+            <div className="flex gap-1.5 mt-1 pt-2 border-t border-zinc-800">
+              <button onClick={handleSaveProject} disabled={!objUrl} className="flex-1 py-1 rounded text-[9px] font-bold uppercase tracking-wider bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed border border-zinc-700">
+                Save Session
               </button>
-           </div>
+              <label className={`flex-1 flex items-center justify-center py-1 rounded text-[9px] font-bold uppercase tracking-wider bg-zinc-800 text-zinc-300 transition-colors border border-zinc-700 ${!objUrl ? 'opacity-50 cursor-not-allowed' : 'hover:bg-zinc-700 hover:text-white cursor-pointer'}`}>
+                Load Session
+                <input type="file" accept=".json" onChange={handleLoadProject} disabled={!objUrl} className="hidden" />
+              </label>
+            </div>
+          </div>
+
+          {objUrl && (
+             <div className="flex flex-col gap-4 animate-in fade-in duration-200">
+               <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
+                  <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider mb-1">Curves Extraction</span>
+
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] w-14 text-zinc-400">Min Size</span>
+                    <input type="range" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value))} disabled={isAutoExtracting} className="flex-1 accent-emerald-500 h-1" />
+                    <input type="number" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value) || 0)} disabled={isAutoExtracting} className="text-[10px] text-emerald-400 w-10 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-emerald-500" />
+                  </div>
+                  
+                  <div className="flex gap-1.5 mt-0.5">
+                    <button onClick={handleAutoExtract} disabled={isAutoExtracting} className="flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white border border-emerald-600/50 transition-colors">
+                      Auto Detect
+                    </button>
+                    
+                    <button title="Clear All Curves" onClick={handleClearAllFeatures} disabled={isAutoExtracting || currentFeatures.length === 0} className="w-8 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-red-600/10 text-red-500 hover:bg-red-600 hover:text-white border border-red-600/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                      <IconClear />
+                    </button>
+                  </div>
+               </div>
+               
+               <div className="flex flex-col gap-1">
+                 <div className="flex items-center justify-between px-2 py-1">
+                   <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-wider text-[10px]">
+                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+                     Reference Mesh
+                   </div>
+                   <button onClick={() => setShowMesh(!showMesh)} className="text-zinc-500 hover:text-zinc-300 transition-colors">
+                     {showMesh ? <IconEye /> : <IconEyeOff />}
+                   </button>
+                 </div>
+                 <div className="flex items-center justify-between px-3 py-1.5 bg-zinc-900 rounded border border-zinc-800 transition-colors">
+                    <span className="text-[11px] text-zinc-300 truncate w-40">{fileName}</span>
+                 </div>
+               </div>
+
+               <div className="flex flex-col gap-1">
+                 <div className="flex items-center justify-between px-2 py-1">
+                   <div className="flex items-center gap-2 text-purple-500/80 font-bold uppercase tracking-wider text-[10px]">
+                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M22 12c-2.66 0-4.33-3-7-3s-4.34 3-7 3-4.33-3-7-3" /></svg>
+                     Extracted Curves
+                   </div>
+                   <button onClick={() => setShowCurvesFolder(!showCurvesFolder)} className="text-zinc-500 hover:text-zinc-300 transition-colors">
+                     {showCurvesFolder ? <IconEye /> : <IconEyeOff />}
+                   </button>
+                 </div>
+                 {showCurvesFolder && (
+                   currentFeatures.length === 0 ? <span className="px-3 text-[10px] text-zinc-600 italic">Empty</span> : currentFeatures.map((feat) => {
+                     const isHidden = hiddenCurveIds.includes(feat.id);
+                     return (
+                       <div key={feat.id} className={`flex items-center justify-between px-3 py-1.5 rounded border transition-colors bg-zinc-900 border-zinc-800 hover:border-zinc-600`}>
+                         <div className="flex items-center gap-2 overflow-hidden">
+                           <span className="text-zinc-500 shrink-0"><IconWave /></span>
+                           <span className="text-[11px] text-zinc-300 font-mono truncate">{feat.type === 'circle' ? 'Circle' : 'Curve'}_{feat.id.substring(0,4)}</span>
+                         </div>
+                         <div className="flex gap-2">
+                           <button onClick={(e) => { e.stopPropagation(); toggleCurveVisibility(feat.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0">
+                             {!isHidden ? <IconEye /> : <IconEyeOff />}
+                           </button>
+                           <button onClick={(e) => { e.stopPropagation(); handleDeleteFeature(feat.id); }} className="text-zinc-500 hover:text-red-400 shrink-0">
+                             <IconTrash />
+                           </button>
+                         </div>
+                       </div>
+                     );
+                   })
+                 )}
+               </div>
+
+               <div className="flex flex-col gap-1">
+                 <div className="flex items-center justify-between px-2 py-1">
+                   <div className="flex items-center gap-2 text-green-500/80 font-bold uppercase tracking-wider text-[10px]">
+                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+                     Surface Sheets
+                   </div>
+                   <button onClick={() => setShowSheetsFolder(!showSheetsFolder)} className="text-zinc-500 hover:text-zinc-300 transition-colors">
+                     {showSheetsFolder ? <IconEye /> : <IconEyeOff />}
+                   </button>
+                 </div>
+                 {sheets.length === 0 ? <span className="px-3 text-[10px] text-zinc-600 italic">Empty</span> : sheets.map((geo) => {
+                   const isCylindrical = geo.payload?.loops?.[0]?.type === 'circle' || geo.sub_type === 'cylinder';
+                   return (
+                     <div 
+                       key={geo.id} onClick={() => setSelectedItemId(geo.id)}
+                       className={`flex items-center justify-between px-3 py-1.5 rounded border cursor-pointer transition-colors ${selectedItemId === geo.id ? 'bg-zinc-800 border-green-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
+                     >
+                       <div className="flex items-center gap-2 overflow-hidden">
+                         <span className="text-zinc-500 shrink-0">{isCylindrical ? <IconCylinderOutline /> : <IconSquare />}</span>
+                         <span className="text-[11px] text-zinc-300 font-mono truncate">{geo.name || `Sheet_${geo.id}`}</span>
+                       </div>
+                       <div className="flex gap-2">
+                         <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0">
+                           {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
+                         </button>
+                         <button onClick={(e) => { e.stopPropagation(); handleDeleteGeometry(geo.id); }} className="text-zinc-500 hover:text-red-400 shrink-0">
+                           <IconTrash />
+                         </button>
+                       </div>
+                     </div>
+                   );
+                 })}
+               </div>
+
+               <div className="flex flex-col gap-1">
+                 <div className="flex items-center justify-between px-2 py-1">
+                   <div className="flex items-center gap-2 text-blue-500/80 font-bold uppercase tracking-wider text-[10px]">
+                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+                     CAD Solids
+                   </div>
+                   <button onClick={() => setShowSolidsFolder(!showSolidsFolder)} className="text-zinc-500 hover:text-zinc-300 transition-colors">
+                     {showSolidsFolder ? <IconEye /> : <IconEyeOff />}
+                   </button>
+                 </div>
+                 {solids.length === 0 ? <span className="px-3 text-[10px] text-zinc-600 italic">Empty</span> : solids.map((geo) => {
+                   const isCylindrical = geo.payload?.loops?.[0]?.type === 'circle' || geo.sub_type === 'cylinder';
+                   return (
+                     <div 
+                       key={geo.id} onClick={() => setSelectedItemId(geo.id)}
+                       className={`flex items-center justify-between px-3 py-1.5 rounded border cursor-pointer transition-colors ${selectedItemId === geo.id ? 'bg-zinc-800 border-blue-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
+                     >
+                       <div className="flex items-center gap-2 overflow-hidden">
+                         <span className="text-zinc-500 shrink-0">{isCylindrical ? <IconCylinderOutline /> : <IconSquare />}</span>
+                         <span className="text-[11px] text-zinc-300 font-mono truncate">{geo.name || `Solid_${geo.id}`}</span>
+                       </div>
+                       <div className="flex gap-2">
+                         <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0">
+                           {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
+                         </button>
+                         <button onClick={(e) => { e.stopPropagation(); handleDeleteGeometry(geo.id); }} className="text-zinc-500 hover:text-red-400 shrink-0">
+                           <IconTrash />
+                         </button>
+                       </div>
+                     </div>
+                   );
+                 })}
+               </div>
+
+             </div>
+          )}
+        </div>
+        
+        {objUrl && (
+             <div className="p-3 border-t border-zinc-800 flex flex-col gap-2 shrink-0">
+                <div className="flex items-center gap-2 px-1">
+                  <input type="checkbox" id="mergeHulls" checked={mergeExportHulls} onChange={(e) => setMergeExportHulls(e.target.checked)} disabled={isExporting} className="accent-emerald-500 w-3 h-3 rounded bg-zinc-800 border-zinc-700" />
+                  <label htmlFor="mergeHulls" className="text-[10px] text-zinc-300 uppercase tracking-wide cursor-pointer select-none">Merge Solids (Boolean)</label>
+                </div>
+                <button onClick={handleExportSTEP} disabled={isExporting || (currentFeatures.length === 0 && rebuildHistory.length === 0)} className={`w-full py-2.5 rounded text-[11px] font-bold uppercase tracking-widest transition-all flex items-center justify-center gap-2 ${isExporting ? 'bg-emerald-900 text-emerald-400 cursor-wait' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-lg shadow-emerald-900/20 disabled:opacity-30 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:shadow-none'}`}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                  {isExporting ? 'Building STEP...' : 'Export STEP'}
+                </button>
+             </div>
         )}
       </div>
 
-      {/* CENTER PANEL: VIEWPORT */}
+      {/* CENTER COLUMN: VIEWPORT */}
       <div className="flex-1 flex flex-col relative bg-zinc-900 overflow-hidden">
-        
-        <div className="flex-1 relative">
+        <div className="flex-1 relative overflow-hidden">
           <Viewport 
             objUrl={objUrl} 
             symmetry={symmetry} 
-            activeTool={activeTool}
             onSelectLoop={handleSelectLoop}
             onSelectSolid={handleSelectSolid}
+            extractedFeatures={currentFeatures}
             showMesh={showMesh} 
             showWireframe={showWireframe}
             meshOpacity={meshOpacity}
             selectedLoops={selectedLoops}
             rebuildHistory={rebuildHistory}
-            selectedItemId={selectedItemId}
+            selectedSolidIndex={selectedItemId}
             cursorScale={cursorScale}
-            extractedFeatures={extractedFeatures}
+            showSheetsFolder={showSheetsFolder}
+            showSolidsFolder={showSolidsFolder}
+            showCurvesFolder={showCurvesFolder}
+            hiddenCurveIds={hiddenCurveIds}
+            sharpnessAngle={sharpnessAngle}
           />
 
-          <div className="absolute top-4 left-4 flex gap-2 z-10 items-start">
-            <button onClick={() => setShowWireframe(!showWireframe)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showWireframe ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>
-              <span className="text-xs font-semibold">Wireframe</span>
-            </button>
+          <div className="absolute top-4 left-4 flex flex-col gap-1.5 z-10 items-start">
+            <div className="flex gap-2">
+              <button onClick={() => setShowMesh(!showMesh)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showMesh ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                <span className="text-xs font-semibold">Mesh</span>
+              </button>
+
+              <button onClick={() => setShowWireframe(!showWireframe)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showWireframe ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>
+                <span className="text-xs font-semibold">Wireframe</span>
+              </button>
+            </div>
             
             {showMesh && (
-              <>
+              <div className="flex gap-2">
                 <div className="flex items-center gap-3 px-3 py-1.5 bg-zinc-900/80 border border-zinc-800 rounded-md shadow-lg backdrop-blur-md pointer-events-auto">
                   <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wide">Opacity</span>
                   <input type="range" min="0" max="1" step="0.05" value={meshOpacity} onChange={(e) => setMeshOpacity(parseFloat(e.target.value))} className="w-20 accent-zinc-300 h-1" />
                 </div>
+                
                 <div className="flex items-center gap-3 px-3 py-1.5 bg-zinc-900/80 border border-zinc-800 rounded-md shadow-lg backdrop-blur-md pointer-events-auto">
                   <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wide">Cursor</span>
-                  <input type="range" min="0.001" max="0.02" step="0.001" value={cursorScale} onChange={(e) => setCursorScale(parseFloat(e.target.value))} className="w-16 accent-zinc-300 h-1" />
+                  <input type="range" min="0.005" max="0.05" step="0.001" value={cursorScale} onChange={(e) => setCursorScale(parseFloat(e.target.value))} className="w-16 accent-zinc-300 h-1" />
                 </div>
-              </>
+              </div>
             )}
+          </div>
+
+          {/* DEDICATED UNDO/REDO BUTTONS */}
+          <div className="absolute bottom-4 left-4 flex gap-2 z-10 pointer-events-auto">
+            <button title="Undo Curve Action (Ctrl+Z)" onClick={handleUndo} disabled={historyIndex === 0} className="p-2.5 rounded-md bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed shadow-lg transition-all">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" /></svg>
+            </button>
+            <button title="Redo Curve Action (Ctrl+Y)" onClick={handleRedo} disabled={historyIndex === featuresHistory.length - 1} className="p-2.5 rounded-md bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed shadow-lg transition-all">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 10h-10a8 8 0 00-8 8v2M21 10l-6 6m6-6l-6-6" /></svg>
+            </button>
           </div>
 
           <div className="absolute top-4 right-4 bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-md shadow-2xl p-2 w-40 z-10 flex flex-col gap-1.5 pointer-events-auto">
@@ -1024,7 +844,7 @@ export default function App() {
         </div>
 
         <div className="h-28 bg-[#0a0a0c] border-t border-zinc-800 shrink-0 flex flex-col shadow-[inset_0_4px_6px_rgba(0,0,0,0.5)]">
-          <div className="flex items-center px-3 py-1 bg-zinc-900 border-b border-zinc-800">
+          <div className="flex items-center justify-between px-3 py-1 bg-zinc-900 border-b border-zinc-800">
             <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 flex items-center gap-2">
               <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
               Output Console
@@ -1041,109 +861,144 @@ export default function App() {
         </div>
       </div>
 
-      {/* RIGHT PANEL: INSPECTOR */}
+      {/* RIGHT COLUMN: INSPECTOR */}
       <div className="w-64 bg-zinc-950 border-l border-zinc-800 flex flex-col z-10 shrink-0 shadow-2xl">
-        <div className="p-4 border-b border-zinc-800">
+        <div className="p-4 border-b border-zinc-800 shrink-0">
           <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-300">Inspector</h2>
         </div>
 
-        <div className="p-4 flex-1 overflow-y-auto">
-          {!selectedItemId ? (
-            <div className="flex flex-col gap-3">
-              <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-2">
-                <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Environment</span>
-                <div className="flex flex-col gap-1 mt-2">
-                  <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
-                    <span>Sharpness (Dihedral)</span>
-                    <span className="text-white">{sharpnessAngle}°</span>
-                  </div>
+        <div className="p-4 flex-1 overflow-y-auto flex flex-col gap-4">
+          
+          <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-2">
+            <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Environment</span>
+            <div className="flex flex-col gap-1 mt-2">
+              <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
+                <span>Sharpness (Dihedral)</span>
+                <span className="text-white">{sharpnessAngle}°</span>
+              </div>
+              <input 
+                type="range" 
+                min="0" max="180" 
+                value={sharpnessAngle} 
+                onChange={(e) => setSharpnessAngle(parseInt(e.target.value))} 
+                className="w-full accent-indigo-500 h-1 mt-1" 
+              />
+            </div>
+          </div>
+
+          <div className="bg-zinc-900 rounded border border-amber-900/50 p-2 flex flex-col gap-2">
+             <div className="flex justify-between items-center pb-1 border-b border-zinc-800">
+                <span className="text-[10px] font-bold uppercase text-amber-500 tracking-wider">Selection Stack</span>
+                <span className="text-[10px] font-mono text-zinc-500 bg-zinc-950 px-2 py-0.5 rounded">{selectedLoops.length} Items</span>
+             </div>
+             
+             <p className="text-[9px] text-zinc-400 italic">Select tool: hover mesh and click loops to add to stack.</p>
+
+             <div className="min-h-16 max-h-40 overflow-y-auto bg-zinc-950 border border-zinc-800 rounded p-1 flex flex-col gap-1">
+                {selectedLoops.length === 0 ? (
+                  <span className="text-zinc-600 text-[10px] text-center mt-4 mb-4">Stack is empty.</span>
+                ) : (
+                  selectedLoops.map((loop, i) => (
+                    <div key={i} className="flex justify-between items-center bg-zinc-800/50 px-2 py-1 rounded text-[10px] font-mono text-zinc-300">
+                      <span>Loop #{loop.id.split('_')[1] || i}</span>
+                      <span className="text-amber-500">[{loop.points.length} pts]</span>
+                    </div>
+                  ))
+                )}
+             </div>
+          </div>
+
+          {selectedItemData ? (
+            <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-3">
+              <div className="flex justify-between items-center border-b border-zinc-800 pb-2">
+                <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Classification</span>
+                <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${selectedItemData.type === 'sheet' ? 'bg-green-900/30 text-green-400 border border-green-800' : 'bg-blue-900/30 text-blue-400 border border-blue-800'}`}>
+                  {selectedItemData.type}
+                </span>
+              </div>
+
+              <div className="flex flex-col gap-1 pt-1">
+                <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Properties</span>
+                
+                <div className="flex justify-between items-center bg-zinc-950 p-2 rounded border border-zinc-800 mt-1">
+                  <span className="text-[10px] font-mono text-zinc-500">Name</span>
                   <input 
-                    type="range" 
-                    min="0" max="180" 
-                    value={sharpnessAngle} 
-                    onChange={(e) => setSharpnessAngle(parseInt(e.target.value))} 
-                    className="w-full accent-indigo-500 h-1 mt-1" 
+                    className="text-[10px] font-mono text-zinc-300 bg-transparent text-right outline-none w-32 border-b border-transparent focus:border-indigo-500 transition-colors"
+                    value={selectedItemData.name || `${selectedItemData.type}_${selectedItemData.id}`}
+                    onChange={(e) => setRebuildHistory(prev => prev.map(geo => geo.id === selectedItemId ? { ...geo, name: e.target.value } : geo))}
                   />
                 </div>
-              </div>
-              <div className="text-[10px] text-zinc-600 mt-4 text-center italic px-4">
-                Select an object in the viewport or outliner to view its properties.
-              </div>
-            </div>
-          ) : selectedItemData ? (
-            <div className="flex flex-col gap-3">
-              <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-3">
-                
-                <div className="flex justify-between items-center border-b border-zinc-800 pb-2">
-                  <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Classification</span>
-                  <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${selectedItemData.type === 'sheet' ? 'bg-green-900/30 text-green-400 border border-green-800' : 'bg-blue-900/30 text-blue-400 border border-blue-800'}`}>
-                    {selectedItemData.type}
-                  </span>
-                </div>
 
-                <div className="flex flex-col gap-1 pt-1">
-                  <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">History & Properties</span>
-                  
-                  <div className="flex justify-between items-center bg-zinc-950 p-2 rounded border border-zinc-800 mt-1">
-                    <span className="text-[10px] font-mono text-zinc-500">Name</span>
-                    <input 
-                      className="text-[10px] font-mono text-zinc-300 bg-transparent text-right outline-none w-32 border-b border-transparent focus:border-indigo-500 transition-colors"
-                      value={selectedItemData.name || `${selectedItemData.type}_${selectedItemData.id}`}
-                      onChange={(e) => setRebuildHistory(prev => prev.map(geo => geo.id === selectedItemId ? { ...geo, name: e.target.value } : geo))}
-                    />
-                  </div>
-
-                  <div className="flex justify-between items-center bg-zinc-950 p-2 rounded border border-zinc-800 mt-1">
-                    <span className="text-[10px] font-mono text-zinc-500">Faces Count</span>
-                    <span className="text-[10px] font-mono text-zinc-300">{selectedItemData.faces?.length || 0}</span>
-                  </div>
+                <div className="flex justify-between items-center bg-zinc-950 p-2 rounded border border-zinc-800 mt-1">
+                  <span className="text-[10px] font-mono text-zinc-500">Faces Count</span>
+                  <span className="text-[10px] font-mono text-zinc-300">{selectedItemData.faces?.length || 0}</span>
                 </div>
 
                 {selectedItemData.payload && selectedItemData.payload.operation === 'extrude' && (
-                  <div className="mt-4 pt-4 border-t border-zinc-800 flex flex-col gap-2">
-                      <div className="flex items-center justify-between">
-                          <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Rebuild Param</span>
-                          {isCommitting && <span className="text-[8px] text-indigo-400 animate-pulse uppercase tracking-wider">Building...</span>}
-                      </div>
-                      
-                      <div className="flex items-center justify-between bg-zinc-950 p-2 rounded border border-zinc-800">
-                         <span className="text-[10px] font-mono text-zinc-500">Depth</span>
-                         <input 
-                           type="number"
-                           className="w-16 bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[10px] text-zinc-300 outline-none focus:border-indigo-500 text-right font-mono"
-                           defaultValue={selectedItemData.payload.extrude_depth}
-                           onBlur={(e) => {
-                               const newDepth = parseFloat(e.target.value) || 0;
-                               if (newDepth !== selectedItemData.payload.extrude_depth) {
-                                    handleUpdateHistoryItem(selectedItemId, newDepth);
-                               }
-                           }}
-                           onKeyDown={(e) => {
-                               if (e.key === 'Enter') e.target.blur();
-                           }}
-                           disabled={isCommitting}
-                           step="0.1"
-                         />
-                      </div>
-                      <span className="text-[8px] text-zinc-600 italic text-right pr-1">Press Enter to re-run Extrude logic</span>
+                  <div className="flex items-center justify-between bg-zinc-950 p-2 rounded border border-zinc-800 mt-1">
+                     <span className="text-[10px] font-mono text-zinc-500">Depth</span>
+                     <input 
+                       type="number"
+                       className="w-16 bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[10px] text-zinc-300 outline-none focus:border-indigo-500 text-right font-mono"
+                       defaultValue={selectedItemData.payload.extrude_depth}
+                       onBlur={(e) => {
+                           const newDepth = parseFloat(e.target.value) || 0;
+                           if (newDepth !== selectedItemData.payload.extrude_depth) {
+                                handleUpdateHistoryItemDepth(selectedItemId, newDepth);
+                           }
+                       }}
+                       onKeyDown={(e) => {
+                           if (e.key === 'Enter') e.target.blur();
+                       }}
+                       disabled={isCommitting}
+                       step="0.1"
+                     />
                   </div>
                 )}
 
-                {selectedItemData.type === 'sheet' && (
-                  <div className="mt-4 pt-4 border-t border-zinc-800">
-                    <button 
-                      onClick={handlePromoteSheet}
-                      className="w-full py-2 bg-blue-600/20 text-blue-400 hover:bg-blue-600 hover:text-white border border-blue-600/50 rounded text-[10px] font-bold uppercase tracking-wider transition-colors"
-                    >
-                      Promote to Solid
-                    </button>
-                    <p className="text-[9px] text-zinc-500 text-center mt-2">Applies thickness and moves to CAD Solids</p>
+                {selectedItemData.payload && selectedItemData.payload.loops?.[0]?.type === 'circle' && (
+                  <div className="flex items-center justify-between bg-zinc-950 p-2 rounded border border-zinc-800 mt-1">
+                     <span className="text-[10px] font-mono text-zinc-500">Radius</span>
+                     <input 
+                       type="number"
+                       className="w-16 bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[10px] text-zinc-300 outline-none focus:border-indigo-500 text-right font-mono"
+                       defaultValue={selectedItemData.payload.loops[0].radius}
+                       onBlur={(e) => {
+                           const newRadius = parseFloat(e.target.value) || 0;
+                           if (newRadius !== selectedItemData.payload.loops[0].radius) {
+                                handleUpdateHistoryItemRadius(selectedItemId, newRadius);
+                           }
+                       }}
+                       onKeyDown={(e) => {
+                           if (e.key === 'Enter') e.target.blur();
+                       }}
+                       disabled={isCommitting}
+                       step="0.1"
+                     />
                   </div>
                 )}
+                
+                {(selectedItemData.payload?.operation === 'extrude' || selectedItemData.payload?.loops?.[0]?.type === 'circle') && (
+                    <span className="text-[8px] text-zinc-600 italic mt-1 px-1">Press Enter or Unfocus to rebuild</span>
+                )}
               </div>
+
+              {selectedItemData.type === 'sheet' && (
+                <div className="mt-2 pt-3 border-t border-zinc-800">
+                  <button 
+                    onClick={() => handlePromoteSheet(selectedItemId)}
+                    className="w-full py-2 bg-blue-600/20 text-blue-400 hover:bg-blue-600 hover:text-white border border-blue-600/50 rounded text-[10px] font-bold uppercase tracking-wider transition-colors"
+                  >
+                    Promote to Solid
+                  </button>
+                  <p className="text-[9px] text-zinc-500 text-center mt-2">Applies thickness and moves to CAD Solids</p>
+                </div>
+              )}
             </div>
           ) : (
-            <div className="text-[10px] text-zinc-600 text-center italic">Object not found.</div>
+            <div className="text-[10px] text-zinc-600 text-center italic mt-2">
+              Select an object in the viewport or outliner to edit properties.
+            </div>
           )}
         </div>
       </div>

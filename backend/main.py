@@ -25,7 +25,6 @@ app.add_middleware(
 
 class AppState:
     mesh = None
-    components = None
     live_logs = []
     rebuild_geometry = [] # Unified stack for analytical Solids and Sheets
 
@@ -41,14 +40,23 @@ class Point3D(BaseModel):
     x: float
     y: float
     z: float
+    sharpness_angle: float = 30.0
 
 class FeatureParams(BaseModel):
     x: float
     y: float
     z: float
+    sharpness_angle: float = 30.0
+
+class ClassifyParams(BaseModel):
+    x: float
+    y: float
+    z: float
+    sharpness_angle: float = 30.0
 
 class AutoExtractParams(BaseModel):
     min_size: float
+    sharpness_angle: float = 30.0
 
 class HullParams(BaseModel):
     max_hulls: int
@@ -80,41 +88,114 @@ async def upload_mesh(file: UploadFile = File(...)):
         mesh = trimesh.load(io.BytesIO(contents), file_type='obj', force='mesh')
         state.mesh = mesh
         
-        # PRE-CACHE OPTIMIZATION: Calculate edge graph on upload for instant UI hovering!
-        broadcast_log("[System] Pre-calculating surface adjacency graph...")
-        adjacency = mesh.face_adjacency
-        angles = mesh.face_adjacency_angles
-        smooth_edges = adjacency[angles < 0.5]
-        state.components = trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces)))
-        
         broadcast_log(f"[Success] Python parsed mesh. Faces: {len(mesh.faces):,}")
         return {"message": "Mesh successfully loaded", "faces": len(mesh.faces)}
     except Exception as e:
         broadcast_log(f"[Error] Failed to load mesh: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to load mesh: {str(e)}")
 
+def get_patch_components(mesh, sharpness_angle_deg):
+    """Dynamic Real-Time Segmentation based on UI Sharpness Slider"""
+    if mesh is None: return []
+    threshold_rad = np.radians(sharpness_angle_deg)
+    adjacency = mesh.face_adjacency
+    angles = mesh.face_adjacency_angles
+    smooth_edges = adjacency[angles < threshold_rad]
+    return list(trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces))))
+
+
+@app.post("/classify-patch")
+async def classify_patch(params: ClassifyParams):
+    """The Primitive Classifier - Fits Plane, Sphere, and Cylinder in a race."""
+    if state.mesh is None:
+        raise HTTPException(status_code=400, detail="No mesh loaded.")
+        
+    import scipy.optimize
+    mesh = state.mesh
+    target_pt = np.array([[params.x, params.y, params.z]])
+    
+    _, _, face_ids = mesh.nearest.on_surface(target_pt)
+    if len(face_ids) == 0:
+        raise HTTPException(status_code=404)
+        
+    start_face = face_ids[0]
+    components = get_patch_components(mesh, params.sharpness_angle)
+    target_region = next((comp for comp in components if start_face in comp), [start_face])
+    
+    # Get unique vertices of the patch
+    patch_verts_idx = np.unique(mesh.faces[target_region])
+    pts = mesh.vertices[patch_verts_idx]
+    
+    if len(pts) < 4:
+        return {"best_match": "planar", "errors": {"plane": 0, "cylinder": 999, "sphere": 999}}
+        
+    centroid = np.mean(pts, axis=0)
+    
+    # 1. Fit Plane
+    _, _, vh = np.linalg.svd(pts - centroid)
+    normal = vh[2, :]
+    plane_err = float(np.mean(np.abs(np.dot(pts - centroid, normal))))
+    
+    # 2. Fit Sphere
+    def sphere_obj(c):
+        r = np.linalg.norm(pts - c, axis=1)
+        return r - np.mean(r)
+    
+    res_sph = scipy.optimize.least_squares(sphere_obj, centroid)
+    r_sph = np.mean(np.linalg.norm(pts - res_sph.x, axis=1))
+    sphere_err = float(np.std(np.linalg.norm(pts - res_sph.x, axis=1)))
+    
+    if r_sph > 10000 or r_sph < 1e-4: 
+        sphere_err = float('inf')
+        
+    # 3. Fit Cylinder
+    u = vh[0, :]
+    v = vh[1, :]
+    p2d = np.column_stack((np.dot(pts - centroid, u), np.dot(pts - centroid, v)))
+    def calc_R(c): return np.sqrt((p2d[:, 0] - c[0])**2 + (p2d[:, 1] - c[1])**2)
+    def cyl_obj(c): Ri = calc_R(c); return Ri - Ri.mean()
+    
+    c2d_guess = np.mean(p2d, axis=0)
+    res_cyl = scipy.optimize.least_squares(cyl_obj, c2d_guess)
+    radii = calc_R(res_cyl.x)
+    r_cyl = np.mean(radii)
+    cyl_err = float(np.std(radii))
+    
+    # Hallucination Firewall
+    max_allowed_radius = max(100.0, np.ptp(pts)*10)
+    if r_cyl > max_allowed_radius or r_cyl < 1e-4:
+        cyl_err = float('inf')
+        
+    errors = {
+        "plane": plane_err,
+        "cylinder": cyl_err,
+        "sphere": sphere_err
+    }
+    
+    best_match = min(errors, key=errors.get)
+    
+    return {
+        "best_match": best_match,
+        "errors": errors,
+        "radius": float(r_cyl) if best_match == 'cylinder' else float(r_sph) if best_match == 'sphere' else None
+    }
+
+
 @app.post("/analyze-surface")
-async def analyze_surface(point: Point3D):
+async def analyze_surface(params: Point3D):
     if state.mesh is None:
         raise HTTPException(status_code=400, detail="No mesh loaded.")
     
     mesh = state.mesh
-    target_pt = np.array([[point.x, point.y, point.z]])
+    target_pt = np.array([[params.x, params.y, params.z]])
     
     closest_points, distances, face_ids = mesh.nearest.on_surface(target_pt)
     if len(face_ids) == 0:
         raise HTTPException(status_code=404, detail="Could not snap to a face.")
         
     start_face = face_ids[0]
-    target_region = None
-    if state.components is not None:
-        for comp in state.components:
-            if start_face in comp:
-                target_region = comp
-                break
-                
-    if target_region is None or len(target_region) == 0:
-        target_region = [start_face] 
+    components = get_patch_components(mesh, params.sharpness_angle)
+    target_region = next((comp for comp in components if start_face in comp), [start_face])
 
     region_normals = mesh.face_normals[target_region]
     variance = np.var(region_normals, axis=0).sum()
@@ -138,7 +219,7 @@ async def analyze_surface(point: Point3D):
 
 @app.post("/scout-loop")
 async def scout_loop(params: Point3D):
-    if state.mesh is None or state.components is None:
+    if state.mesh is None:
         raise HTTPException(status_code=400)
         
     try:
@@ -150,7 +231,8 @@ async def scout_loop(params: Point3D):
         if len(face_ids) == 0: raise HTTPException(status_code=404)
         
         start_face = face_ids[0]
-        target_region = next((comp for comp in state.components if start_face in comp), [start_face])
+        components = get_patch_components(mesh, params.sharpness_angle)
+        target_region = next((comp for comp in components if start_face in comp), [start_face])
         
         faces = mesh.faces[target_region]
         edges = trimesh.geometry.faces_to_edges(faces)
@@ -446,7 +528,8 @@ async def extract_feature(params: FeatureParams):
         raise HTTPException(status_code=404, detail="Could not snap to a face.")
         
     start_face = face_ids[0]
-    target_region = next((comp for comp in state.components if start_face in comp), [start_face])
+    components = get_patch_components(mesh, params.sharpness_angle)
+    target_region = next((comp for comp in components if start_face in comp), [start_face])
     region_normals = mesh.face_normals[target_region]
     region_normal = np.mean(region_normals, axis=0)
     
@@ -548,8 +631,9 @@ def auto_extract(params: AutoExtractParams):
     extracted_features = []
     
     broadcast_log(f"[System] Isolating panels > {params.min_size} units...")
+    components = get_patch_components(mesh, params.sharpness_angle)
     
-    for comp in state.components:
+    for comp in components:
         if len(comp) < 3: 
             continue
             
@@ -761,8 +845,7 @@ if __name__ == '__main__':
 async def export_step(payload: dict):
     try:
         import build123d as b3d
-        from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_Transform
-        from OCP.gp import gp_Trsf, gp_Ax2, gp_Pnt, gp_Dir
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
     except ImportError as e:
         raise HTTPException(status_code=500, detail=f"Import Error: {str(e)}. Try deleting your .venv folder and recreating it.")
         
@@ -860,25 +943,19 @@ async def export_step(payload: dict):
 
     # 4. Symmetry Logic across all collected shapes
     if any([symmetry.get('x'), symmetry.get('y'), symmetry.get('z')]):
-        broadcast_log("[System] Applying structural symmetry arrays...")
+        broadcast_log("[System] Applying structural symmetry arrays using build123d.mirror()...")
         
-        def mirror_shape(shape, axis_dir):
-            trsf = gp_Trsf()
-            trsf.SetMirror(gp_Ax2(gp_Pnt(0,0,0), gp_Dir(*axis_dir)))
-            transformed = BRepBuilderAPI_Transform(shape.wrapped, trsf, True).Shape()
-            return b3d.Shape.cast(transformed)
-
         final_shapes = []
         for s in shapes:
             final_shapes.append(s)
 
         try:
             if symmetry.get('x'):
-                final_shapes.extend([mirror_shape(s, (1, 0, 0)) for s in list(final_shapes)])
+                final_shapes.extend([b3d.mirror(s, about=b3d.Plane.YZ) for s in list(final_shapes)])
             if symmetry.get('y'):
-                final_shapes.extend([mirror_shape(s, (0, 1, 0)) for s in list(final_shapes)])
+                final_shapes.extend([b3d.mirror(s, about=b3d.Plane.XZ) for s in list(final_shapes)])
             if symmetry.get('z'):
-                final_shapes.extend([mirror_shape(s, (0, 0, 1)) for s in list(final_shapes)])
+                final_shapes.extend([b3d.mirror(s, about=b3d.Plane.XY) for s in list(final_shapes)])
             shapes = final_shapes
         except Exception as mirror_err:
             broadcast_log(f"[Warning] Symmetry Mirroring failed during export: {mirror_err}")
