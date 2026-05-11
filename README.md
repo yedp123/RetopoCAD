@@ -7,6 +7,8 @@
 
 ## **⚠️ Highly Experimental**
 
+The project is nowhere near production ready, this is merely an exploration trying to bring the philosophy of traditional 3D retopology to the complex world of CAD. 
+
 ## **Features**
 
 wip
