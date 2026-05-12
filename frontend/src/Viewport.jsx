@@ -1,4 +1,4 @@
-import React, { Suspense, useEffect, useRef, useMemo, useState } from 'react';
+import React, { Suspense, useEffect, useLayoutEffect, useRef, useMemo, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Bounds, Edges, Grid, GizmoHelper, GizmoViewport, TransformControls, Html } from '@react-three/drei';
 import { useLoader } from '@react-three/fiber';
@@ -159,7 +159,7 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, origina
         onPointerOut={() => setHovered(false)}
         onClick={(e) => {
           if (disabled) return;
-          if (e.delta > 5) return; // Prevent selection if dragging camera/gizmo
+          if (e.delta > 5) return; 
           e.stopPropagation();
           if (onSelect) {
             const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
@@ -206,7 +206,7 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSe
         onPointerOut={() => setHovered(false)}
         onClick={(e) => {
           if (disabled) return;
-          if (e.delta > 5) return; // Prevent selection if dragging camera/gizmo
+          if (e.delta > 5) return; 
           e.stopPropagation();
           if (onSelect) {
             const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
@@ -221,7 +221,6 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSe
   );
 }
 
-// Highly isolated Transform component. Disconnected from React's continuous render cycle to stop drag-fights.
 function ActiveTransformSolid({ geo, material, centerOffset, transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap, onSelect }) {
   const groupRef = useRef();
   const inputRef = useRef(null);
@@ -232,7 +231,6 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
   const startScale = useRef(new THREE.Vector3());
   const dominantAxis = useRef('x');
 
-  // Calculates the true volumetric centroid to anchor the Gizmo perfectly
   const { localPivot, absoluteCenter } = useMemo(() => {
     if (!geo.vertices || geo.vertices.length === 0) {
         return { localPivot: new THREE.Vector3(), absoluteCenter: new THREE.Vector3() };
@@ -250,8 +248,7 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
     return { localPivot: pivot, absoluteCenter: absCenter };
   }, [geo.vertices, centerOffset]);
 
-  // Initial Placement
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (groupRef.current) {
       groupRef.current.position.copy(localPivot);
       groupRef.current.rotation.set(0, 0, 0);
@@ -338,7 +335,7 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
   return (
     <TransformControls
       mode={transformMode}
-      space="local"
+      space="world"
       translationSnap={linearSnap > 0 ? linearSnap : null}
       rotationSnap={angleSnap > 0 ? angleSnap * Math.PI / 180 : null}
       scaleSnap={linearSnap > 0 ? linearSnap : null}
@@ -405,7 +402,8 @@ function GhostModel({
   extractedFeatures, showMesh, showWireframe, meshOpacity,
   selectedLoops, rebuildHistory, selectedSolidIndex, cursorScale,
   showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle,
-  transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap
+  transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap,
+  outlinerExpanded
 }) {
   const obj = useLoader(OBJLoader, url);
   const cursorGroupRef = useRef(); 
@@ -465,7 +463,7 @@ function GhostModel({
   const handlePointerMove = (e) => {
     if (transformMode) {
       if (scoutLoop) setScoutLoop(null);
-      return; // Do not stop propagation if tool is active, let it pass to gizmos
+      return; 
     }
     
     e.stopPropagation(); 
@@ -514,7 +512,7 @@ function GhostModel({
 
   const handleClick = async (e) => {
     if (transformMode) return;
-    if (e.delta > 5) return; // Prevent selection if dragging camera/gizmo
+    if (e.delta > 5) return; 
     
     e.stopPropagation(); 
     if (!cursorGroupRef.current) return;
@@ -535,10 +533,7 @@ function GhostModel({
     <group ref={cursorGroupRef}>
       <group>
         {meshes?.map((mesh, index) => (
-          <mesh 
-            key={`base-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} 
-            onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onClick={handleClick} visible={showMesh}
-          >
+          <mesh key={`base-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onClick={handleClick} visible={showMesh}>
             <meshStandardMaterial color="#cccccc" transparent opacity={meshOpacity} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
             <Edges raycast={() => null} threshold={15} color="#18181b" visible={showWireframe} />
           </mesh>
@@ -569,7 +564,7 @@ function GhostModel({
            const mat = geo.type === 'sheet' ? (isSelected ? selectedSolidMaterial : sheetMaterial) : (isSelected ? selectedSolidMaterial : solidMaterial);
            
            const handleSelect = (e) => { 
-              if (e.delta > 5) return; // Prevent selection if dragging camera/gizmo
+              if (e.delta > 5) return; 
               e.stopPropagation(); 
               const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
               const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
@@ -606,9 +601,7 @@ function GhostModel({
         return (
           <group key={`mirror-group-${mirrorKey}`} scale={scale}>
             {meshes?.map((mesh, index) => (
-              <mesh 
-                key={`mirror-${mirrorKey}-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} visible={showMesh}
-              >
+              <mesh key={`mirror-${mirrorKey}-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} visible={showMesh}>
                 <meshStandardMaterial color="#cccccc" transparent opacity={meshOpacity} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
                 <Edges raycast={() => null} threshold={15} color="#18181b" visible={showWireframe} />
               </mesh>
@@ -659,7 +652,7 @@ export default function Viewport(props) {
      selectedLoops, rebuildHistory, selectedSolidIndex, cursorScale,
      showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle,
      linearSnap, setLinearSnap, angleSnap, setAngleSnap, toggleSymmetry,
-     transformMode, setTransformMode
+     transformMode, setTransformMode, outlinerExpanded
   } = props;
 
   const [previewMode, setPreviewMode] = useState('reference');

@@ -1,7 +1,7 @@
 import uvicorn
 import trimesh
 import trimesh.curvature
-import trimesh.smoothing  # Fixed scoping bug by making this global
+import trimesh.smoothing 
 import numpy as np
 import io
 import tempfile
@@ -146,7 +146,6 @@ async def upload_mesh(background_tasks: BackgroundTasks, file: UploadFile = File
         
         mesh = trimesh.load(io.BytesIO(contents), file_type='obj', force='mesh')
         
-        # Removed aggressive np.round to preserve surface curvature fidelity
         mesh.merge_vertices()
         mesh.update_faces(mesh.nondegenerate_faces())
         mesh.remove_unreferenced_vertices()
@@ -480,7 +479,7 @@ async def create_primitive(params: CreatePrimitiveParams):
             center_3d = centroid + center_2d[0]*u + center_2d[1]*v
             h_vals = np.dot(pts - center_3d, axis)
             h_min, h_max = np.min(h_vals), np.max(h_vals)
-            height = float(h_max - h_min) # Removed 1.2 overshoot for clean fit
+            height = float(h_max - h_min)
             
             midpoint = center_3d + axis * (h_max + h_min) / 2.0
             loc = b3d.Plane(origin=b3d.Vector(midpoint), z_dir=b3d.Vector(axis)).location
@@ -520,7 +519,7 @@ async def create_primitive(params: CreatePrimitiveParams):
                 h_vals = np.dot(pts - apex, axis)
                 h_min, h_max = min(h_vals), max(h_vals)
                 
-                h_cone = max(abs(h_min), abs(h_max)) # Removed 1.2 overshoot
+                h_cone = max(abs(h_min), abs(h_max)) 
                 r_base = h_cone * np.tan(theta)
                 
                 base_center = apex - axis * h_cone
@@ -618,7 +617,7 @@ async def create_sheet(params: CommitGeometryParams):
     try:
         processed_loop = params.loops[0]['points']
         
-        if params.loops[0].get('type') == 'planar':
+        if params.loops[0].get('type') in ['planar', 'plane']:
             processed_loop = apply_pca_firewall(processed_loop)
             broadcast_log("[System] Planar Firewall Applied: Flattening loop.")
         
@@ -669,11 +668,11 @@ async def commit_geometry(params: CommitGeometryParams):
 
         processed_loops = []
         for loop_data in params.loops:
-            if loop_data.get('type') == 'planar':
+            if loop_data.get('type') in ['planar', 'plane']:
                 processed_loops.append(apply_pca_firewall(loop_data['points']))
                 broadcast_log("[System] Planar Firewall Applied: Flattening planar loop.")
             else:
-                processed_loops.append(loop_data['points'])
+                processed_loops.append(loop_data.get('points', []))
 
         if params.operation == 'loft' and len(processed_loops) == 2:
             pts1 = resample_loop(processed_loops[0], 100)
@@ -752,7 +751,7 @@ async def boolean_cut(params: BooleanCutParams):
             raise ValueError("Target solid not found.")
 
         processed_loop = params.loops[0]['points']
-        if params.loops[0].get('type') == 'planar':
+        if params.loops[0].get('type') in ['planar', 'plane']:
             processed_loop = apply_pca_firewall(processed_loop)
             broadcast_log("[System] Planar Firewall Applied: Flattening loop.")
         
@@ -1148,11 +1147,9 @@ async def export_step(payload: dict):
     merge_hulls = payload.get("merge_hulls", False)
     symmetry = payload.get("symmetry", {"x": False, "y": False, "z": False})
     
-    # 1. Inject perfectly pure analytical geometry (Solids & Sheets) from precision rebuild
     for shape in state.rebuild_geometry:
         shapes.append(shape)
         
-    # 2. Process CoACD Hulls using the robust original logic
     hulls = payload.get("hulls", [])
     hull_solids = []
     
@@ -1213,7 +1210,6 @@ async def export_step(payload: dict):
     else:
         shapes.extend(hull_solids)
             
-    # 3. Process Extracted Sketched Features
     features = payload.get("features", [])
     if features:
         broadcast_log(f"[System] Compiling {len(features)} CAD sketches...")
@@ -1236,7 +1232,6 @@ async def export_step(payload: dict):
             
     shapes = [s for s in shapes if s is not None and hasattr(s, 'wrapped')]
 
-    # 4. Symmetry Logic across all collected shapes
     if any([symmetry.get('x'), symmetry.get('y'), symmetry.get('z')]):
         broadcast_log("[System] Applying structural symmetry arrays using build123d.mirror()...")
         
@@ -1259,7 +1254,6 @@ async def export_step(payload: dict):
         broadcast_log("[Error] No geometry found to export.")
         raise HTTPException(status_code=400, detail="No geometry found to export.")
         
-    # 5. Native build123d robust export
     broadcast_log("[System] Writing STEP file to disk...")
     fd, path = tempfile.mkstemp(suffix=".step")
     os.close(fd)

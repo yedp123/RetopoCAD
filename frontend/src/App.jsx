@@ -29,7 +29,7 @@ const applySnap = (value, snapThreshold) => {
     return Math.round(value / snapThreshold) * snapThreshold;
 };
 
-function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive, linearSnap }) {
+function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive, linearSnap, transformMode }) {
   const [pos, setPos] = useState({ x: -1000, y: -1000 });
   const isEditingExtrude = selectedItemData?.payload?.operation === 'extrude';
   const [localDepth, setLocalDepth] = useState(extrudeDepth);
@@ -44,10 +44,11 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
 
   useEffect(() => {
     if (!anchorPos) return;
-    const offset = 120;
+    
+    const transformActive = transformMode !== null;
+    const offset = transformActive ? 320 : 120; // Pushes ring much further away to clear Gizmo
     const ringSize = 135; 
 
-    // Slide ring right so it Breathes and doesn't overlap gizmos!
     let targetX = anchorPos.x + offset + (selectedItemData ? 160 : 0);
     let targetY = anchorPos.y + offset;
 
@@ -55,7 +56,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
     if (targetY + ringSize > window.innerHeight) targetY = anchorPos.y - offset;
 
     setPos({ x: targetX, y: targetY });
-  }, [anchorPos, selectedItemData]);
+  }, [anchorPos, selectedItemData, transformMode]);
 
   if ((!selectedLoops || selectedLoops.length === 0) && !selectedItemData) return null;
 
@@ -238,11 +239,11 @@ export default function App() {
   const [symmetry, setSymmetry] = useState({ x: false, y: false, z: false });
   const toggleSymmetry = (axis) => setSymmetry(prev => ({ ...prev, [axis]: !prev[axis] }));
   const [showMesh, setShowMesh] = useState(true);
-  const [showSheetsFolder, setShowSheetsFolder] = useState(true);
-  const [showSolidsFolder, setShowSolidsFolder] = useState(true);
-  const [showCurvesFolder, setShowCurvesFolder] = useState(true);
   const [showWireframe, setShowWireframe] = useState(true);
   const [meshOpacity, setMeshOpacity] = useState(0.4);
+  
+  const [outlinerExpanded, setOutlinerExpanded] = useState({ mesh: true, curves: true, sheets: true, solids: true });
+  const toggleOutliner = (key) => setOutlinerExpanded(prev => ({ ...prev, [key]: !prev[key] }));
   const [hiddenCurveIds, setHiddenCurveIds] = useState([]);
   
   const [serverLogs, setServerLogs] = useState(["System initialized. Ready for operations..."]);
@@ -277,7 +278,6 @@ export default function App() {
     setHistoryIndex(newHistory.length - 1);
   };
 
-  // Unified global Undo/Redo logic handling both Geometry operations and extracted Curves
   const handleGlobalUndo = async () => {
     if (rebuildHistory.length > 0) {
         try {
@@ -319,10 +319,24 @@ export default function App() {
           handleGlobalRedo();
         }
       }
+
+      // Delete/Backspace hook
+      if (key === 'delete' || key === 'backspace') {
+         e.preventDefault();
+         if (selectedItemId) {
+             setRebuildHistory(prev => prev.filter(geo => geo.id !== selectedItemId));
+             setSelectedItemId(null);
+         } else if (selectedLoops.length > 0) {
+             const loopsToRemove = selectedLoops.map(l => l.id);
+             commitFeatures(currentFeatures.filter(f => !loopsToRemove.includes(f.id)));
+             setSelectedLoops([]);
+             setPatchAnalysis(null);
+         }
+      }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [historyIndex, featuresHistory.length, rebuildHistory]);
+  }, [historyIndex, featuresHistory.length, rebuildHistory, selectedItemId, selectedLoops, currentFeatures]);
 
   const handleDeleteFeature = (id) => {
     const filtered = currentFeatures.filter(f => f.id !== id);
@@ -444,7 +458,7 @@ export default function App() {
         return [...prev, loopData];
     });
     if (clickPos) setMenuAnchor(clickPos);
-    else setMenuAnchor({x: window.innerWidth / 2, y: window.innerHeight / 2});
+    else setMenuAnchor({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
 
     if (loopData.clickPoint) {
       try {
@@ -476,7 +490,7 @@ export default function App() {
   const handleSelectSolid = (id, clickPos) => {
     setSelectedItemId(id);
     if (clickPos) setMenuAnchor(clickPos);
-    else setMenuAnchor({x: window.innerWidth / 2, y: window.innerHeight / 2});
+    else setMenuAnchor({ x: window.innerWidth / 2, y: window.innerHeight / 2 }); 
   };
 
   const toggleItemVisibility = (id) => {
@@ -766,194 +780,244 @@ export default function App() {
         setPatchAnalysis={setPatchAnalysis}
         onCreatePrimitive={handleCreatePrimitive}
         linearSnap={linearSnap}
+        transformMode={transformMode}
       />
 
-      {/* LEFT COLUMN: OUTLINER */}
-      <div className="w-64 bg-zinc-950 border-r border-zinc-800 flex flex-col z-10 shrink-0 shadow-2xl">
+      {/* LEFT COLUMN 1: TOOLS & SETTINGS */}
+      <div className="w-48 bg-zinc-950 border-r border-zinc-800 flex flex-col z-20 shrink-0 shadow-2xl p-2.5 gap-2.5">
         
-        <div className="p-4 border-b border-zinc-800 flex items-center justify-between shrink-0">
-          <h1 className="text-xl font-black tracking-wider text-white">RetopoCAD</h1>
-          {isUploading && <div className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></div>}
+        <div className="flex justify-between items-center pb-1.5 border-b border-zinc-800 shrink-0">
+          <div className="text-xs font-black tracking-widest text-zinc-300 uppercase">RetopoCAD</div>
+          {isUploading && <div className="w-1.5 h-1.5 rounded-full bg-yellow-400 animate-pulse"></div>}
         </div>
 
-        <div className="flex flex-col gap-3 p-3 flex-1 overflow-y-auto">
+        <div className="flex flex-col gap-2.5 flex-1 overflow-y-auto">
           
-          <div className="bg-zinc-900 border border-zinc-800 rounded p-2 flex flex-col gap-2">
+          <div className="bg-zinc-900 border border-zinc-800 rounded p-1.5 flex flex-col gap-1.5">
             <div className="flex justify-between items-center">
-              <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Import Mesh</span>
-              <label className={`px-2 py-1 rounded text-[10px] font-bold text-white cursor-pointer transition-colors shadow ${isUploading ? 'bg-indigo-800 cursor-wait' : 'bg-indigo-600 hover:bg-indigo-500'}`}>
+              <span className="text-[8px] font-bold uppercase text-zinc-400 tracking-wider">Import Mesh</span>
+              <label className={`px-2 py-1 rounded text-[8px] font-bold text-white cursor-pointer transition-colors shadow ${isUploading ? 'bg-indigo-800 cursor-wait' : 'bg-indigo-600 hover:bg-indigo-500'}`}>
                 {isUploading ? 'WAIT...' : 'UPLOAD .OBJ'}
                 <input type="file" accept=".obj" className="hidden" onChange={handleFileUpload} disabled={isUploading} />
               </label>
             </div>
-            {objUrl && <span className="text-[9px] font-mono text-emerald-400 leading-tight block truncate">{backendStatus}</span>}
+            {objUrl && <span className="text-[7.5px] font-mono text-emerald-400 leading-tight block truncate">{backendStatus}</span>}
 
-            <div className="flex gap-1.5 mt-1 pt-2 border-t border-zinc-800">
-              <button onClick={handleSaveProject} disabled={!objUrl} className="flex-1 py-1 rounded text-[9px] font-bold uppercase tracking-wider bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed border border-zinc-700">
-                Save Session
-              </button>
-              <label className={`flex-1 flex items-center justify-center py-1 rounded text-[9px] font-bold uppercase tracking-wider bg-zinc-800 text-zinc-300 transition-colors border border-zinc-700 ${!objUrl ? 'opacity-50 cursor-not-allowed' : 'hover:bg-zinc-700 hover:text-white cursor-pointer'}`}>
-                Load Session
-                <input type="file" accept=".json" onChange={handleLoadProject} disabled={!objUrl} className="hidden" />
-              </label>
-            </div>
+            {objUrl && (
+              <div className="flex gap-1 mt-1 pt-1.5 border-t border-zinc-800">
+                <button onClick={handleSaveProject} className="flex-1 py-1 rounded text-[7.5px] font-bold uppercase tracking-wider bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white transition-colors border border-zinc-700">
+                  Save Session
+                </button>
+                <label className="flex-1 flex items-center justify-center py-1 rounded text-[7.5px] font-bold uppercase tracking-wider bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white cursor-pointer transition-colors border border-zinc-700">
+                  Load Session
+                  <input type="file" accept=".json" onChange={handleLoadProject} className="hidden" />
+                </label>
+              </div>
+            )}
           </div>
 
           {objUrl && (
-             <div className="flex flex-col gap-4 animate-in fade-in duration-200">
+             <div className="flex flex-col gap-2.5 animate-in fade-in duration-200">
+               
                <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
-                  <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider mb-1">Curves Extraction</span>
+                  <div>
+                    <span className="text-[8px] font-bold uppercase text-zinc-400 tracking-wider">Pre-Processing</span>
+                    <div className="flex flex-col gap-1 mt-2">
+                      <div className="flex justify-between items-center text-[8px] text-zinc-400 font-mono">
+                        <span>Sharpness (Dihedral)</span>
+                        <span className="text-white">{sharpnessAngle}°</span>
+                      </div>
+                      <input 
+                        type="range" min="0" max="180" 
+                        value={sharpnessAngle} 
+                        onChange={(e) => setSharpnessAngle(parseInt(e.target.value))} 
+                        className="w-full accent-indigo-500 h-1 mt-1 mb-2" 
+                      />
+                      
+                      <div className="flex justify-between items-center text-[8px] text-zinc-400 font-mono">
+                        <span>Decimation (Faces)</span>
+                        <span className="text-white">{decimationTarget.toLocaleString()}</span>
+                      </div>
+                      <input 
+                        type="range" min="5000" max="100000" step="1000" 
+                        value={decimationTarget} 
+                        onChange={(e) => setDecimationTarget(parseInt(e.target.value))} 
+                        onMouseUp={applyPreprocessing}
+                        className="w-full accent-indigo-500 h-1 mt-1 mb-2" 
+                      />
+                      
+                      <div className="flex justify-between items-center text-[8px] text-zinc-400 font-mono">
+                        <span>Sharpening (Iters)</span>
+                        <span className="text-white">{sharpeningIters}</span>
+                      </div>
+                      <input 
+                        type="range" min="0" max="10" step="1" 
+                        value={sharpeningIters} 
+                        onChange={(e) => setSharpeningIters(parseInt(e.target.value))} 
+                        onMouseUp={applyPreprocessing}
+                        className="w-full accent-indigo-500 h-1 mt-1 mb-1" 
+                      />
+                      
+                      <button onClick={applyPreprocessing} className="w-full py-1.5 mt-2 bg-zinc-800 hover:bg-zinc-700 text-[8px] font-bold uppercase text-white rounded border border-zinc-700 transition-colors">
+                        Apply Filters
+                      </button>
+                    </div>
+                  </div>
+               </div>
+
+               <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
+                  <span className="text-[8px] font-bold uppercase text-zinc-400 tracking-wider mb-1">Curves Extraction</span>
 
                   <div className="flex items-center gap-2">
-                    <span className="text-[10px] w-14 text-zinc-400">Min Size</span>
+                    <span className="text-[8px] w-12 text-zinc-400">Min Size</span>
                     <input type="range" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value))} disabled={isAutoExtracting} className="flex-1 accent-emerald-500 h-1" />
-                    <input type="number" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value) || 0)} disabled={isAutoExtracting} className="text-[10px] text-emerald-400 w-10 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-emerald-500" />
+                    <input type="number" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value) || 0)} disabled={isAutoExtracting} className="text-[8px] text-emerald-400 w-8 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-emerald-500" />
                   </div>
                   
-                  <div className="flex gap-1.5 mt-0.5">
-                    <button onClick={handleAutoExtract} disabled={isAutoExtracting} className="flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white border border-emerald-600/50 transition-colors">
+                  <div className="flex gap-1 mt-0.5">
+                    <button onClick={handleAutoExtract} disabled={isAutoExtracting} className="flex-1 py-1 rounded text-[8px] font-bold uppercase tracking-wide bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white border border-emerald-600/50 transition-colors">
                       Auto Detect
                     </button>
                     
-                    <button title="Clear All Curves" onClick={handleClearAllFeatures} disabled={isAutoExtracting || currentFeatures.length === 0} className="w-8 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-red-600/10 text-red-500 hover:bg-red-600 hover:text-white border border-red-600/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                    <button title="Clear All Curves" onClick={handleClearAllFeatures} disabled={isAutoExtracting || currentFeatures.length === 0} className="w-6 py-1 flex items-center justify-center rounded text-[8px] font-bold uppercase tracking-wide bg-red-600/10 text-red-500 hover:bg-red-600 hover:text-white border border-red-600/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
                       <IconClear />
                     </button>
                   </div>
                </div>
-               
-               <div className="flex flex-col gap-1">
-                 <div className="flex items-center justify-between px-2 py-1">
-                   <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-wider text-[10px]">
-                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
-                     Reference Mesh
-                   </div>
-                   <button onClick={() => setShowMesh(!showMesh)} className="text-zinc-500 hover:text-zinc-300 transition-colors">
-                     {showMesh ? <IconEye /> : <IconEyeOff />}
-                   </button>
-                 </div>
-                 <div className="flex items-center justify-between px-3 py-1.5 bg-zinc-900 rounded border border-zinc-800 transition-colors">
-                    <span className="text-[11px] text-zinc-300 truncate w-40">{fileName}</span>
-                 </div>
-               </div>
-
-               <div className="flex flex-col gap-1">
-                 <div className="flex items-center justify-between px-2 py-1">
-                   <div className="flex items-center gap-2 text-purple-500/80 font-bold uppercase tracking-wider text-[10px]">
-                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M22 12c-2.66 0-4.33-3-7-3s-4.34 3-7 3-4.33-3-7-3" /></svg>
-                     Extracted Curves
-                   </div>
-                   <button onClick={() => setShowCurvesFolder(!showCurvesFolder)} className="text-zinc-500 hover:text-zinc-300 transition-colors">
-                     {showCurvesFolder ? <IconEye /> : <IconEyeOff />}
-                   </button>
-                 </div>
-                 {showCurvesFolder && (
-                   currentFeatures.length === 0 ? <span className="px-3 text-[10px] text-zinc-600 italic">Empty</span> : currentFeatures.map((feat) => {
-                     const isHidden = hiddenCurveIds.includes(feat.id);
-                     return (
-                       <div key={feat.id} className={`flex items-center justify-between px-3 py-1.5 rounded border transition-colors bg-zinc-900 border-zinc-800 hover:border-zinc-600`}>
-                         <div className="flex items-center gap-2 overflow-hidden">
-                           <span className="text-zinc-500 shrink-0"><IconWave /></span>
-                           <span className="text-[11px] text-zinc-300 font-mono truncate">{feat.type === 'circle' ? 'Circle' : 'Curve'}_{feat.id.substring(0,4)}</span>
-                         </div>
-                         <div className="flex gap-2">
-                           <button onClick={(e) => { e.stopPropagation(); toggleCurveVisibility(feat.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0">
-                             {!isHidden ? <IconEye /> : <IconEyeOff />}
-                           </button>
-                           <button onClick={(e) => { e.stopPropagation(); handleDeleteFeature(feat.id); }} className="text-zinc-500 hover:text-red-400 shrink-0">
-                             <IconTrash />
-                           </button>
-                         </div>
-                       </div>
-                     );
-                   })
-                 )}
-               </div>
-
-               <div className="flex flex-col gap-1">
-                 <div className="flex items-center justify-between px-2 py-1">
-                   <div className="flex items-center gap-2 text-green-500/80 font-bold uppercase tracking-wider text-[10px]">
-                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
-                     Surface Sheets
-                   </div>
-                   <button onClick={() => setShowSheetsFolder(!showSheetsFolder)} className="text-zinc-500 hover:text-zinc-300 transition-colors">
-                     {showSheetsFolder ? <IconEye /> : <IconEyeOff />}
-                   </button>
-                 </div>
-                 {sheets.length === 0 ? <span className="px-3 text-[10px] text-zinc-600 italic">Empty</span> : sheets.map((geo) => {
-                   const isCylindrical = geo.payload?.loops?.[0]?.type === 'circle' || geo.sub_type === 'cylinder';
-                   return (
-                     <div 
-                       key={geo.id} onClick={() => setSelectedItemId(geo.id)}
-                       className={`flex items-center justify-between px-3 py-1.5 rounded border cursor-pointer transition-colors ${selectedItemId === geo.id ? 'bg-zinc-800 border-green-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
-                     >
-                       <div className="flex items-center gap-2 overflow-hidden">
-                         <span className="text-zinc-500 shrink-0">{isCylindrical ? <IconCylinderOutline /> : <IconSquare />}</span>
-                         <span className="text-[11px] text-zinc-300 font-mono truncate">{geo.name || `Sheet_${geo.id}`}</span>
-                       </div>
-                       <div className="flex gap-2">
-                         <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0">
-                           {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
-                         </button>
-                         <button onClick={(e) => { e.stopPropagation(); handleDeleteGeometry(geo.id); }} className="text-zinc-500 hover:text-red-400 shrink-0">
-                           <IconTrash />
-                         </button>
-                       </div>
-                     </div>
-                   );
-                 })}
-               </div>
-
-               <div className="flex flex-col gap-1">
-                 <div className="flex items-center justify-between px-2 py-1">
-                   <div className="flex items-center gap-2 text-blue-500/80 font-bold uppercase tracking-wider text-[10px]">
-                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
-                     CAD Solids
-                   </div>
-                   <button onClick={() => setShowSolidsFolder(!showSolidsFolder)} className="text-zinc-500 hover:text-zinc-300 transition-colors">
-                     {showSolidsFolder ? <IconEye /> : <IconEyeOff />}
-                   </button>
-                 </div>
-                 {solids.length === 0 ? <span className="px-3 text-[10px] text-zinc-600 italic">Empty</span> : solids.map((geo) => {
-                   const isCylindrical = geo.payload?.loops?.[0]?.type === 'circle' || geo.sub_type === 'cylinder';
-                   return (
-                     <div 
-                       key={geo.id} onClick={() => setSelectedItemId(geo.id)}
-                       className={`flex items-center justify-between px-3 py-1.5 rounded border cursor-pointer transition-colors ${selectedItemId === geo.id ? 'bg-zinc-800 border-blue-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
-                     >
-                       <div className="flex items-center gap-2 overflow-hidden">
-                         <span className="text-zinc-500 shrink-0">{isCylindrical ? <IconCylinderOutline /> : <IconSquare />}</span>
-                         <span className="text-[11px] text-zinc-300 font-mono truncate">{geo.name || `Solid_${geo.id}`}</span>
-                       </div>
-                       <div className="flex gap-2">
-                         <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0">
-                           {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
-                         </button>
-                         <button onClick={(e) => { e.stopPropagation(); handleDeleteGeometry(geo.id); }} className="text-zinc-500 hover:text-red-400 shrink-0">
-                           <IconTrash />
-                         </button>
-                       </div>
-                     </div>
-                   );
-                 })}
-               </div>
-
              </div>
           )}
         </div>
         
         {objUrl && (
-             <div className="p-3 border-t border-zinc-800 flex flex-col gap-2 shrink-0">
-                <div className="flex items-center gap-2 px-1">
-                  <input type="checkbox" id="mergeHulls" checked={mergeExportHulls} onChange={(e) => setMergeExportHulls(e.target.checked)} disabled={isExporting} className="accent-emerald-500 w-3 h-3 rounded bg-zinc-800 border-zinc-700" />
-                  <label htmlFor="mergeHulls" className="text-[10px] text-zinc-300 uppercase tracking-wide cursor-pointer select-none">Merge Solids (Boolean)</label>
-                </div>
-                <button onClick={handleExportSTEP} disabled={isExporting || (currentFeatures.length === 0 && rebuildHistory.length === 0)} className={`w-full py-2.5 rounded text-[11px] font-bold uppercase tracking-widest transition-all flex items-center justify-center gap-2 ${isExporting ? 'bg-emerald-900 text-emerald-400 cursor-wait' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-lg shadow-emerald-900/20 disabled:opacity-30 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:shadow-none'}`}>
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                  {isExporting ? 'Building STEP...' : 'Export STEP'}
-                </button>
+          <div className="mt-auto pt-2 border-t border-zinc-800 flex flex-col gap-2 shrink-0">
+             <div className="flex items-center gap-1.5 px-1">
+               <input type="checkbox" id="mergeHulls" checked={mergeExportHulls} onChange={(e) => setMergeExportHulls(e.target.checked)} disabled={isExporting} className="accent-emerald-500 w-3 h-3 rounded bg-zinc-800 border-zinc-700" />
+               <label htmlFor="mergeHulls" className="text-[8px] text-zinc-300 uppercase tracking-wide cursor-pointer select-none">Merge Solids</label>
              </div>
+             <button onClick={handleExportSTEP} disabled={isExporting || (currentFeatures.length === 0 && rebuildHistory.length === 0)} className={`w-full py-2 rounded text-[9px] font-bold uppercase tracking-widest transition-all flex items-center justify-center gap-2 ${isExporting ? 'bg-emerald-900 text-emerald-400 cursor-wait' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-lg shadow-emerald-900/20 disabled:opacity-30 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:shadow-none'}`}>
+               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+               {isExporting ? 'WAIT...' : 'Export STEP'}
+             </button>
+          </div>
         )}
       </div>
+
+      {/* LEFT COLUMN 2: OUTLINER */}
+      {objUrl && (
+        <div className="w-56 bg-[#0c0c0e] border-r border-zinc-800 flex flex-col z-10 shrink-0 shadow-xl animate-in slide-in-from-left duration-200">
+          <div className="p-2 border-b border-zinc-800 shrink-0 flex items-center justify-between">
+            <h2 className="text-[9px] font-bold uppercase tracking-wider text-zinc-500">Outliner</h2>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-1.5 flex flex-col gap-2">
+            
+            <div className="flex flex-col gap-0.5">
+               <button onClick={() => toggleOutliner('mesh')} className="flex items-center justify-between px-2 py-1.5 hover:bg-zinc-800/50 rounded transition-colors group">
+                  <div className="flex items-center gap-1.5">
+                     <span className="text-zinc-500 group-hover:text-zinc-300 scale-75"><IconEye /></span>
+                     <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 group-hover:text-zinc-200">Ref Mesh</span>
+                  </div>
+                  <span className="text-zinc-600 text-[7px]">{outlinerExpanded.mesh ? '▼' : '▶'}</span>
+               </button>
+               {outlinerExpanded.mesh && (
+                 <div className="flex flex-col gap-0.5 pl-3 pr-1 mt-0.5">
+                    <div className="flex items-center justify-between px-2 py-1.5 bg-zinc-900 rounded border border-zinc-800">
+                      <span className="text-[9px] text-zinc-300 truncate w-24">{fileName}</span>
+                      <button onClick={() => setShowMesh(!showMesh)} className="text-zinc-500 hover:text-zinc-300 transition-colors scale-75">
+                        {showMesh ? <IconEye /> : <IconEyeOff />}
+                      </button>
+                    </div>
+                 </div>
+               )}
+            </div>
+
+            <div className="flex flex-col gap-0.5">
+               <button onClick={() => toggleOutliner('curves')} className="flex items-center justify-between px-2 py-1.5 hover:bg-zinc-800/50 rounded transition-colors group">
+                  <div className="flex items-center gap-1.5">
+                     <span className="text-purple-500/80 scale-75"><IconWave /></span>
+                     <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 group-hover:text-zinc-200">Curves</span>
+                  </div>
+                  <span className="text-zinc-600 text-[7px]">{outlinerExpanded.curves ? '▼' : '▶'}</span>
+               </button>
+               {outlinerExpanded.curves && (
+                 <div className="flex flex-col gap-0.5 pl-3 pr-1 mt-0.5">
+                    {currentFeatures.length === 0 ? <span className="px-2 text-[8px] text-zinc-600 italic">Empty</span> : currentFeatures.map((feat) => {
+                      const isHidden = hiddenCurveIds.includes(feat.id);
+                      return (
+                        <div key={feat.id} className="flex items-center justify-between px-2 py-1 rounded border transition-colors bg-zinc-900 border-zinc-800 hover:border-zinc-600">
+                          <span className="text-[9px] text-zinc-300 font-mono truncate">{feat.type === 'circle' ? 'Circle' : 'Curve'}_{feat.id.substring(0,4)}</span>
+                          <div className="flex gap-1">
+                            <button onClick={(e) => { e.stopPropagation(); toggleCurveVisibility(feat.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0 scale-75">
+                              {!isHidden ? <IconEye /> : <IconEyeOff />}
+                            </button>
+                            <button onClick={(e) => { e.stopPropagation(); handleDeleteFeature(feat.id); }} className="text-zinc-500 hover:text-red-400 shrink-0 scale-75">
+                              <IconTrash />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                 </div>
+               )}
+            </div>
+
+            <div className="flex flex-col gap-0.5">
+               <button onClick={() => toggleOutliner('sheets')} className="flex items-center justify-between px-2 py-1.5 hover:bg-zinc-800/50 rounded transition-colors group">
+                  <div className="flex items-center gap-1.5">
+                     <span className="text-green-500/80 scale-75"><IconSquare /></span>
+                     <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 group-hover:text-zinc-200">Surfaces</span>
+                  </div>
+                  <span className="text-zinc-600 text-[7px]">{outlinerExpanded.sheets ? '▼' : '▶'}</span>
+               </button>
+               {outlinerExpanded.sheets && (
+                 <div className="flex flex-col gap-0.5 pl-3 pr-1 mt-0.5">
+                    {sheets.length === 0 ? <span className="px-2 text-[8px] text-zinc-600 italic">Empty</span> : sheets.map((geo) => (
+                      <div key={geo.id} onClick={() => setSelectedItemId(geo.id)} className={`flex items-center justify-between px-2 py-1 rounded border cursor-pointer transition-colors ${selectedItemId === geo.id ? 'bg-zinc-800 border-green-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}>
+                        <span className="text-[9px] text-zinc-300 font-mono truncate w-20">{geo.name || `Sheet_${geo.id}`}</span>
+                        <div className="flex gap-1">
+                          <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0 scale-75">
+                            {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
+                          </button>
+                          <button onClick={(e) => { e.stopPropagation(); handleDeleteGeometry(geo.id); }} className="text-zinc-500 hover:text-red-400 shrink-0 scale-75">
+                            <IconTrash />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                 </div>
+               )}
+            </div>
+
+            <div className="flex flex-col gap-0.5">
+               <button onClick={() => toggleOutliner('solids')} className="flex items-center justify-between px-2 py-1.5 hover:bg-zinc-800/50 rounded transition-colors group">
+                  <div className="flex items-center gap-1.5">
+                     <span className="text-blue-500/80 scale-75"><IconCylinderOutline /></span>
+                     <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 group-hover:text-zinc-200">Solids</span>
+                  </div>
+                  <span className="text-zinc-600 text-[7px]">{outlinerExpanded.solids ? '▼' : '▶'}</span>
+               </button>
+               {outlinerExpanded.solids && (
+                 <div className="flex flex-col gap-0.5 pl-3 pr-1 mt-0.5">
+                    {solids.length === 0 ? <span className="px-2 text-[8px] text-zinc-600 italic">Empty</span> : solids.map((geo) => (
+                      <div key={geo.id} onClick={() => setSelectedItemId(geo.id)} className={`flex items-center justify-between px-2 py-1 rounded border cursor-pointer transition-colors ${selectedItemId === geo.id ? 'bg-zinc-800 border-blue-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}>
+                        <span className="text-[9px] text-zinc-300 font-mono truncate w-20">{geo.name || `Solid_${geo.id}`}</span>
+                        <div className="flex gap-1">
+                          <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0 scale-75">
+                            {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
+                          </button>
+                          <button onClick={(e) => { e.stopPropagation(); handleDeleteGeometry(geo.id); }} className="text-zinc-500 hover:text-red-400 shrink-0 scale-75">
+                            <IconTrash />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                 </div>
+               )}
+            </div>
+
+          </div>
+        </div>
+      )}
 
       {/* CENTER COLUMN: VIEWPORT */}
       <div className="flex-1 flex flex-col relative bg-zinc-900 overflow-hidden">
@@ -971,9 +1035,9 @@ export default function App() {
             rebuildHistory={rebuildHistory}
             selectedSolidIndex={selectedItemId}
             cursorScale={cursorScale}
-            showSheetsFolder={showSheetsFolder}
-            showSolidsFolder={showSolidsFolder}
-            showCurvesFolder={showCurvesFolder}
+            showSheetsFolder={outlinerExpanded.sheets}
+            showSolidsFolder={outlinerExpanded.solids}
+            showCurvesFolder={outlinerExpanded.curves}
             hiddenCurveIds={hiddenCurveIds}
             sharpnessAngle={sharpnessAngle}
             linearSnap={linearSnap}
@@ -983,31 +1047,12 @@ export default function App() {
             toggleSymmetry={toggleSymmetry}
             transformMode={transformMode}
             setTransformMode={setTransformMode}
+            outlinerExpanded={outlinerExpanded}
           />
-
-          {/* LEFT FLOATING TOOLBAR */}
-          <div 
-            onPointerDown={(e) => e.stopPropagation()} 
-            className="absolute top-1/2 left-4 -translate-y-1/2 flex flex-col gap-2 z-10 pointer-events-auto bg-zinc-900/80 border border-zinc-800 p-1.5 rounded-lg shadow-xl backdrop-blur-md"
-          >
-            <button onClick={() => setTransformMode(null)} className={`p-2 rounded transition-all ${transformMode === null ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`} title="Select (Q)"><IconCursor /></button>
-            <button onClick={() => setTransformMode('translate')} className={`p-2 rounded transition-all ${transformMode === 'translate' ? 'bg-amber-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`} title="Move (W)"><IconMove /></button>
-            <button onClick={() => setTransformMode('rotate')} className={`p-2 rounded transition-all ${transformMode === 'rotate' ? 'bg-amber-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`} title="Rotate (E)"><IconRotate /></button>
-            <button onClick={() => setTransformMode('scale')} className={`p-2 rounded transition-all ${transformMode === 'scale' ? 'bg-amber-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`} title="Scale (R)"><IconScale /></button>
-            
-            <div className="w-full h-px bg-zinc-700/50 my-1"></div>
-            
-            <button title="Undo Solid/Curve (Ctrl+Z)" onClick={handleGlobalUndo} disabled={historyIndex === 0 && rebuildHistory.length === 0} className="p-2 rounded text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed transition-all">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" /></svg>
-            </button>
-            <button title="Redo Curve Action (Ctrl+Y)" onClick={handleGlobalRedo} disabled={historyIndex === featuresHistory.length - 1} className="p-2 rounded text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed transition-all">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 10h-10a8 8 0 00-8 8v2M21 10l-6 6m6-6l-6-6" /></svg>
-            </button>
-          </div>
 
           <div 
              onPointerDown={(e) => e.stopPropagation()} 
-             className="absolute top-4 left-4 flex flex-col gap-1.5 z-10 items-start pointer-events-auto pl-14"
+             className="absolute top-4 left-4 flex flex-col gap-1.5 z-10 items-start pointer-events-auto"
           >
             <div className="flex gap-2">
               <button onClick={() => setShowMesh(!showMesh)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showMesh ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
@@ -1035,6 +1080,26 @@ export default function App() {
               </div>
             )}
           </div>
+
+          {/* LEFT FLOATING TOOLBAR */}
+          <div 
+            onPointerDown={(e) => e.stopPropagation()} 
+            className="absolute top-1/2 left-4 -translate-y-1/2 flex flex-col gap-2 z-10 pointer-events-auto bg-zinc-900/80 border border-zinc-800 p-1.5 rounded-lg shadow-xl backdrop-blur-md"
+          >
+            <button onClick={() => setTransformMode(null)} className={`p-2 rounded transition-all ${transformMode === null ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`} title="Select (Q)"><IconCursor /></button>
+            <button onClick={() => setTransformMode('translate')} className={`p-2 rounded transition-all ${transformMode === 'translate' ? 'bg-amber-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`} title="Move (W)"><IconMove /></button>
+            <button onClick={() => setTransformMode('rotate')} className={`p-2 rounded transition-all ${transformMode === 'rotate' ? 'bg-amber-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`} title="Rotate (E)"><IconRotate /></button>
+            <button onClick={() => setTransformMode('scale')} className={`p-2 rounded transition-all ${transformMode === 'scale' ? 'bg-amber-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`} title="Scale (R)"><IconScale /></button>
+            
+            <div className="w-full h-px bg-zinc-700/50 my-1"></div>
+            
+            <button title="Undo Solid/Curve (Ctrl+Z)" onClick={handleGlobalUndo} disabled={historyIndex === 0 && rebuildHistory.length === 0} className="p-2 rounded text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed transition-all">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" /></svg>
+            </button>
+            <button title="Redo Curve Action (Ctrl+Y)" onClick={handleGlobalRedo} disabled={historyIndex === featuresHistory.length - 1} className="p-2 rounded text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed transition-all">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 10h-10a8 8 0 00-8 8v2M21 10l-6 6m6-6l-6-6" /></svg>
+            </button>
+          </div>
         </div>
 
         <div className="h-28 bg-[#0a0a0c] border-t border-zinc-800 shrink-0 flex flex-col shadow-[inset_0_4px_6px_rgba(0,0,0,0.5)]">
@@ -1056,60 +1121,12 @@ export default function App() {
       </div>
 
       {/* RIGHT COLUMN: INSPECTOR */}
-      <div className="w-64 bg-zinc-950 border-l border-zinc-800 flex flex-col z-10 shrink-0 shadow-2xl">
+      <div className="w-[260px] bg-zinc-950 border-l border-zinc-800 flex flex-col z-10 shrink-0 shadow-2xl">
         <div className="p-4 border-b border-zinc-800 shrink-0">
           <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-300">Inspector</h2>
         </div>
 
         <div className="p-4 flex-1 overflow-y-auto flex flex-col gap-4">
-          
-          <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-3">
-            <div>
-              <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Pre-Processing</span>
-              <div className="flex flex-col gap-1 mt-2">
-                <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
-                  <span>Sharpness (Dihedral)</span>
-                  <span className="text-white">{sharpnessAngle}°</span>
-                </div>
-                <input 
-                  type="range" 
-                  min="0" max="180" 
-                  value={sharpnessAngle} 
-                  onChange={(e) => setSharpnessAngle(parseInt(e.target.value))} 
-                  className="w-full accent-indigo-500 h-1 mt-1 mb-2" 
-                />
-                
-                <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
-                  <span>Decimation (Faces)</span>
-                  <span className="text-white">{decimationTarget.toLocaleString()}</span>
-                </div>
-                <input 
-                  type="range" min="5000" max="100000" step="1000" 
-                  value={decimationTarget} 
-                  onChange={(e) => setDecimationTarget(parseInt(e.target.value))} 
-                  onMouseUp={applyPreprocessing}
-                  className="w-full accent-indigo-500 h-1 mt-1 mb-2" 
-                />
-                
-                <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
-                  <span>Sharpening (Iters)</span>
-                  <span className="text-white">{sharpeningIters}</span>
-                </div>
-                <input 
-                  type="range" min="0" max="10" step="1" 
-                  value={sharpeningIters} 
-                  onChange={(e) => setSharpeningIters(parseInt(e.target.value))} 
-                  onMouseUp={applyPreprocessing}
-                  className="w-full accent-indigo-500 h-1 mt-1 mb-1" 
-                />
-                
-                <button onClick={applyPreprocessing} className="w-full py-1.5 mt-2 bg-zinc-800 hover:bg-zinc-700 text-[9px] font-bold uppercase text-white rounded border border-zinc-700 transition-colors">
-                  Apply Filters
-                </button>
-              </div>
-            </div>
-          </div>
-
           <div className="bg-zinc-900 rounded border border-amber-900/50 p-2 flex flex-col gap-2">
              <div className="flex justify-between items-center pb-1 border-b border-zinc-800">
                 <span className="text-[10px] font-bold uppercase text-amber-500 tracking-wider">Selection Stack</span>
