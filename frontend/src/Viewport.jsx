@@ -1,6 +1,6 @@
 import React, { Suspense, useEffect, useRef, useMemo, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
-import { OrbitControls, Bounds, Edges, Grid, GizmoHelper, GizmoViewport } from '@react-three/drei';
+import { OrbitControls, Bounds, Edges, Grid, GizmoHelper, GizmoViewport, TransformControls, Html } from '@react-three/drei';
 import { useLoader } from '@react-three/fiber';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import * as THREE from 'three';
@@ -41,13 +41,9 @@ function SplashHighlight({ feature, originalMeshes, centerOffset }) {
             geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
             geo.setIndex(new THREE.BufferAttribute(indices, 1));
             geo.computeVertexNormals();
-            if (centerOffset) {
-                geo.translate(-centerOffset.x, -centerOffset.y, -centerOffset.z);
-            }
+            if (centerOffset) geo.translate(-centerOffset.x, -centerOffset.y, -centerOffset.z);
             return { geo, meshParams: null };
-        } catch(e) {
-            return null;
-        }
+        } catch(e) { return null; }
     }
 
     if (feature.patch_faces && originalMeshes && originalMeshes.length > 0) {
@@ -94,12 +90,8 @@ function SplashHighlight({ feature, originalMeshes, centerOffset }) {
           geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(newPos), 3));
           geo.computeVertexNormals();
           return { geo, meshParams: baseMesh };
-        } catch(e) {
-          console.error("Splash build error", e);
-          return null;
-        }
+        } catch(e) { return null; }
     }
-    
     return null;
   }, [feature, originalMeshes, centerOffset]);
 
@@ -110,12 +102,7 @@ function SplashHighlight({ feature, originalMeshes, centerOffset }) {
   }, [feature.id]);
 
   const material = useMemo(() => new THREE.MeshBasicMaterial({
-    color: color,
-    transparent: true,
-    opacity: 0.45,
-    side: THREE.DoubleSide,
-    depthWrite: false,
-    depthTest: true
+    color: color, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false, depthTest: true
   }), [color]);
 
   if (!result || !result.geo) return null;
@@ -142,9 +129,7 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, origina
 
   const geometry = useMemo(() => {
     if (!points.length) return null;
-    try {
-        return new THREE.BufferGeometry().setFromPoints(points);
-    } catch(e) { return null; }
+    try { return new THREE.BufferGeometry().setFromPoints(points); } catch(e) { return null; }
   }, [points]);
   
   const quaternion = useMemo(() => {
@@ -165,9 +150,7 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, origina
     <group>
       {finalHover && <SplashHighlight feature={feature} originalMeshes={originalMeshes} centerOffset={centerOffset} />}
       <line 
-        geometry={geometry} 
-        position={pos} 
-        quaternion={quaternion}
+        geometry={geometry} position={pos} quaternion={quaternion}
         onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
         onPointerOut={() => setHovered(false)}
         onClick={(e) => {
@@ -193,9 +176,7 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSe
     if (!points?.length) return null;
     try {
         const pts = points.map(p => new THREE.Vector3(...p));
-        if (centerOffset) {
-            pts.forEach(p => p.sub(centerOffset));
-        }
+        if (centerOffset) pts.forEach(p => p.sub(centerOffset));
         if (pts.length > 0) pts.push(pts[0].clone()); 
         return new THREE.BufferGeometry().setFromPoints(pts);
     } catch (e) { return null; }
@@ -228,11 +209,191 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSe
   );
 }
 
+// Highly isolated Transform component. Disconnected from React's continuous render cycle to stop drag-fights.
+function ActiveTransformSolid({ geo, material, centerOffset, transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap, onSelect }) {
+  const groupRef = useRef();
+  const inputRef = useRef(null);
+  const isDraggingRef = useRef(false);
+  
+  const startPos = useRef(new THREE.Vector3());
+  const startRot = useRef(new THREE.Euler());
+  const startScale = useRef(new THREE.Vector3());
+  const dominantAxis = useRef('x');
+
+  // Calculates the true volumetric centroid to anchor the Gizmo perfectly
+  const { localPivot, absoluteCenter } = useMemo(() => {
+    if (!geo.vertices || geo.vertices.length === 0) {
+        return { localPivot: new THREE.Vector3(), absoluteCenter: new THREE.Vector3() };
+    }
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const pt of geo.vertices) {
+        const x = pt[0], y = pt[1], z = pt[2];
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+        if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    const absCenter = new THREE.Vector3((minX+maxX)/2, (minY+maxY)/2, (minZ+maxZ)/2);
+    const pivot = absCenter.clone().sub(centerOffset);
+    return { localPivot: pivot, absoluteCenter: absCenter };
+  }, [geo.vertices, centerOffset]);
+
+  // Initial Placement - Using useEffect stops React from forcing the position back on every re-render
+  useEffect(() => {
+    if (groupRef.current) {
+      groupRef.current.position.copy(localPivot);
+      groupRef.current.rotation.set(0, 0, 0);
+      groupRef.current.scale.set(1, 1, 1);
+    }
+  }, [localPivot]);
+
+  useEffect(() => {
+    if (groupRef.current) {
+      startPos.current.copy(groupRef.current.position);
+      startRot.current.copy(groupRef.current.rotation);
+      startScale.current.copy(groupRef.current.scale);
+      if (inputRef.current) inputRef.current.value = '0';
+    }
+  }, [transformMode]);
+
+  const handleChange = () => {
+    if (!groupRef.current || !isDraggingRef.current) return;
+    
+    let maxDelta = 0;
+    if (transformMode === 'translate') {
+      const diff = groupRef.current.position.clone().sub(startPos.current);
+      const absX = Math.abs(diff.x), absY = Math.abs(diff.y), absZ = Math.abs(diff.z);
+      maxDelta = diff.x; dominantAxis.current = 'x';
+      if (absY > absX && absY > absZ) { maxDelta = diff.y; dominantAxis.current = 'y'; }
+      if (absZ > absX && absZ > absY) { maxDelta = diff.z; dominantAxis.current = 'z'; }
+    } else if (transformMode === 'rotate') {
+      const diffX = groupRef.current.rotation.x - startRot.current.x;
+      const diffY = groupRef.current.rotation.y - startRot.current.y;
+      const diffZ = groupRef.current.rotation.z - startRot.current.z;
+      const absX = Math.abs(diffX), absY = Math.abs(diffY), absZ = Math.abs(diffZ);
+      maxDelta = diffX; dominantAxis.current = 'x';
+      if (absY > absX && absY > absZ) { maxDelta = diffY; dominantAxis.current = 'y'; }
+      if (absZ > absX && absZ > absY) { maxDelta = diffZ; dominantAxis.current = 'z'; }
+      maxDelta = maxDelta * 180 / Math.PI;
+    } else if (transformMode === 'scale') {
+      const diff = groupRef.current.scale.clone().sub(startScale.current);
+      const absX = Math.abs(diff.x), absY = Math.abs(diff.y), absZ = Math.abs(diff.z);
+      maxDelta = diff.x; dominantAxis.current = 'x';
+      if (absY > absX && absY > absZ) { maxDelta = diff.y; dominantAxis.current = 'y'; }
+      if (absZ > absX && absZ > absY) { maxDelta = diff.z; dominantAxis.current = 'z'; }
+    }
+
+    if (inputRef.current) {
+      const unit = transformMode === 'rotate' ? '°' : ' units';
+      inputRef.current.value = maxDelta > 0 ? `+${maxDelta.toFixed(2)}${unit}` : `${maxDelta.toFixed(2)}${unit}`;
+    }
+  };
+
+  const handleDraggingChanged = (e) => {
+    isDraggingRef.current = e.value;
+    if (e.value && groupRef.current) {
+      startPos.current.copy(groupRef.current.position);
+      startRot.current.copy(groupRef.current.rotation);
+      startScale.current.copy(groupRef.current.scale);
+      if (inputRef.current) inputRef.current.value = '0';
+    }
+  };
+
+  const handleManualInput = (e) => {
+    if (e.key === 'Enter') {
+      const val = parseFloat(inputRef.current.value.replace(/[^0-9.-]/g, '')) || 0;
+      if (transformMode === 'translate') {
+        const newPos = startPos.current.clone();
+        newPos[dominantAxis.current] += val;
+        groupRef.current.position.copy(newPos);
+        startPos.current.copy(newPos);
+      } else if (transformMode === 'rotate') {
+        const newRot = startRot.current.clone();
+        newRot[dominantAxis.current] += (val * Math.PI / 180);
+        groupRef.current.rotation.copy(newRot);
+        startRot.current.copy(newRot);
+      } else if (transformMode === 'scale') {
+        const newScale = startScale.current.clone();
+        newScale[dominantAxis.current] += val;
+        groupRef.current.scale.copy(newScale);
+        startScale.current.copy(newScale);
+      }
+      if (inputRef.current) inputRef.current.value = '0';
+      e.target.blur();
+    }
+  };
+
+  return (
+    <TransformControls
+      mode={transformMode}
+      space="local"
+      translationSnap={linearSnap > 0 ? linearSnap : null}
+      rotationSnap={angleSnap > 0 ? angleSnap * Math.PI / 180 : null}
+      scaleSnap={linearSnap > 0 ? linearSnap : null}
+      onChange={handleChange}
+      onDraggingChanged={handleDraggingChanged}
+    >
+      <group ref={groupRef} onClick={onSelect}>
+        <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={absoluteCenter} material={material} />
+        
+        <Html center position={[0, 1.5, 0]} zIndexRange={[100, 0]}>
+          <div 
+            onPointerDown={(e) => e.stopPropagation()}
+            onPointerUp={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
+            className="bg-zinc-900/95 border border-zinc-700 p-2 rounded shadow-2xl backdrop-blur-md font-mono text-[10px] w-40 flex flex-col gap-1.5 pointer-events-auto"
+          >
+            <div className="flex justify-between items-center text-zinc-400">
+              <span className="uppercase tracking-wider font-bold">Snap</span>
+              <select 
+                value={transformMode === 'rotate' ? angleSnap : linearSnap} 
+                onChange={(e) => transformMode === 'rotate' ? setAngleSnap(parseFloat(e.target.value)) : setLinearSnap(parseFloat(e.target.value))}
+                className="w-16 bg-zinc-950 border border-zinc-700 text-right text-white outline-none focus:border-blue-500 rounded px-1 py-0.5"
+              >
+                {transformMode === 'rotate' ? (
+                  <>
+                    <option value={0}>None</option>
+                    <option value={5}>5°</option>
+                    <option value={15}>15°</option>
+                    <option value={45}>45°</option>
+                    <option value={90}>90°</option>
+                  </>
+                ) : (
+                  <>
+                    <option value={0}>None</option>
+                    <option value={1}>1.0</option>
+                    <option value={0.5}>0.5</option>
+                    <option value={0.1}>0.1</option>
+                  </>
+                )}
+              </select>
+            </div>
+            <div className="flex justify-between items-center text-amber-400 font-bold">
+              <span className="uppercase tracking-wider">Delta</span>
+              <div className="relative">
+                <input
+                  ref={inputRef}
+                  type="text"
+                  defaultValue="0"
+                  onKeyDown={handleManualInput}
+                  className="w-16 bg-zinc-950 border border-zinc-700 text-right text-amber-400 outline-none focus:border-amber-500 rounded px-1 py-0.5"
+                />
+              </div>
+            </div>
+          </div>
+        </Html>
+      </group>
+    </TransformControls>
+  );
+}
+
 function GhostModel({ 
   url, symmetry, onSelectLoop, onSelectSolid,
   extractedFeatures, showMesh, showWireframe, meshOpacity,
   selectedLoops, rebuildHistory, selectedSolidIndex, cursorScale,
-  showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle
+  showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle,
+  transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap
 }) {
   const obj = useLoader(OBJLoader, url);
   const cursorGroupRef = useRef(); 
@@ -242,16 +403,13 @@ function GhostModel({
   const [scoutLoop, setScoutLoop] = useState(null);
   const scoutTimeout = useRef(null);
   
-  useEffect(() => {
-    return () => URL.revokeObjectURL(url);
-  }, [url]);
+  useEffect(() => { return () => URL.revokeObjectURL(url); }, [url]);
 
   const activeScales = useMemo(() => {
     const scales = [];
     const xArr = symmetry.x ? [1, -1] : [1];
     const yArr = symmetry.y ? [1, -1] : [1];
     const zArr = symmetry.z ? [1, -1] : [1];
-    
     for (let x of xArr) {
       for (let y of yArr) {
         for (let z of zArr) {
@@ -281,49 +439,24 @@ function GhostModel({
         geom.translate(-center.x, -center.y, -center.z);
         geom.computeBoundingBox();
         geom.computeBoundingSphere();
-        extracted.push({ 
-           geometry: geom, 
-           position: child.position.clone(), 
-           rotation: child.rotation.clone(), 
-           scale: child.scale.clone() 
-        });
+        extracted.push({ geometry: geom, position: child.position.clone(), rotation: child.rotation.clone(), scale: child.scale.clone() });
       }
     });
     
     return { meshes: extracted, cursorRadius: calculatedRadius, centerOffset: center };
   }, [obj, cursorScale]);
 
-  const solidMaterial = useMemo(() => new THREE.MeshStandardMaterial({
-    color: "#3b82f6", 
-    transparent: true,
-    opacity: 0.8,
-    roughness: 0.3,
-    metalness: 0.1,
-    side: THREE.DoubleSide
-  }), []);
-
-  const sheetMaterial = useMemo(() => new THREE.MeshStandardMaterial({
-    color: "#4ade80", 
-    transparent: true,
-    opacity: 0.8,
-    roughness: 0.3,
-    metalness: 0.1,
-    side: THREE.DoubleSide
-  }), []);
-
-  const selectedSolidMaterial = useMemo(() => new THREE.MeshStandardMaterial({
-    color: "#f97316", 
-    emissive: "#ea580c",
-    emissiveIntensity: 0.4,
-    transparent: true,
-    opacity: 0.9,
-    roughness: 0.2,
-    metalness: 0.3,
-    side: THREE.DoubleSide
-  }), []);
+  const solidMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: "#3b82f6", transparent: true, opacity: 0.8, roughness: 0.3, metalness: 0.1, side: THREE.DoubleSide }), []);
+  const sheetMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: "#4ade80", transparent: true, opacity: 0.8, roughness: 0.3, metalness: 0.1, side: THREE.DoubleSide }), []);
+  const selectedSolidMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: "#f97316", emissive: "#ea580c", emissiveIntensity: 0.4, transparent: true, opacity: 0.9, roughness: 0.2, metalness: 0.3, side: THREE.DoubleSide }), []);
 
   const handlePointerMove = (e) => {
     e.stopPropagation(); 
+    
+    if (transformMode) {
+      if (scoutLoop) setScoutLoop(null);
+      return;
+    }
 
     if (cursorGroupRef.current) {
       const worldPoint = e.point.clone();
@@ -362,16 +495,15 @@ function GhostModel({
 
   const handlePointerOut = () => {
     if (cursorRef.current) cursorRef.current.visible = false;
-    mirroredCursorRefs.current.forEach(ref => {
-      if (ref) ref.visible = false;
-    });
-    setScoutLoop(null);
+    mirroredCursorRefs.current.forEach(ref => { if (ref) ref.visible = false; });
+    if (scoutLoop) setScoutLoop(null);
     clearTimeout(scoutTimeout.current);
   };
 
   const handleClick = async (e) => {
     e.stopPropagation(); 
     if (!cursorGroupRef.current) return;
+    if (transformMode) return;
 
     const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
     const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
@@ -414,26 +546,38 @@ function GhostModel({
            const isVisible = geo.visible !== false &&
              !(geo.type === 'sheet' && !showSheetsFolder) &&
              !(geo.type === 'solid' && !showSolidsFolder);
+           if (!isVisible) return null;
 
            const isSelected = geo.id === selectedSolidIndex;
-           const mat = geo.type === 'sheet' ? sheetMaterial : (isSelected ? selectedSolidMaterial : solidMaterial);
+           const mat = geo.type === 'sheet' ? (isSelected ? selectedSolidMaterial : sheetMaterial) : (isSelected ? selectedSolidMaterial : solidMaterial);
+           
+           const handleSelect = (e) => { 
+              e.stopPropagation(); 
+              const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
+              const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
+              if (onSelectSolid) onSelectSolid(geo.id, { x: screenX, y: screenY }); 
+           };
+
+           if (isSelected && transformMode && (transformMode === 'translate' || transformMode === 'rotate' || transformMode === 'scale')) {
+               return (
+                  <ActiveTransformSolid 
+                     key={`geo-${geo.id || idx}`}
+                     geo={geo}
+                     material={mat}
+                     centerOffset={centerOffset}
+                     transformMode={transformMode}
+                     linearSnap={linearSnap}
+                     setLinearSnap={setLinearSnap}
+                     angleSnap={angleSnap}
+                     setAngleSnap={setAngleSnap}
+                     onSelect={handleSelect}
+                  />
+               );
+           }
+
            return (
-             <group 
-               key={`geo-${geo.id || idx}`} 
-               visible={isVisible}
-               onClick={(e) => { 
-                  e.stopPropagation(); 
-                  const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
-                  const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
-                  if (onSelectSolid) onSelectSolid(geo.id, { x: screenX, y: screenY }); 
-               }}
-             >
-               <HullMesh 
-                 vertices={geo.vertices} 
-                 faces={geo.faces} 
-                 centerOffset={centerOffset} 
-                 material={mat} 
-               />
+             <group key={`geo-${geo.id || idx}`} onClick={handleSelect}>
+               <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={centerOffset} material={mat} />
              </group>
            );
         })}
@@ -459,15 +603,10 @@ function GhostModel({
                const isVisible = geo.visible !== false &&
                  !(geo.type === 'sheet' && !showSheetsFolder) &&
                  !(geo.type === 'solid' && !showSolidsFolder);
-                 
+               if (!isVisible) return null;
                return (
-                 <group key={`mirror-geo-${mirrorKey}-${idx}`} visible={isVisible}>
-                     <HullMesh 
-                       vertices={geo.vertices} 
-                       faces={geo.faces} 
-                       centerOffset={centerOffset} 
-                       material={geo.type === 'sheet' ? sheetMaterial : solidMaterial} 
-                     />
+                 <group key={`mirror-geo-${mirrorKey}-${idx}`}>
+                     <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={centerOffset} material={geo.type === 'sheet' ? sheetMaterial : solidMaterial} />
                  </group>
                );
             })}
@@ -475,13 +614,12 @@ function GhostModel({
         );
       })}
 
-      {showMesh && (
+      {showMesh && !transformMode && (
         <>
           <mesh ref={cursorRef} visible={false} renderOrder={1}>
             <sphereGeometry args={[cursorRadius, 16, 16]} />
             <meshBasicMaterial color="#3b82f6" depthTest={false} /> 
           </mesh>
-
           {activeScales?.map((scale, i) => (
             <mesh key={`cursor-${scale.join(',')}`} ref={(el) => { if(el) mirroredCursorRefs.current[i] = el; }} visible={false} renderOrder={1}>
               <sphereGeometry args={[cursorRadius, 16, 16]} />
@@ -494,57 +632,50 @@ function GhostModel({
   );
 }
 
-export default function Viewport({ 
-  objUrl, symmetry, onSelectLoop, onSelectSolid,
-  extractedFeatures, showMesh, showWireframe, meshOpacity,
-  selectedLoops, rebuildHistory, selectedSolidIndex, cursorScale,
-  showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle
-}) {
+export default function Viewport(props) {
+  const { 
+     objUrl, cleanedObjUrl, symmetry, onSelectLoop, onSelectSolid,
+     extractedFeatures, showMesh, showWireframe, meshOpacity,
+     selectedLoops, rebuildHistory, selectedSolidIndex, cursorScale,
+     showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle,
+     linearSnap, setLinearSnap, angleSnap, setAngleSnap, toggleSymmetry,
+     transformMode, setTransformMode
+  } = props;
+
+  const [previewMode, setPreviewMode] = useState('reference');
+
   return (
-    <Canvas camera={{ position: [5, 5, 5], fov: 45 }} gl={{ antialias: true }} raycaster={{ params: { Line: { threshold: 0.2 } } }}>
-      <color attach="background" args={['#18181b']} />
-      <ambientLight intensity={0.4} />
-      <hemisphereLight skyColor="#ffffff" groundColor="#444444" intensity={0.6} />
-      <directionalLight position={[10, 10, 10]} castShadow />
-      <Grid infiniteGrid fadeDistance={50} sectionColor="#3f3f46" cellColor="#27272a" position={[0, -0.01, 0]} />
+    <div className="relative w-full h-full">
+      <Canvas camera={{ position: [5, 5, 5], fov: 45 }} gl={{ antialias: true }} raycaster={{ params: { Line: { threshold: 0.15 } } }}>
+        <color attach="background" args={['#18181b']} />
+        <ambientLight intensity={0.4} />
+        <hemisphereLight skyColor="#ffffff" groundColor="#444444" intensity={0.6} />
+        <directionalLight position={[10, 10, 10]} castShadow />
+        <Grid infiniteGrid fadeDistance={50} sectionColor="#3f3f46" cellColor="#27272a" position={[0, -0.01, 0]} />
 
-      <Suspense fallback={null}>
-        {objUrl && (
-          <>
-            <Bounds fit clip margin={1.2}>
-              <GhostModel 
-                url={objUrl} 
-                symmetry={symmetry} 
-                onSelectLoop={onSelectLoop}
-                onSelectSolid={onSelectSolid}
-                extractedFeatures={extractedFeatures}
-                showMesh={showMesh} 
-                showWireframe={showWireframe}
-                meshOpacity={meshOpacity}
-                selectedLoops={selectedLoops}
-                rebuildHistory={rebuildHistory}
-                selectedSolidIndex={selectedSolidIndex}
-                cursorScale={cursorScale}
-                showSheetsFolder={showSheetsFolder}
-                showSolidsFolder={showSolidsFolder}
-                showCurvesFolder={showCurvesFolder}
-                hiddenCurveIds={hiddenCurveIds}
-                sharpnessAngle={sharpnessAngle}
-              />
-            </Bounds>
-            {symmetry?.x && <mesh rotation={[0, Math.PI / 2, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#ef4444" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
-            {symmetry?.y && <mesh rotation={[-Math.PI / 2, 0, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#22c55e" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
-            {symmetry?.z && <mesh rotation={[0, 0, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#3b82f6" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
-          </>
-        )}
-      </Suspense>
+        <Suspense fallback={null}>
+          {objUrl && (
+            <>
+              <Bounds fit clip margin={1.2}>
+                <GhostModel 
+                  {...props}
+                  transformMode={transformMode}
+                  url={previewMode === 'cleaned' && cleanedObjUrl ? cleanedObjUrl : objUrl}
+                />
+              </Bounds>
+              {symmetry?.x && <mesh rotation={[0, Math.PI / 2, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#ef4444" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
+              {symmetry?.y && <mesh rotation={[-Math.PI / 2, 0, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#22c55e" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
+              {symmetry?.z && <mesh rotation={[0, 0, 0]}><planeGeometry args={[5000, 5000]} /><meshBasicMaterial color="#3b82f6" transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} /></mesh>}
+            </>
+          )}
+        </Suspense>
 
-      <OrbitControls makeDefault enablePan={true} />
+        <OrbitControls makeDefault enablePan={true} />
 
-      <GizmoHelper alignment="bottom-right" margin={[60, 60]}>
-        <GizmoViewport axisColors={['#ef4444', '#22c55e', '#3b82f6']} labelColor="white" />
-      </GizmoHelper>
-
-    </Canvas>
+        <GizmoHelper alignment="bottom-right" margin={[60, 60]}>
+          <GizmoViewport axisColors={['#ef4444', '#22c55e', '#3b82f6']} labelColor="white" />
+        </GizmoHelper>
+      </Canvas>
+    </div>
   );
 }

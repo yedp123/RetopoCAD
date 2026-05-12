@@ -1,6 +1,7 @@
 import uvicorn
 import trimesh
 import trimesh.curvature
+import trimesh.smoothing  # Fixed scoping bug by making this global
 import numpy as np
 import io
 import tempfile
@@ -9,7 +10,7 @@ import sys
 import subprocess
 import pickle
 import traceback
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -26,8 +27,9 @@ app.add_middleware(
 
 class AppState:
     mesh = None
+    cleaned_mesh = None 
     live_logs = []
-    rebuild_geometry = [] # Unified stack for analytical Solids and Sheets
+    rebuild_geometry = [] 
 
 state = AppState()
 
@@ -81,49 +83,89 @@ class CreatePrimitiveParams(BaseModel):
     sharpness_angle: float = 30.0
     symmetry: dict = None
 
+class PreprocessParams(BaseModel):
+    decimation_target: int = 25000
+    sharpening_iters: int = 3
+
 @app.get("/api/logs")
 async def get_logs():
     return {"logs": state.live_logs}
 
+def run_preprocessing_engine(mesh_in, decimation_target=25000, sharpening_iters=3):
+    """Background Task: Decimates and Sharpens geometry."""
+    try:
+        broadcast_log(f"[System] Background: Pre-Processing Engine Started (Target: {decimation_target}, Iters: {sharpening_iters})...")
+        clean_mesh = mesh_in.copy()
+        
+        # 1. Decimation
+        if len(clean_mesh.faces) > decimation_target:
+            try:
+                broadcast_log("[System] Background: Running simplification...")
+                if hasattr(clean_mesh, 'simplify_quadratic_decimation'):
+                    clean_mesh = clean_mesh.simplify_quadratic_decimation(decimation_target)
+                else:
+                    import fast_simplification
+                    v, f = fast_simplification.simplify(clean_mesh.vertices, clean_mesh.faces, target_count=decimation_target)
+                    clean_mesh = trimesh.Trimesh(vertices=v, faces=f)
+            except Exception as e:
+                broadcast_log(f"[Warning] Decimation skipped: {e}")
+
+        # 2. Sharpening
+        if sharpening_iters > 0:
+            try:
+                broadcast_log("[System] Background: Applying feature sharpening...")
+                for _ in range(sharpening_iters):
+                    if hasattr(trimesh.smoothing, 'filter_bilateral'):
+                        clean_mesh = trimesh.smoothing.filter_bilateral(clean_mesh)
+                    else:
+                        clean_mesh = trimesh.smoothing.filter_taubin(clean_mesh)
+            except Exception as e:
+                broadcast_log(f"[Warning] Sharpening filter bypassed: {e}")
+
+        state.cleaned_mesh = clean_mesh
+        broadcast_log(f"[Success] Background: Cleaned Mesh ready for Math! Faces: {len(clean_mesh.faces):,}")
+    except Exception as e:
+        state.cleaned_mesh = mesh_in
+        broadcast_log(f"[Error] Pre-processing crashed, falling back to raw mesh: {e}")
+
+
+@app.post("/preprocess-mesh")
+async def preprocess_mesh(params: PreprocessParams, background_tasks: BackgroundTasks):
+    if state.mesh is None: raise HTTPException(status_code=400)
+    background_tasks.add_task(run_preprocessing_engine, state.mesh, params.decimation_target, params.sharpening_iters)
+    return {"status": "Processing in background"}
+
+
 @app.post("/upload-mesh")
-async def upload_mesh(file: UploadFile = File(...)):
+async def upload_mesh(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     try:
         state.live_logs = [] 
-        state.rebuild_geometry = [] # Clear history on new upload
+        state.rebuild_geometry = [] 
         broadcast_log(f"[System] Receiving {file.filename}...")
         contents = await file.read()
         
-        # Load the mesh
         mesh = trimesh.load(io.BytesIO(contents), file_type='obj', force='mesh')
         
-        # --- THE AGGRESSIVE CAD FIX ---
-        broadcast_log("[System] Running Aggressive CAD Cleanup...")
-        
-        # 1. Round vertices to 4 decimal places to eliminate microscopic CAD export gaps
-        mesh.vertices = np.round(mesh.vertices, decimals=4)
-        
-        # 2. Weld the now-mathematically-identical vertices together
+        # Removed aggressive np.round to preserve surface curvature fidelity
         mesh.merge_vertices()
-        
-        # 3. Clean up any weird zero-area faces created by the merge
         mesh.update_faces(mesh.nondegenerate_faces())
         mesh.remove_unreferenced_vertices()
-        
-        # 4. FIX NORMALS: Ensure all adjacent faces are pointing outwards!
         trimesh.repair.fix_normals(mesh)
         trimesh.repair.fix_inversion(mesh)
-        # ---------------------------------------
         
         state.mesh = mesh
+        state.cleaned_mesh = mesh 
         
-        broadcast_log(f"[Success] Python parsed and welded mesh. Faces: {len(mesh.faces):,}")
+        background_tasks.add_task(run_preprocessing_engine, mesh, 25000, 3)
+        
+        broadcast_log(f"[Success] Python parsed mesh. Faces: {len(mesh.faces):,}")
         return {"message": "Mesh successfully loaded", "faces": len(mesh.faces)}
     except Exception as e:
         broadcast_log(f"[Error] Failed to load mesh: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to load mesh: {str(e)}")
 
+
 def get_patch_components(mesh, sharpness_angle_deg):
-    """Dynamic Real-Time Segmentation based on UI Sharpness Slider"""
     if mesh is None: return []
     threshold_rad = np.radians(sharpness_angle_deg)
     adjacency = mesh.face_adjacency
@@ -131,113 +173,158 @@ def get_patch_components(mesh, sharpness_angle_deg):
     smooth_edges = adjacency[angles < threshold_rad]
     return list(trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces))))
 
-def perform_fitting_race(mesh, target_pt, sharpness_angle):
+
+def perform_fitting_race(target_pt, sharpness_angle):
     import scipy.optimize
     
-    _, _, face_ids = mesh.nearest.on_surface(target_pt)
-    if len(face_ids) == 0:
+    ref_mesh = state.mesh
+    _, _, ref_face_ids = ref_mesh.nearest.on_surface(target_pt)
+    if len(ref_face_ids) == 0:
         raise HTTPException(status_code=404)
-        
-    start_face = face_ids[0]
-    components = get_patch_components(mesh, sharpness_angle)
-    target_region = next((comp for comp in components if start_face in comp), [start_face])
+    start_ref_face = ref_face_ids[0]
+    ref_components = get_patch_components(ref_mesh, sharpness_angle)
+    ref_target_region = next((comp for comp in ref_components if start_ref_face in comp), [start_ref_face])
+    patch_id = f"patch_{min(ref_target_region)}"
+
+    math_mesh = state.cleaned_mesh if state.cleaned_mesh is not None else state.mesh
+    _, _, math_face_ids = math_mesh.nearest.on_surface(target_pt)
+    start_math_face = math_face_ids[0]
+    math_components = get_patch_components(math_mesh, sharpness_angle)
+    math_target_region = next((comp for comp in math_components if start_math_face in comp), [start_math_face])
     
-    # Get unique vertices of the patch
-    patch_verts_idx = np.unique(mesh.faces[target_region])
-    pts = mesh.vertices[patch_verts_idx]
+    patch_verts_idx = np.unique(math_mesh.faces[math_target_region])
+    pts = math_mesh.vertices[patch_verts_idx]
     
     if len(pts) < 4:
-        return {"best_match": "plane", "errors": {"plane": 0, "cylinder": 999, "sphere": 999}, "radius": 0.0, "face_count": len(target_region)}
+        return {"best_match": "plane", "errors": {"plane": 0, "cylinder": 999, "sphere": 999, "cone": 999, "torus": 999}, "radius": 0.0, "face_count": len(ref_target_region), "patch_faces": ref_target_region.tolist(), "id": patch_id}
         
     centroid = np.mean(pts, axis=0)
     
-    # --- 1. THE FITTING RACE ---
-    
-    # Fit Plane
     _, _, vh = np.linalg.svd(pts - centroid)
     normal = vh[2, :]
-    plane_err = float(np.mean(np.abs(np.dot(pts - centroid, normal))))
+    plane_mse = float(np.mean((np.dot(pts - centroid, normal))**2))
     
-    # Fit Sphere
     def sphere_obj(c):
-        r = np.linalg.norm(pts - c, axis=1)
-        return r - np.mean(r)
-    
-    res_sph = scipy.optimize.least_squares(sphere_obj, centroid)
-    r_sph = np.mean(np.linalg.norm(pts - res_sph.x, axis=1))
-    sphere_err = float(np.std(np.linalg.norm(pts - res_sph.x, axis=1)))
-    if r_sph > 10000 or r_sph < 1e-4: 
-        sphere_err = float('inf')
+        return np.linalg.norm(pts - c, axis=1) - np.mean(np.linalg.norm(pts - c, axis=1))
+    try:
+        res_sph = scipy.optimize.least_squares(sphere_obj, centroid)
+        sph_r = np.linalg.norm(pts - res_sph.x, axis=1)
+        sphere_mse = float(np.mean((sph_r - np.mean(sph_r))**2))
+        r_sph = float(np.mean(sph_r))
+        if r_sph > 10000: sphere_mse = float('inf')
+    except:
+        sphere_mse = float('inf')
+        r_sph = 0.0
         
-    # Fit Cylinder
     u = vh[0, :]
     v = vh[1, :]
     p2d = np.column_stack((np.dot(pts - centroid, u), np.dot(pts - centroid, v)))
     def calc_R(c): return np.sqrt((p2d[:, 0] - c[0])**2 + (p2d[:, 1] - c[1])**2)
-    def cyl_obj(c): Ri = calc_R(c); return Ri - Ri.mean()
+    def cyl_obj(c): return calc_R(c) - np.mean(calc_R(c))
     
-    c2d_guess = np.mean(p2d, axis=0)
-    res_cyl = scipy.optimize.least_squares(cyl_obj, c2d_guess)
-    radii = calc_R(res_cyl.x)
-    r_cyl = np.mean(radii)
-    cyl_err = float(np.std(radii))
-    
-    # Hallucination Firewall
-    max_allowed_radius = max(100.0, np.ptp(pts)*10)
-    if r_cyl > max_allowed_radius or r_cyl < 1e-4:
-        cyl_err = float('inf')
+    try:
+        c2d_guess = np.mean(p2d, axis=0)
+        res_cyl = scipy.optimize.least_squares(cyl_obj, c2d_guess)
+        radii = calc_R(res_cyl.x)
+        cyl_mse = float(np.mean((radii - np.mean(radii))**2))
+        r_cyl = np.mean(radii)
+        if r_cyl > max(100.0, np.ptp(pts)*10) or r_cyl < 1e-4: cyl_mse = float('inf')
+    except:
+        cyl_mse = float('inf')
+        r_cyl = 0.0
+
+    def cone_obj(c):
+        apex, axis, theta = c[0:3], c[3:6], c[6]
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm < 1e-5: return np.ones(len(pts))*999
+        axis = axis / axis_norm
+        vec = pts - apex
+        h = np.dot(vec, axis)
+        r_vec = np.linalg.norm(np.cross(vec, axis), axis=1)
+        return r_vec * np.cos(theta) - h * np.sin(theta)
+        
+    try:
+        apex_guess = centroid + normal * np.ptp(pts)
+        res_cone = scipy.optimize.least_squares(cone_obj, [*apex_guess, *normal, np.pi/4])
+        cone_mse = float(np.mean((cone_obj(res_cone.x))**2))
+    except:
+        cone_mse = float('inf')
+
+    def torus_obj(c):
+        center, axis, R, r_min = c[0:3], c[3:6], c[6], c[7]
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm < 1e-5: return np.ones(len(pts))*999
+        axis = axis / axis_norm
+        vec = pts - center
+        z = np.dot(vec, axis)
+        d_xy = np.linalg.norm(vec - np.outer(z, axis), axis=1)
+        return np.sqrt((d_xy - R)**2 + z**2) - r_min
+
+    try:
+        res_torus = scipy.optimize.least_squares(torus_obj, [*centroid, *normal, np.ptp(pts)/2, np.ptp(pts)/10])
+        torus_mse = float(np.mean((torus_obj(res_torus.x))**2))
+    except:
+        torus_mse = float('inf')
         
     errors = {
-        "plane": plane_err,
-        "cylinder": cyl_err,
-        "sphere": sphere_err
+        "plane": plane_mse,
+        "cylinder": cyl_mse,
+        "sphere": sphere_mse,
+        "cone": cone_mse,
+        "torus": torus_mse
     }
-    
-    # --- 2. GAUSSIAN CURVATURE CLASSIFICATION ---
+
     try:
         calc_radius = max(np.ptp(pts, axis=0).max() * 0.15, 1e-3)
-        gaussian_curv = trimesh.curvature.discrete_gaussian_curvature_measure(mesh, pts, calc_radius)
-        mean_curv = trimesh.curvature.discrete_mean_curvature_measure(mesh, pts, calc_radius)
+        gaussian_curv = trimesh.curvature.discrete_gaussian_curvature_measure(math_mesh, pts, calc_radius)
+        mean_curv = trimesh.curvature.discrete_mean_curvature_measure(math_mesh, pts, calc_radius)
 
         avg_gauss = float(np.mean(np.abs(gaussian_curv)))
         avg_mean = float(np.mean(np.abs(mean_curv)))
-        std_gauss = float(np.std(gaussian_curv))
 
-        gauss_zero_tol = 0.05
-        mean_high_tol = 0.05
+        gauss_zero_tol, mean_high_tol = 0.05, 0.05
 
         if avg_gauss < gauss_zero_tol and avg_mean < mean_high_tol:
             best_match = "plane"
         elif avg_gauss < gauss_zero_tol and avg_mean >= mean_high_tol:
-            best_match = "cylinder"
-        elif avg_gauss >= gauss_zero_tol and std_gauss < (avg_gauss * 1.5):
-            best_match = "sphere"
+            best_match = "cylinder" if cyl_mse < cone_mse else "cone"
+        elif avg_gauss >= gauss_zero_tol:
+            best_match = "sphere" if sphere_mse < torus_mse else "torus"
         else:
-            best_match = min(errors, key=errors.get) # Fallback to strict error race
-    except Exception as e:
-        broadcast_log(f"[Warning] Curvature analysis failed: {str(e)}")
+            best_match = min(errors, key=errors.get)
+    except:
         best_match = min(errors, key=errors.get)
+
+    strict_best = min(errors, key=errors.get)
+    if errors[best_match] > errors[strict_best] * 3.0:
+        best_match = strict_best
+
+    if min(errors.values()) > 0.5: 
+        best_match = 'B-Spline'
 
     return {
         "best_match": best_match,
         "errors": errors,
         "radius": float(r_cyl) if best_match == 'cylinder' else float(r_sph) if best_match == 'sphere' else 0.0,
-        "face_count": len(target_region)
+        "face_count": len(ref_target_region),
+        "patch_faces": ref_target_region.tolist(),
+        "id": patch_id
     }
+
 
 @app.post("/classify-patch")
 async def classify_patch(params: ClassifyParams):
     if state.mesh is None:
         raise HTTPException(status_code=400, detail="No mesh loaded.")
     target_pt = np.array([[params.x, params.y, params.z]])
-    return perform_fitting_race(state.mesh, target_pt, params.sharpness_angle)
+    return perform_fitting_race(target_pt, params.sharpness_angle)
 
 @app.post("/analyze-surface")
 async def analyze_surface(params: Point3D):
     if state.mesh is None:
         raise HTTPException(status_code=400, detail="No mesh loaded.")
     target_pt = np.array([[params.x, params.y, params.z]])
-    return perform_fitting_race(state.mesh, target_pt, params.sharpness_angle)
+    return perform_fitting_race(target_pt, params.sharpness_angle)
 
 @app.post("/scout-loop")
 async def scout_loop(params: Point3D):
@@ -246,17 +333,24 @@ async def scout_loop(params: Point3D):
         
     try:
         import networkx as nx
-        mesh = state.mesh
         target_pt = np.array([[params.x, params.y, params.z]])
         
-        _, _, face_ids = mesh.nearest.on_surface(target_pt)
-        if len(face_ids) == 0: raise HTTPException(status_code=404)
+        ref_mesh = state.mesh
+        _, _, ref_face_ids = ref_mesh.nearest.on_surface(target_pt)
+        if len(ref_face_ids) == 0: raise HTTPException(status_code=404)
+        start_ref_face = ref_face_ids[0]
+        ref_components = get_patch_components(ref_mesh, params.sharpness_angle)
+        ref_target_region = next((comp for comp in ref_components if start_ref_face in comp), [start_ref_face])
+        patch_id = f"patch_{min(ref_target_region)}"
+
+        math_mesh = state.cleaned_mesh if state.cleaned_mesh is not None else state.mesh
+        _, _, math_face_ids = math_mesh.nearest.on_surface(target_pt)
+        if len(math_face_ids) == 0: raise HTTPException(status_code=404)
+        start_math_face = math_face_ids[0]
+        math_components = get_patch_components(math_mesh, params.sharpness_angle)
+        math_target_region = next((comp for comp in math_components if start_math_face in comp), [start_math_face])
         
-        start_face = face_ids[0]
-        components = get_patch_components(mesh, params.sharpness_angle)
-        target_region = next((comp for comp in components if start_face in comp), [start_face])
-        
-        faces = mesh.faces[target_region]
+        faces = math_mesh.faces[math_target_region]
         edges = trimesh.geometry.faces_to_edges(faces)
         edges_sorted = np.sort(edges, axis=1)
         unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
@@ -273,7 +367,7 @@ async def scout_loop(params: Point3D):
         best_subgraph = None
         
         for loop in loops:
-            loop_verts = mesh.vertices[list(loop)]
+            loop_verts = math_mesh.vertices[list(loop)]
             dist = np.min(np.linalg.norm(loop_verts - target_pt, axis=1))
             if dist < min_dist:
                 min_dist = dist
@@ -286,14 +380,13 @@ async def scout_loop(params: Point3D):
         except:
             ordered_nodes = list(nx.dfs_preorder_nodes(best_subgraph))
             
-        ordered_points = mesh.vertices[ordered_nodes]
-        patch_id = f"patch_{min(target_region)}"
+        ordered_points = math_mesh.vertices[ordered_nodes]
         
         return {
             "id": patch_id,
             "type": "planar",
             "points": ordered_points.tolist(),
-            "patch_faces": target_region.tolist()
+            "patch_faces": ref_target_region.tolist() 
         }
     except Exception as e:
         raise HTTPException(status_code=500)
@@ -307,11 +400,10 @@ async def undo_geometry():
     return {"success": False, "message": "Nothing to undo."}
 
 def apply_pca_firewall(points):
-    """PLANAR FIREWALL: Best-fit plane projection via SVD"""
     pts = np.array(points)
     centroid = np.mean(pts, axis=0)
     _, _, vh = np.linalg.svd(pts - centroid)
-    normal = vh[2, :] # normal vector is the last row of Vh
+    normal = vh[2, :]
     proj_pts = []
     for p in pts:
         dist = np.dot(p - centroid, normal)
@@ -319,27 +411,18 @@ def apply_pca_firewall(points):
     return proj_pts
 
 def resample_loop(points, target_count=100):
-    """Uniformly resamples a 3D loop using linear interpolation to standardize vertex counts."""
     pts = np.array(points)
-    if len(pts) < 2:
-        return points
-    
+    if len(pts) < 2: return points
     diffs = np.diff(pts, axis=0)
     diffs = np.vstack([diffs, pts[0] - pts[-1]])
-    
     dists = np.linalg.norm(diffs, axis=1)
     cum_dists = np.insert(np.cumsum(dists), 0, 0)
     total_len = cum_dists[-1]
-    
-    if total_len == 0:
-        return points
-    
+    if total_len == 0: return points
     target_dists = np.linspace(0, total_len, target_count, endpoint=False)
     resampled = np.zeros((target_count, 3))
-    
     for i in range(3):
         resampled[:, i] = np.interp(target_dists, cum_dists, np.append(pts[:, i], pts[0, i]))
-        
     return resampled.tolist()
 
 @app.post("/create-primitive")
@@ -352,34 +435,40 @@ async def create_primitive(params: CreatePrimitiveParams):
         raise HTTPException(status_code=500, detail="build123d missing")
 
     broadcast_log(f"[System] Committing {params.primitive_type.upper()} primitive to Stack...")
-    mesh = state.mesh
-    if not mesh:
+    
+    math_mesh = state.cleaned_mesh if state.cleaned_mesh is not None else state.mesh
+    if not math_mesh:
         raise HTTPException(status_code=400, detail="No mesh loaded.")
 
     try:
         patch_faces = params.patch_faces
-        patch_verts_idx = np.unique(mesh.faces[patch_faces])
-        pts = mesh.vertices[patch_verts_idx]
+        ref_mesh = state.mesh
+        ref_verts = ref_mesh.vertices[np.unique(ref_mesh.faces[patch_faces])]
+        target_pt = np.mean(ref_verts, axis=0).reshape(1, 3)
+        
+        _, _, math_face_ids = math_mesh.nearest.on_surface(target_pt)
+        start_math_face = math_face_ids[0]
+        math_components = get_patch_components(math_mesh, params.sharpness_angle)
+        math_target_region = next((comp for comp in math_components if start_math_face in comp), [start_math_face])
+        
+        patch_verts_idx = np.unique(math_mesh.faces[math_target_region])
+        pts = math_mesh.vertices[patch_verts_idx]
         
         solid = None
         
         if params.primitive_type == 'cylinder':
-            # Use normals to find the main cylinder axis safely
-            region_normals = mesh.face_normals[patch_faces]
+            region_normals = math_mesh.face_normals[math_target_region]
             cov_normals = np.cov(region_normals.T)
             evals, evecs = np.linalg.eigh(cov_normals)
-            axis = evecs[:, 0] # direction of least normal variance is the axis
+            axis = evecs[:, 0]
             
-            if np.abs(axis[0]) < 0.9:
-                u = np.cross(axis, [1, 0, 0])
-            else:
-                u = np.cross(axis, [0, 1, 0])
+            if np.abs(axis[0]) < 0.9: u = np.cross(axis, [1, 0, 0])
+            else: u = np.cross(axis, [0, 1, 0])
             u = u / np.linalg.norm(u)
             v = np.cross(axis, u)
             
             centroid = np.mean(pts, axis=0)
             p2d = np.column_stack((np.dot(pts - centroid, u), np.dot(pts - centroid, v)))
-            
             def calc_R(c): return np.sqrt((p2d[:, 0] - c[0])**2 + (p2d[:, 1] - c[1])**2)
             def cyl_obj(c): Ri = calc_R(c); return Ri - Ri.mean()
             
@@ -388,11 +477,10 @@ async def create_primitive(params: CreatePrimitiveParams):
             center_2d = res_cyl.x
             radius = float(np.mean(calc_R(center_2d)))
             
-            # Find bounds along the axis to set height
             center_3d = centroid + center_2d[0]*u + center_2d[1]*v
             h_vals = np.dot(pts - center_3d, axis)
             h_min, h_max = np.min(h_vals), np.max(h_vals)
-            height = float((h_max - h_min) * 1.2) # Extended by 20% for easy boolean clipping
+            height = float(h_max - h_min) # Removed 1.2 overshoot for clean fit
             
             midpoint = center_3d + axis * (h_max + h_min) / 2.0
             loc = b3d.Plane(origin=b3d.Vector(midpoint), z_dir=b3d.Vector(axis)).location
@@ -408,8 +496,65 @@ async def create_primitive(params: CreatePrimitiveParams):
             loc = b3d.Location(b3d.Vector(res_sph.x))
             solid = loc * b3d.Sphere(radius=r_sph)
 
+        elif params.primitive_type == 'cone':
+            def cone_obj(c):
+                apex, axis, theta = c[0:3], c[3:6], c[6]
+                axis_norm = np.linalg.norm(axis)
+                if axis_norm < 1e-5: return np.ones(len(pts))*999
+                axis = axis / axis_norm
+                vec = pts - apex
+                h = np.dot(vec, axis)
+                r_vec = np.linalg.norm(np.cross(vec, axis), axis=1)
+                return r_vec * np.cos(theta) - h * np.sin(theta)
+                
+            centroid = np.mean(pts, axis=0)
+            _, _, vh = np.linalg.svd(pts - centroid)
+            normal = vh[2, :]
+            apex_guess = centroid + normal * np.ptp(pts)
+            try:
+                res_cone = scipy.optimize.least_squares(cone_obj, [*apex_guess, *normal, np.pi/4])
+                apex, axis, theta = res_cone.x[0:3], res_cone.x[3:6], res_cone.x[6]
+                axis = axis / np.linalg.norm(axis)
+                theta = abs(theta)
+                
+                h_vals = np.dot(pts - apex, axis)
+                h_min, h_max = min(h_vals), max(h_vals)
+                
+                h_cone = max(abs(h_min), abs(h_max)) # Removed 1.2 overshoot
+                r_base = h_cone * np.tan(theta)
+                
+                base_center = apex - axis * h_cone
+                loc = b3d.Plane(origin=b3d.Vector(base_center), z_dir=b3d.Vector(axis)).location
+                solid = loc * b3d.Cone(bottom_radius=abs(r_base), top_radius=0, height=h_cone)
+            except Exception as e:
+                raise ValueError(f"Cone fitting failed: {e}")
+
+        elif params.primitive_type == 'torus':
+            def torus_obj(c):
+                center, axis, R, r_min = c[0:3], c[3:6], c[6], c[7]
+                axis_norm = np.linalg.norm(axis)
+                if axis_norm < 1e-5: return np.ones(len(pts))*999
+                axis = axis / axis_norm
+                vec = pts - center
+                z = np.dot(vec, axis)
+                d_xy = np.linalg.norm(vec - np.outer(z, axis), axis=1)
+                return np.sqrt((d_xy - R)**2 + z**2) - r_min
+
+            centroid = np.mean(pts, axis=0)
+            _, _, vh = np.linalg.svd(pts - centroid)
+            normal = vh[2, :]
+            try:
+                res_torus = scipy.optimize.least_squares(torus_obj, [*centroid, *normal, np.ptp(pts)/2, np.ptp(pts)/10])
+                center, axis, R, r_min = res_torus.x[0:3], res_torus.x[3:6], res_torus.x[6], res_torus.x[7]
+                axis = axis / np.linalg.norm(axis)
+                
+                loc = b3d.Plane(origin=b3d.Vector(center), z_dir=b3d.Vector(axis)).location
+                solid = loc * b3d.Torus(major_radius=abs(R), minor_radius=abs(r_min))
+            except Exception as e:
+                raise ValueError(f"Torus fitting failed: {e}")
+
         elif params.primitive_type == 'plane':
-            faces = mesh.faces[patch_faces]
+            faces = math_mesh.faces[math_target_region]
             edges = trimesh.geometry.faces_to_edges(faces)
             edges_sorted = np.sort(edges, axis=1)
             unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
@@ -426,7 +571,7 @@ async def create_primitive(params: CreatePrimitiveParams):
             except:
                 ordered_nodes = list(nx.dfs_preorder_nodes(subgraph))
                 
-            ordered_points = mesh.vertices[ordered_nodes]
+            ordered_points = math_mesh.vertices[ordered_nodes]
             processed_loop = apply_pca_firewall(ordered_points)
             
             pts_vec = [b3d.Vector(p) for p in processed_loop]
@@ -657,26 +802,32 @@ async def extract_feature(params: FeatureParams):
     except ImportError:
         raise HTTPException(status_code=500, detail="Missing libraries.")
 
-    mesh = state.mesh
     target_pt = np.array([[params.x, params.y, params.z]])
     
-    closest_points, distances, face_ids = mesh.nearest.on_surface(target_pt)
-    if len(face_ids) == 0:
+    # 1. Visuals
+    ref_mesh = state.mesh
+    _, _, ref_face_ids = ref_mesh.nearest.on_surface(target_pt)
+    if len(ref_face_ids) == 0:
         raise HTTPException(status_code=404, detail="Could not snap to a face.")
-        
-    start_face = face_ids[0]
-    components = get_patch_components(mesh, params.sharpness_angle)
-    target_region = next((comp for comp in components if start_face in comp), [start_face])
+    start_ref_face = ref_face_ids[0]
+    ref_components = get_patch_components(ref_mesh, params.sharpness_angle)
+    ref_target_region = next((comp for comp in ref_components if start_ref_face in comp), [start_ref_face])
+    patch_id = f"patch_{min(ref_target_region)}"
+
+    # 2. Math
+    math_mesh = state.cleaned_mesh if state.cleaned_mesh is not None else state.mesh
+    _, _, math_face_ids = math_mesh.nearest.on_surface(target_pt)
+    start_math_face = math_face_ids[0]
+    math_components = get_patch_components(math_mesh, params.sharpness_angle)
+    math_target_region = next((comp for comp in math_components if start_math_face in comp), [start_math_face])
     
-    patch_id = f"patch_{min(target_region)}"
-    
-    region_normals = mesh.face_normals[target_region]
+    region_normals = math_mesh.face_normals[math_target_region]
     region_normal = np.mean(region_normals, axis=0)
     
     variance = np.var(region_normals, axis=0).sum()
     is_planar = variance < 1e-2
 
-    faces = mesh.faces[target_region]
+    faces = math_mesh.faces[math_target_region]
     edges = trimesh.geometry.faces_to_edges(faces)
     edges_sorted = np.sort(edges, axis=1)
     unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
@@ -694,7 +845,7 @@ async def extract_feature(params: FeatureParams):
     best_subgraph = None
     
     for loop in loops:
-        loop_verts = mesh.vertices[list(loop)]
+        loop_verts = math_mesh.vertices[list(loop)]
         dist = np.min(np.linalg.norm(loop_verts - target_pt, axis=1))
         if dist < min_dist:
             min_dist = dist
@@ -703,7 +854,7 @@ async def extract_feature(params: FeatureParams):
 
     is_circle = False
     if not is_planar:
-        loop_points = mesh.vertices[best_loop_nodes]
+        loop_points = math_mesh.vertices[best_loop_nodes]
         if len(loop_points) >= 3:
             try:
                 center_guess = np.mean(loop_points, axis=0)
@@ -734,7 +885,9 @@ async def extract_feature(params: FeatureParams):
                         "type": "circle",
                         "center": center_3d.tolist(),
                         "radius": radius,
-                        "normal": normal.tolist()
+                        "normal": normal.tolist(),
+                        "patch_faces": ref_target_region.tolist(),
+                        "id": patch_id
                     }
             except:
                 pass
@@ -747,11 +900,13 @@ async def extract_feature(params: FeatureParams):
             except:
                 ordered_nodes = list(nx.dfs_preorder_nodes(best_subgraph))
                 
-            ordered_points = mesh.vertices[ordered_nodes]
+            ordered_points = math_mesh.vertices[ordered_nodes]
             return {
                 "type": "planar",
                 "points": ordered_points.tolist(),
-                "normal": region_normal.tolist()
+                "normal": region_normal.tolist(),
+                "patch_faces": ref_target_region.tolist(),
+                "id": patch_id
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail="Failed to trace shape boundary.")

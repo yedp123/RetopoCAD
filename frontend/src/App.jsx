@@ -13,21 +13,17 @@ const IconEyeOff = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="n
 const IconSquare = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect></svg>;
 const IconCylinderOutline = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 6c0 1.657 3.582 3 8 3s8-1.343 8-3M4 6c0-1.657 3.582-3 8-3s8 1.343 8 3m-16 0v12c0 1.657 3.582 3 8 3s8-1.343 8-3V6"></path></svg>;
 const IconSphere = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path><path d="M2 12h20"></path></svg>;
+const IconCone = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2L2 20h20L12 2z"></path></svg>;
+const IconTorus = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="4"></circle></svg>;
 const IconWave = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 12c-2.66 0-4.33-3-7-3s-4.34 3-7 3-4.33-3-7-3"></path></svg>;
 const IconTrash = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>;
 
-function CompactSymmetryToggle({ label, active, onClick, colorClass }) {
-  return (
-    <button onClick={onClick} className={`flex items-center justify-between w-full px-3 py-1.5 rounded transition-colors ${active ? 'bg-zinc-700/50 text-white' : 'hover:bg-zinc-800/50 text-zinc-400 hover:text-zinc-200'}`}>
-      <span className="font-medium text-[10px] uppercase tracking-wider">{label}</span>
-      <div className={`w-6 h-3 rounded-full relative transition-colors ${active ? colorClass : 'bg-zinc-800'}`}>
-        <div className={`absolute top-0.5 left-0.5 w-2 h-2 rounded-full bg-white transition-transform ${active ? 'translate-x-3' : ''}`}></div>
-      </div>
-    </button>
-  );
-}
+const applySnap = (value, snapThreshold) => {
+    if (!snapThreshold || snapThreshold <= 0) return value;
+    return Math.round(value / snapThreshold) * snapThreshold;
+};
 
-function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive }) {
+function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive, linearSnap }) {
   const [pos, setPos] = useState({ x: -1000, y: -1000 });
   const isEditingExtrude = selectedItemData?.payload?.operation === 'extrude';
   const [localDepth, setLocalDepth] = useState(extrudeDepth);
@@ -45,14 +41,15 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
     const offset = 120;
     const ringSize = 135; 
 
-    let targetX = anchorPos.x + offset;
+    // Slide ring right so it Breathes and doesn't overlap gizmos!
+    let targetX = anchorPos.x + offset + (selectedItemData ? 160 : 0);
     let targetY = anchorPos.y + offset;
 
-    if (targetX + ringSize > window.innerWidth) targetX = anchorPos.x - offset; 
+    if (targetX + ringSize > window.innerWidth) targetX = anchorPos.x - offset - (selectedItemData ? 160 : 0); 
     if (targetY + ringSize > window.innerHeight) targetY = anchorPos.y - offset;
 
     setPos({ x: targetX, y: targetY });
-  }, [anchorPos]);
+  }, [anchorPos, selectedItemData]);
 
   if ((!selectedLoops || selectedLoops.length === 0) && !selectedItemData) return null;
 
@@ -74,12 +71,10 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
   const buttons = [];
   const outerButtons = [];
 
-  // Inner tools
   if (selectedLoops.length > 0) {
       buttons.push({ label: extrudeLabel, icon: isCylinderLoop ? <IconCylinderFill /> : <IconExtrude />, angle: -90, action: onExtrude, disabled: selectedLoops.length !== 1, color: 'text-blue-400' });
       buttons.push({ label: 'Loft', icon: <IconLoft />, angle: 0, action: onLoft, disabled: selectedLoops.length !== 2, color: 'text-blue-400' });
       
-      // Dynamic Sheet / Create Primitive button
       if (patchAnalysis) {
           buttons.push({ label: 'Create\nPrimitive', icon: <IconExtrude />, angle: 90, action: onCreatePrimitive, disabled: false, color: 'text-emerald-400' });
       } else {
@@ -98,7 +93,6 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
       buttons.push({ label: 'Cut', icon: <IconCut />, angle: -45, action: onCut, disabled: true, color: 'text-orange-400' });
   }
 
-  // Outer tools
   if (selectedLoops.length > 0 || selectedItemData) {
       outerButtons.push({ label: 'Delete', icon: <IconTrash />, angle: -45, action: onDeleteItem, disabled: !selectedItemData, color: 'text-red-500' });
       outerButtons.push({ label: 'Clear\nSelection', icon: <IconClear />, angle: 45, action: onClear, disabled: false, color: 'text-zinc-400' });
@@ -107,7 +101,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
   return (
     <div style={{ left: pos.x, top: pos.y }} className="fixed pointer-events-none z-50 flex items-center justify-center -translate-x-1/2 -translate-y-1/2 transition-all duration-200">
        
-       <div className="absolute bottom-[130px] flex flex-col items-center gap-1.5 pointer-events-none w-64 text-center">
+       <div className="absolute bottom-[130px] flex flex-col items-center gap-1.5 pointer-events-none w-80 text-center">
           {selectionString && (
             <span className={`font-black px-3 py-1 rounded text-[10px] uppercase tracking-widest ${isEditingExtrude ? 'bg-amber-600 text-white border border-amber-500 shadow-[0_0_15px_rgba(217,119,6,0.5)]' : 'bg-amber-500 text-zinc-950 border border-amber-400 shadow-[0_0_15px_rgba(245,158,11,0.3)]'}`}>
               {selectionString}
@@ -123,6 +117,8 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
                    <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'plane'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'plane' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Plane"><IconSquare /></button>
                    <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'cylinder'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'cylinder' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Cylinder"><IconCylinderOutline /></button>
                    <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'sphere'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'sphere' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Sphere"><IconSphere /></button>
+                   <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'cone'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'cone' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Cone"><IconCone /></button>
+                   <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'torus'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'torus' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Torus"><IconTorus /></button>
                 </div>
              </div>
           )}
@@ -130,7 +126,10 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
 
        <div className="absolute w-[160px] h-[160px] rounded-full border border-zinc-600/30 bg-zinc-900/40 backdrop-blur-md animate-in zoom-in duration-150 pointer-events-none" />
        
-       <div className={`absolute pointer-events-auto flex flex-col items-center justify-center w-14 h-14 rounded-full border shadow-xl backdrop-blur-md animate-in zoom-in transition-colors ${isEditingExtrude ? 'bg-zinc-800/95 border-amber-500/50' : 'bg-zinc-800/90 border-zinc-600'}`}>
+       <div 
+          onPointerDown={(e) => e.stopPropagation()}
+          className={`absolute pointer-events-auto flex flex-col items-center justify-center w-14 h-14 rounded-full border shadow-xl backdrop-blur-md animate-in zoom-in transition-colors ${isEditingExtrude ? 'bg-zinc-800/95 border-amber-500/50' : 'bg-zinc-800/90 border-zinc-600'}`}
+       >
          {isCylinderLoop && (
              <span className="text-[7.5px] font-black uppercase text-emerald-400 tracking-tighter leading-none mb-1">R: {selectedLoops[0].radius.toFixed(2)}</span>
          )}
@@ -140,19 +139,21 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
            value={localDepth} 
            onChange={(e) => setLocalDepth(parseFloat(e.target.value) || 0)}
            onBlur={(e) => {
+               const snappedVal = applySnap(parseFloat(e.target.value) || 0, linearSnap);
+               setLocalDepth(snappedVal);
                if (isEditingExtrude) {
-                   if (localDepth !== selectedItemData.payload.extrude_depth) {
-                       onUpdateDepth(selectedItemData.id, localDepth);
+                   if (snappedVal !== selectedItemData.payload.extrude_depth) {
+                       onUpdateDepth(selectedItemData.id, snappedVal);
                    }
                } else {
-                   setExtrudeDepth(localDepth);
+                   setExtrudeDepth(snappedVal);
                }
            }}
            onKeyDown={(e) => {
                if (e.key === 'Enter') e.target.blur();
            }}
            className={`w-10 bg-transparent text-center text-[10px] font-mono outline-none focus:bg-zinc-700/50 rounded transition-colors ${isEditingExtrude ? 'text-amber-400 font-bold' : 'text-white'}`}
-           step="0.5"
+           step={linearSnap > 0 ? linearSnap : 0.5}
          />
        </div>
 
@@ -207,6 +208,12 @@ export default function App() {
   const [cursorScale, setCursorScale] = useState(0.005); 
   const [sharpnessAngle, setSharpnessAngle] = useState(30);
   
+  const [decimationTarget, setDecimationTarget] = useState(25000);
+  const [sharpeningIters, setSharpeningIters] = useState(3);
+  const [linearSnap, setLinearSnap] = useState(0); 
+  const [angleSnap, setAngleSnap] = useState(0); 
+  
+  const [transformMode, setTransformMode] = useState(null);
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 }); 
   const [menuAnchor, setMenuAnchor] = useState({ x: 0, y: 0 });
   
@@ -265,24 +272,52 @@ export default function App() {
     setHistoryIndex(newHistory.length - 1);
   };
 
-  const handleUndo = () => { if (historyIndex > 0) setHistoryIndex(historyIndex - 1); };
-  const handleRedo = () => { if (historyIndex < featuresHistory.length - 1) setHistoryIndex(historyIndex + 1); };
+  // Unified global Undo/Redo logic handling both Geometry operations and extracted Curves
+  const handleGlobalUndo = async () => {
+    if (rebuildHistory.length > 0) {
+        try {
+            const res = await fetch('http://localhost:8000/undo-geometry', { method: 'POST' });
+            if (res.ok) {
+                setRebuildHistory(prev => prev.slice(0, -1));
+                setSelectedItemId(null);
+            }
+        } catch (err) { console.error(err); }
+    } else if (historyIndex > 0) {
+        setHistoryIndex(prev => prev - 1);
+    }
+  };
+
+  const handleGlobalRedo = () => {
+    if (historyIndex < featuresHistory.length - 1) {
+        setHistoryIndex(prev => prev + 1);
+    }
+  };
 
   useEffect(() => {
     const handleKeyDown = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+      
+      const key = e.key.toLowerCase();
+      // CAD Hotkeys (Q, W, E, R)
+      if (key === 'q') setTransformMode(null);
+      if (key === 'w') setTransformMode('translate');
+      if (key === 'e') setTransformMode('rotate');
+      if (key === 'r') setTransformMode('scale');
+
+      // Undo/Redo Hotkeys
       if (e.ctrlKey || e.metaKey) {
-        if (e.key.toLowerCase() === 'z') {
+        if (key === 'z') {
           e.preventDefault();
-          if (historyIndex > 0) setHistoryIndex(prev => prev - 1);
-        } else if (e.key.toLowerCase() === 'y') {
+          handleGlobalUndo();
+        } else if (key === 'y') {
           e.preventDefault();
-          if (historyIndex < featuresHistory.length - 1) setHistoryIndex(prev => prev + 1);
+          handleGlobalRedo();
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [historyIndex, featuresHistory.length]);
+  }, [historyIndex, featuresHistory.length, rebuildHistory]);
 
   const handleDeleteFeature = (id) => {
     const filtered = currentFeatures.filter(f => f.id !== id);
@@ -441,7 +476,7 @@ export default function App() {
 
   const toggleItemVisibility = (id) => {
     setRebuildHistory(prev => prev.map(geo => 
-      geo.id === id ? { ...geo, visible: geo.visible === false ? true : false } : geo
+      geo.id === id ? { ...geo, visible: geo.visible === false ? true : geo.visible !== false ? false : true } : geo
     ));
   };
 
@@ -580,6 +615,19 @@ export default function App() {
     setSelectedItemId(null);
   };
 
+  const applyPreprocessing = async () => {
+    try {
+      setServerLogs(prev => [...prev, `[System] Updating Pre-Processing settings...`]);
+      await fetch('http://localhost:8000/preprocess-mesh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decimation_target: decimationTarget, sharpening_iters: sharpeningIters })
+      });
+    } catch (err) {
+      setServerLogs(prev => [...prev, `[Error] Failed to connect to backend for preprocessing.`]);
+    }
+  };
+
   const handleFileUpload = async (event) => {
     const file = event.target.files[0];
     if (!file || !file.name.toLowerCase().endsWith('.obj')) return;
@@ -615,7 +663,7 @@ export default function App() {
   const handleSaveProject = () => {
     const projectData = {
       features: currentFeatures, rebuildHistory,
-      settings: { minFeatureSize, symmetry, mergeExportHulls, cursorScale, sharpnessAngle }
+      settings: { minFeatureSize, symmetry, mergeExportHulls, cursorScale, sharpnessAngle, decimationTarget, sharpeningIters, linearSnap, angleSnap }
     };
     const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -642,6 +690,10 @@ export default function App() {
           if (data.settings.mergeExportHulls !== undefined) setMergeExportHulls(data.settings.mergeExportHulls);
           if (data.settings.cursorScale) setCursorScale(data.settings.cursorScale);
           if (data.settings.sharpnessAngle) setSharpnessAngle(data.settings.sharpnessAngle);
+          if (data.settings.decimationTarget) setDecimationTarget(data.settings.decimationTarget);
+          if (data.settings.sharpeningIters !== undefined) setSharpeningIters(data.settings.sharpeningIters);
+          if (data.settings.linearSnap !== undefined) setLinearSnap(data.settings.linearSnap);
+          if (data.settings.angleSnap !== undefined) setAngleSnap(data.settings.angleSnap);
         }
       } catch (err) { console.error(err); }
     };
@@ -711,6 +763,7 @@ export default function App() {
         patchAnalysis={patchAnalysis}
         setPatchAnalysis={setPatchAnalysis}
         onCreatePrimitive={handleCreatePrimitive}
+        linearSnap={linearSnap}
       />
 
       {/* LEFT COLUMN: OUTLINER */}
@@ -921,9 +974,19 @@ export default function App() {
             showCurvesFolder={showCurvesFolder}
             hiddenCurveIds={hiddenCurveIds}
             sharpnessAngle={sharpnessAngle}
+            linearSnap={linearSnap}
+            setLinearSnap={setLinearSnap}
+            angleSnap={angleSnap}
+            setAngleSnap={setAngleSnap}
+            toggleSymmetry={toggleSymmetry}
+            transformMode={transformMode}
+            setTransformMode={setTransformMode}
           />
 
-          <div className="absolute top-4 left-4 flex flex-col gap-1.5 z-10 items-start">
+          <div 
+             onPointerDown={(e) => e.stopPropagation()} 
+             className="absolute top-4 left-4 flex flex-col gap-1.5 z-10 items-start pointer-events-auto"
+          >
             <div className="flex gap-2">
               <button onClick={() => setShowMesh(!showMesh)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showMesh ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
@@ -931,19 +994,19 @@ export default function App() {
               </button>
 
               <button onClick={() => setShowWireframe(!showWireframe)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showWireframe ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>
                 <span className="text-xs font-semibold">Wireframe</span>
               </button>
             </div>
             
             {showMesh && (
               <div className="flex gap-2">
-                <div className="flex items-center gap-3 px-3 py-1.5 bg-zinc-900/80 border border-zinc-800 rounded-md shadow-lg backdrop-blur-md pointer-events-auto">
+                <div className="flex items-center gap-3 px-3 py-1.5 bg-zinc-900/80 border border-zinc-800 rounded-md shadow-lg backdrop-blur-md">
                   <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wide">Opacity</span>
                   <input type="range" min="0" max="1" step="0.05" value={meshOpacity} onChange={(e) => setMeshOpacity(parseFloat(e.target.value))} className="w-20 accent-zinc-300 h-1" />
                 </div>
                 
-                <div className="flex items-center gap-3 px-3 py-1.5 bg-zinc-900/80 border border-zinc-800 rounded-md shadow-lg backdrop-blur-md pointer-events-auto">
+                <div className="flex items-center gap-3 px-3 py-1.5 bg-zinc-900/80 border border-zinc-800 rounded-md shadow-lg backdrop-blur-md">
                   <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wide">Cursor</span>
                   <input type="range" min="0.005" max="0.05" step="0.001" value={cursorScale} onChange={(e) => setCursorScale(parseFloat(e.target.value))} className="w-16 accent-zinc-300 h-1" />
                 </div>
@@ -951,21 +1014,16 @@ export default function App() {
             )}
           </div>
 
-          {/* DEDICATED UNDO/REDO BUTTONS */}
-          <div className="absolute bottom-4 left-4 flex gap-2 z-10 pointer-events-auto">
-            <button title="Undo Curve Action (Ctrl+Z)" onClick={handleUndo} disabled={historyIndex === 0} className="p-2.5 rounded-md bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed shadow-lg transition-all">
+          <div 
+             onPointerDown={(e) => e.stopPropagation()} 
+             className="absolute bottom-4 left-4 flex gap-2 z-10 pointer-events-auto"
+          >
+            <button title="Undo Solid/Curve (Ctrl+Z)" onClick={handleGlobalUndo} disabled={historyIndex === 0 && rebuildHistory.length === 0} className="p-2.5 rounded-md bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed shadow-lg transition-all">
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" /></svg>
             </button>
-            <button title="Redo Curve Action (Ctrl+Y)" onClick={handleRedo} disabled={historyIndex === featuresHistory.length - 1} className="p-2.5 rounded-md bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed shadow-lg transition-all">
+            <button title="Redo Curve Action (Ctrl+Y)" onClick={handleGlobalRedo} disabled={historyIndex === featuresHistory.length - 1} className="p-2.5 rounded-md bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed shadow-lg transition-all">
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 10h-10a8 8 0 00-8 8v2M21 10l-6 6m6-6l-6-6" /></svg>
             </button>
-          </div>
-
-          <div className="absolute top-4 right-4 bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-md shadow-2xl p-2 w-40 z-10 flex flex-col gap-1.5 pointer-events-auto">
-            <span className="text-[9px] font-bold text-zinc-400 uppercase tracking-widest border-b border-zinc-800/50 pb-1.5 mb-0.5 text-center">Mirror Planes</span>
-            <CompactSymmetryToggle label="X (YZ)" active={symmetry.x} onClick={() => toggleSymmetry('x')} colorClass="bg-red-500" />
-            <CompactSymmetryToggle label="Y (XZ)" active={symmetry.y} onClick={() => toggleSymmetry('y')} colorClass="bg-green-500" />
-            <CompactSymmetryToggle label="Z (XY)" active={symmetry.z} onClick={() => toggleSymmetry('z')} colorClass="bg-blue-500" />
           </div>
         </div>
 
@@ -995,20 +1053,50 @@ export default function App() {
 
         <div className="p-4 flex-1 overflow-y-auto flex flex-col gap-4">
           
-          <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-2">
-            <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Environment</span>
-            <div className="flex flex-col gap-1 mt-2">
-              <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
-                <span>Sharpness (Dihedral)</span>
-                <span className="text-white">{sharpnessAngle}°</span>
+          <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-3">
+            <div>
+              <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Pre-Processing</span>
+              <div className="flex flex-col gap-1 mt-2">
+                <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
+                  <span>Sharpness (Dihedral)</span>
+                  <span className="text-white">{sharpnessAngle}°</span>
+                </div>
+                <input 
+                  type="range" 
+                  min="0" max="180" 
+                  value={sharpnessAngle} 
+                  onChange={(e) => setSharpnessAngle(parseInt(e.target.value))} 
+                  className="w-full accent-indigo-500 h-1 mt-1 mb-2" 
+                />
+                
+                <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
+                  <span>Decimation (Faces)</span>
+                  <span className="text-white">{decimationTarget.toLocaleString()}</span>
+                </div>
+                <input 
+                  type="range" min="5000" max="100000" step="1000" 
+                  value={decimationTarget} 
+                  onChange={(e) => setDecimationTarget(parseInt(e.target.value))} 
+                  onMouseUp={applyPreprocessing}
+                  className="w-full accent-indigo-500 h-1 mt-1 mb-2" 
+                />
+                
+                <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
+                  <span>Sharpening (Iters)</span>
+                  <span className="text-white">{sharpeningIters}</span>
+                </div>
+                <input 
+                  type="range" min="0" max="10" step="1" 
+                  value={sharpeningIters} 
+                  onChange={(e) => setSharpeningIters(parseInt(e.target.value))} 
+                  onMouseUp={applyPreprocessing}
+                  className="w-full accent-indigo-500 h-1 mt-1 mb-1" 
+                />
+                
+                <button onClick={applyPreprocessing} className="w-full py-1.5 mt-2 bg-zinc-800 hover:bg-zinc-700 text-[9px] font-bold uppercase text-white rounded border border-zinc-700 transition-colors">
+                  Apply Filters
+                </button>
               </div>
-              <input 
-                type="range" 
-                min="0" max="180" 
-                value={sharpnessAngle} 
-                onChange={(e) => setSharpnessAngle(parseInt(e.target.value))} 
-                className="w-full accent-indigo-500 h-1 mt-1" 
-              />
             </div>
           </div>
 
@@ -1065,6 +1153,14 @@ export default function App() {
                         <span className="text-zinc-400">Sphere</span>
                         <span className={patchAnalysis.type === 'sphere' ? 'text-amber-400 font-bold bg-amber-900/20 px-1 rounded' : 'text-zinc-300'}>{patchAnalysis.errors?.sphere?.toExponential(2) || 'N/A'}</span>
                      </div>
+                     <div className="flex justify-between items-center">
+                        <span className="text-zinc-400">Cone</span>
+                        <span className={patchAnalysis.type === 'cone' ? 'text-amber-400 font-bold bg-amber-900/20 px-1 rounded' : 'text-zinc-300'}>{patchAnalysis.errors?.cone?.toExponential(2) || 'N/A'}</span>
+                     </div>
+                     <div className="flex justify-between items-center">
+                        <span className="text-zinc-400">Torus</span>
+                        <span className={patchAnalysis.type === 'torus' ? 'text-amber-400 font-bold bg-amber-900/20 px-1 rounded' : 'text-zinc-300'}>{patchAnalysis.errors?.torus?.toExponential(2) || 'N/A'}</span>
+                     </div>
                   </div>
                </div>
             </div>
@@ -1095,54 +1191,6 @@ export default function App() {
                   <span className="text-[10px] font-mono text-zinc-500">Faces Count</span>
                   <span className="text-[10px] font-mono text-zinc-300">{selectedItemData.faces?.length || 0}</span>
                 </div>
-
-                {selectedItemData.payload && selectedItemData.payload.operation === 'extrude' && (
-                  <div className="flex items-center justify-between bg-zinc-950 p-2 rounded border border-zinc-800 mt-1">
-                     <span className="text-[10px] font-mono text-zinc-500">Depth</span>
-                     <input 
-                       type="number"
-                       className="w-16 bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[10px] text-zinc-300 outline-none focus:border-indigo-500 text-right font-mono"
-                       defaultValue={selectedItemData.payload.extrude_depth}
-                       onBlur={(e) => {
-                           const newDepth = parseFloat(e.target.value) || 0;
-                           if (newDepth !== selectedItemData.payload.extrude_depth) {
-                                handleUpdateHistoryItemDepth(selectedItemId, newDepth);
-                           }
-                       }}
-                       onKeyDown={(e) => {
-                           if (e.key === 'Enter') e.target.blur();
-                       }}
-                       disabled={isCommitting}
-                       step="0.1"
-                     />
-                  </div>
-                )}
-
-                {selectedItemData.payload && selectedItemData.payload.loops?.[0]?.type === 'circle' && (
-                  <div className="flex items-center justify-between bg-zinc-950 p-2 rounded border border-zinc-800 mt-1">
-                     <span className="text-[10px] font-mono text-zinc-500">Radius</span>
-                     <input 
-                       type="number"
-                       className="w-16 bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[10px] text-zinc-300 outline-none focus:border-indigo-500 text-right font-mono"
-                       defaultValue={selectedItemData.payload.loops[0].radius}
-                       onBlur={(e) => {
-                           const newRadius = parseFloat(e.target.value) || 0;
-                           if (newRadius !== selectedItemData.payload.loops[0].radius) {
-                                handleUpdateHistoryItemRadius(selectedItemId, newRadius);
-                           }
-                       }}
-                       onKeyDown={(e) => {
-                           if (e.key === 'Enter') e.target.blur();
-                       }}
-                       disabled={isCommitting}
-                       step="0.1"
-                     />
-                  </div>
-                )}
-                
-                {(selectedItemData.payload?.operation === 'extrude' || selectedItemData.payload?.loops?.[0]?.type === 'circle') && (
-                    <span className="text-[8px] text-zinc-600 italic mt-1 px-1">Press Enter or Unfocus to rebuild</span>
-                )}
               </div>
 
               {selectedItemData.type === 'sheet' && (
