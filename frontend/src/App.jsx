@@ -18,6 +18,12 @@ const IconTorus = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="no
 const IconWave = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 12c-2.66 0-4.33-3-7-3s-4.34 3-7 3-4.33-3-7-3"></path></svg>;
 const IconTrash = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>;
 
+const IconCursor = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/></svg>;
+const IconMove = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 9l-3 3 3 3M9 5l3-3 3 3M19 9l3 3-3 3M9 19l3 3 3 3M2 12h20M12 2v20"/></svg>;
+const IconRotate = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>;
+const IconScale = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 3l-6 6M21 3v6M21 3h-6M3 21l6-6M3 21v-6M3 21h6M14 10L10 14"/></svg>;
+
+
 const applySnap = (value, snapThreshold) => {
     if (!snapThreshold || snapThreshold <= 0) return value;
     return Math.round(value / snapThreshold) * snapThreshold;
@@ -214,7 +220,6 @@ export default function App() {
   const [angleSnap, setAngleSnap] = useState(0); 
   
   const [transformMode, setTransformMode] = useState(null);
-  const [mousePos, setMousePos] = useState({ x: 0, y: 0 }); 
   const [menuAnchor, setMenuAnchor] = useState({ x: 0, y: 0 });
   
   const [featuresHistory, setFeaturesHistory] = useState([[]]); 
@@ -439,7 +444,7 @@ export default function App() {
         return [...prev, loopData];
     });
     if (clickPos) setMenuAnchor(clickPos);
-    else setMenuAnchor(mousePos); 
+    else setMenuAnchor({x: window.innerWidth / 2, y: window.innerHeight / 2});
 
     if (loopData.clickPoint) {
       try {
@@ -471,7 +476,7 @@ export default function App() {
   const handleSelectSolid = (id, clickPos) => {
     setSelectedItemId(id);
     if (clickPos) setMenuAnchor(clickPos);
-    else setMenuAnchor(mousePos); 
+    else setMenuAnchor({x: window.innerWidth / 2, y: window.innerHeight / 2});
   };
 
   const toggleItemVisibility = (id) => {
@@ -726,8 +731,6 @@ export default function App() {
     setIsExporting(false);
   };
 
-  const handleGlobalPointerMove = (e) => setMousePos({ x: e.clientX, y: e.clientY });
-
   const sheets = rebuildHistory.filter(h => h.type === 'sheet');
   const solids = rebuildHistory.filter(h => h.type === 'solid');
   const selectedItemData = rebuildHistory.find(geo => geo.id === selectedItemId);
@@ -735,7 +738,6 @@ export default function App() {
   return (
     <div 
       className="fixed inset-0 flex flex-row overflow-hidden bg-zinc-900 text-zinc-100 font-sans" 
-      onPointerMove={handleGlobalPointerMove}
       onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
     >
       <style>{`
@@ -983,9 +985,29 @@ export default function App() {
             setTransformMode={setTransformMode}
           />
 
+          {/* LEFT FLOATING TOOLBAR */}
+          <div 
+            onPointerDown={(e) => e.stopPropagation()} 
+            className="absolute top-1/2 left-4 -translate-y-1/2 flex flex-col gap-2 z-10 pointer-events-auto bg-zinc-900/80 border border-zinc-800 p-1.5 rounded-lg shadow-xl backdrop-blur-md"
+          >
+            <button onClick={() => setTransformMode(null)} className={`p-2 rounded transition-all ${transformMode === null ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`} title="Select (Q)"><IconCursor /></button>
+            <button onClick={() => setTransformMode('translate')} className={`p-2 rounded transition-all ${transformMode === 'translate' ? 'bg-amber-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`} title="Move (W)"><IconMove /></button>
+            <button onClick={() => setTransformMode('rotate')} className={`p-2 rounded transition-all ${transformMode === 'rotate' ? 'bg-amber-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`} title="Rotate (E)"><IconRotate /></button>
+            <button onClick={() => setTransformMode('scale')} className={`p-2 rounded transition-all ${transformMode === 'scale' ? 'bg-amber-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`} title="Scale (R)"><IconScale /></button>
+            
+            <div className="w-full h-px bg-zinc-700/50 my-1"></div>
+            
+            <button title="Undo Solid/Curve (Ctrl+Z)" onClick={handleGlobalUndo} disabled={historyIndex === 0 && rebuildHistory.length === 0} className="p-2 rounded text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed transition-all">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" /></svg>
+            </button>
+            <button title="Redo Curve Action (Ctrl+Y)" onClick={handleGlobalRedo} disabled={historyIndex === featuresHistory.length - 1} className="p-2 rounded text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed transition-all">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 10h-10a8 8 0 00-8 8v2M21 10l-6 6m6-6l-6-6" /></svg>
+            </button>
+          </div>
+
           <div 
              onPointerDown={(e) => e.stopPropagation()} 
-             className="absolute top-4 left-4 flex flex-col gap-1.5 z-10 items-start pointer-events-auto"
+             className="absolute top-4 left-4 flex flex-col gap-1.5 z-10 items-start pointer-events-auto pl-14"
           >
             <div className="flex gap-2">
               <button onClick={() => setShowMesh(!showMesh)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md shadow-lg border backdrop-blur-md transition-all ${showMesh ? 'bg-zinc-800/80 border-zinc-700 text-white' : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'}`}>
@@ -1012,18 +1034,6 @@ export default function App() {
                 </div>
               </div>
             )}
-          </div>
-
-          <div 
-             onPointerDown={(e) => e.stopPropagation()} 
-             className="absolute bottom-4 left-4 flex gap-2 z-10 pointer-events-auto"
-          >
-            <button title="Undo Solid/Curve (Ctrl+Z)" onClick={handleGlobalUndo} disabled={historyIndex === 0 && rebuildHistory.length === 0} className="p-2.5 rounded-md bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed shadow-lg transition-all">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" /></svg>
-            </button>
-            <button title="Redo Curve Action (Ctrl+Y)" onClick={handleGlobalRedo} disabled={historyIndex === featuresHistory.length - 1} className="p-2.5 rounded-md bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed shadow-lg transition-all">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 10h-10a8 8 0 00-8 8v2M21 10l-6 6m6-6l-6-6" /></svg>
-            </button>
           </div>
         </div>
 

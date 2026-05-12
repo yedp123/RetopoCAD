@@ -113,7 +113,7 @@ function SplashHighlight({ feature, originalMeshes, centerOffset }) {
   return <mesh geometry={result.geo} material={material} />;
 }
 
-function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, originalMeshes }) {
+function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, originalMeshes, disabled }) {
   const [hovered, setHovered] = useState(false);
   const { center, normal, radius } = feature;
 
@@ -151,9 +151,15 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, origina
       {finalHover && <SplashHighlight feature={feature} originalMeshes={originalMeshes} centerOffset={centerOffset} />}
       <line 
         geometry={geometry} position={pos} quaternion={quaternion}
-        onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
+        onPointerOver={(e) => { 
+          if (disabled) return; 
+          e.stopPropagation(); 
+          setHovered(true); 
+        }}
         onPointerOut={() => setHovered(false)}
         onClick={(e) => {
+          if (disabled) return;
+          if (e.delta > 5) return; // Prevent selection if dragging camera/gizmo
           e.stopPropagation();
           if (onSelect) {
             const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
@@ -168,7 +174,7 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, origina
   );
 }
 
-function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSelect, originalMeshes }) {
+function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSelect, originalMeshes, disabled }) {
   const [hovered, setHovered] = useState(false);
   const { points } = feature;
 
@@ -192,9 +198,15 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSe
       {finalHover && <SplashHighlight feature={feature} originalMeshes={originalMeshes} centerOffset={centerOffset} />}
       <line 
         geometry={geometry}
-        onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
+        onPointerOver={(e) => { 
+          if (disabled) return; 
+          e.stopPropagation(); 
+          setHovered(true); 
+        }}
         onPointerOut={() => setHovered(false)}
         onClick={(e) => {
+          if (disabled) return;
+          if (e.delta > 5) return; // Prevent selection if dragging camera/gizmo
           e.stopPropagation();
           if (onSelect) {
             const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
@@ -238,7 +250,7 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
     return { localPivot: pivot, absoluteCenter: absCenter };
   }, [geo.vertices, centerOffset]);
 
-  // Initial Placement - Using useEffect stops React from forcing the position back on every re-render
+  // Initial Placement
   useEffect(() => {
     if (groupRef.current) {
       groupRef.current.position.copy(localPivot);
@@ -451,12 +463,12 @@ function GhostModel({
   const selectedSolidMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: "#f97316", emissive: "#ea580c", emissiveIntensity: 0.4, transparent: true, opacity: 0.9, roughness: 0.2, metalness: 0.3, side: THREE.DoubleSide }), []);
 
   const handlePointerMove = (e) => {
-    e.stopPropagation(); 
-    
     if (transformMode) {
       if (scoutLoop) setScoutLoop(null);
-      return;
+      return; // Do not stop propagation if tool is active, let it pass to gizmos
     }
+    
+    e.stopPropagation(); 
 
     if (cursorGroupRef.current) {
       const worldPoint = e.point.clone();
@@ -501,9 +513,11 @@ function GhostModel({
   };
 
   const handleClick = async (e) => {
+    if (transformMode) return;
+    if (e.delta > 5) return; // Prevent selection if dragging camera/gizmo
+    
     e.stopPropagation(); 
     if (!cursorGroupRef.current) return;
-    if (transformMode) return;
 
     const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
     const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
@@ -521,7 +535,10 @@ function GhostModel({
     <group ref={cursorGroupRef}>
       <group>
         {meshes?.map((mesh, index) => (
-          <mesh key={`base-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onClick={handleClick} visible={showMesh}>
+          <mesh 
+            key={`base-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} 
+            onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onClick={handleClick} visible={showMesh}
+          >
             <meshStandardMaterial color="#cccccc" transparent opacity={meshOpacity} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
             <Edges raycast={() => null} threshold={15} color="#18181b" visible={showWireframe} />
           </mesh>
@@ -532,14 +549,14 @@ function GhostModel({
           const isSelected = selectedLoops?.some(l => l.id === feat.id);
           if (isSelected) return null; 
           return feat.type === 'circle' 
-            ? <CircleCurve key={feat.id} feature={feat} centerOffset={centerOffset} onSelect={onSelectLoop} originalMeshes={meshes} />
-            : <PlanarCurve key={feat.id} feature={feat} centerOffset={centerOffset} onSelect={onSelectLoop} originalMeshes={meshes} />
+            ? <CircleCurve key={feat.id} feature={feat} centerOffset={centerOffset} onSelect={onSelectLoop} originalMeshes={meshes} disabled={!!transformMode} />
+            : <PlanarCurve key={feat.id} feature={feat} centerOffset={centerOffset} onSelect={onSelectLoop} originalMeshes={meshes} disabled={!!transformMode} />
         })}
 
-        {scoutLoop && <PlanarCurve feature={scoutLoop} centerOffset={centerOffset} customColor="#f97316" hoveredOverride={true} originalMeshes={meshes} />}
+        {scoutLoop && <PlanarCurve feature={scoutLoop} centerOffset={centerOffset} customColor="#f97316" hoveredOverride={true} originalMeshes={meshes} disabled={!!transformMode} />}
         
         {selectedLoops?.map((feat, idx) => (
-          <PlanarCurve key={`sel-${feat.id}-${idx}`} feature={feat} centerOffset={centerOffset} customColor="#38bdf8" hoveredOverride={true} originalMeshes={meshes} />
+          <PlanarCurve key={`sel-${feat.id}-${idx}`} feature={feat} centerOffset={centerOffset} customColor="#38bdf8" hoveredOverride={true} originalMeshes={meshes} disabled={!!transformMode} />
         ))}
         
         {rebuildHistory?.map((geo, idx) => {
@@ -552,6 +569,7 @@ function GhostModel({
            const mat = geo.type === 'sheet' ? (isSelected ? selectedSolidMaterial : sheetMaterial) : (isSelected ? selectedSolidMaterial : solidMaterial);
            
            const handleSelect = (e) => { 
+              if (e.delta > 5) return; // Prevent selection if dragging camera/gizmo
               e.stopPropagation(); 
               const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
               const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
@@ -588,7 +606,9 @@ function GhostModel({
         return (
           <group key={`mirror-group-${mirrorKey}`} scale={scale}>
             {meshes?.map((mesh, index) => (
-              <mesh key={`mirror-${mirrorKey}-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} visible={showMesh}>
+              <mesh 
+                key={`mirror-${mirrorKey}-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} visible={showMesh}
+              >
                 <meshStandardMaterial color="#cccccc" transparent opacity={meshOpacity} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
                 <Edges raycast={() => null} threshold={15} color="#18181b" visible={showWireframe} />
               </mesh>
@@ -596,8 +616,8 @@ function GhostModel({
             {showCurvesFolder && extractedFeatures?.map((feat) => {
                if (hiddenCurveIds?.includes(feat.id)) return null;
                return feat.type === 'circle' 
-                ? <CircleCurve key={`mirror-circ-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} />
-                : <PlanarCurve key={`mirror-plan-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} />
+                ? <CircleCurve key={`mirror-circ-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} disabled={!!transformMode} />
+                : <PlanarCurve key={`mirror-plan-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} disabled={!!transformMode} />
             })}
             {rebuildHistory?.map((geo, idx) => {
                const isVisible = geo.visible !== false &&
