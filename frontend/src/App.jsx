@@ -23,13 +23,15 @@ const IconRotate = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="n
 const IconScale = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 3l-6 6M21 3v6M21 3h-6M3 21l6-6M3 21v-6M3 21h6M14 10L10 14"/></svg>;
 const IconLink = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>;
 const IconFlip = () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="16 3 21 3 21 8"></polyline><line x1="4" y1="20" x2="21" y2="3"></line><polyline points="21 16 21 21 16 21"></polyline><line x1="15" y1="15" x2="21" y2="21"></line><line x1="4" y1="4" x2="9" y2="9"></line></svg>;
+const IconPatch = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><path d="M3 9h18M3 15h18M9 3v18M15 3v18"></path></svg>;
+const IconSew = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 12c1.5-1.5 3.5-1.5 5 0 1.5 1.5 3.5 1.5 5 0s3.5-1.5 5 0"></path><line x1="9" y1="4" x2="9" y2="20"></line><line x1="15" y1="4" x2="15" y2="20"></line></svg>;
 
 const applySnap = (value, snapThreshold) => {
     if (!snapThreshold || snapThreshold <= 0) return value;
     return Math.round(value / snapThreshold) * snapThreshold;
 };
 
-function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onSubtract, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive, onCreateBlade, linearSnap, transformMode }) {
+function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onPatch, onSew, onCut, onSubtract, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive, onCreateBlade, linearSnap, transformMode }) {
   const [pos, setPos] = useState({ x: -1000, y: -1000 });
   const [keepTool, setKeepTool] = useState(false);
 
@@ -71,12 +73,12 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
   const planeCount = selectedLoops.filter(l => l.type !== 'circle').length;
   const circleCount = selectedLoops.filter(l => l.type === 'circle').length;
   let selectionText = [];
-  if (planeCount > 0) selectionText.push(`${planeCount} Plane${planeCount > 1 ? 's' : ''}`);
+  if (planeCount > 0) selectionText.push(`${planeCount} Wire${planeCount > 1 ? 's' : ''}`);
   if (circleCount > 0) selectionText.push(`${circleCount} Cylinder${circleCount > 1 ? 's' : ''}`);
   
   if (selectedItemsData.length > 0) {
       const typeCounts = {};
-      selectedItemsData.forEach(i => typeCounts[i.type] = (typeCounts[i.type] || 0) + 1);
+      selectedItemsData.forEach(i => typeCounts[i.type === 'sheet' ? 'face' : i.type] = (typeCounts[i.type === 'sheet' ? 'face' : i.type] || 0) + 1);
       Object.entries(typeCounts).forEach(([type, count]) => {
           selectionText.push(`${count} ${type.charAt(0).toUpperCase() + type.slice(1)}${count > 1 ? 's' : ''}`);
       });
@@ -85,6 +87,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
 
   const isCylinderLoop = selectedLoops.length === 1 && selectedLoops[0].type === 'circle';
   const extrudeLabel = isCylinderLoop ? 'Cylinder' : 'Extrude';
+  const scoutedCount = selectedLoops.filter(l => l.clickPoint).length;
 
   const radius = 70; 
   const outerRadius = 135; 
@@ -96,6 +99,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
   const isTwoVolumes = selectedItemsData.length === 2 && 
       selectedItemsData.every(i => i.type === 'solid' || i.type === 'blade');
   const isLoopAndSolid = selectedLoops.length === 1 && selectedItemsData.length === 1 && selectedItemsData[0].type === 'solid';
+  const hasFaces = selectedItemsData.length > 0 && selectedItemsData.every(i => i.type === 'sheet');
 
   if (selectedLoops.length > 0 && selectedItemsData.length === 0) {
       buttons.push({ label: extrudeLabel, icon: isCylinderLoop ? <IconCylinderFill /> : <IconExtrude />, angle: -90, action: onExtrude, disabled: selectedLoops.length !== 1, color: 'text-blue-400' });
@@ -107,15 +111,33 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
               buttons.push({ label: 'Create\nBlade', icon: <IconSquare />, angle: 135, action: onCreateBlade, disabled: false, color: 'text-amber-400' });
           }
       } else {
-          buttons.push({ label: 'Sheet', icon: <IconSheet />, angle: 90, action: onSheet, disabled: selectedLoops.length !== 1, color: 'text-green-400' });
+          buttons.push({ label: 'Face', icon: <IconSheet />, angle: 90, action: onSheet, disabled: selectedLoops.length !== 1, color: 'text-green-400' });
+      }
+
+      if (selectedLoops.length > 1) {
+          const isFour = selectedLoops.length === 4;
+          buttons.push({ 
+              label: 'Patch\nWires', 
+              icon: <IconPatch />, 
+              angle: 45, 
+              action: onPatch, 
+              disabled: false, 
+              color: isFour ? 'text-emerald-300' : 'text-emerald-500',
+              glow: isFour 
+          });
       }
       
-      buttons.push({ label: 'Extract\nCurve', icon: <IconWave />, angle: 180, action: onExtractCurve, disabled: selectedLoops.length === 0, color: 'text-purple-400' });
+      if (scoutedCount > 0) {
+          buttons.push({ label: 'Extract\nCurve', icon: <IconWave />, angle: 180, action: onExtractCurve, disabled: false, color: 'text-purple-400' });
+      }
   } 
 
-  if (isSingleSheet) {
-      buttons.push({ label: 'Promote to\nSolid', icon: <IconExtrude />, angle: -45, action: () => onPromote(selectedItemsData[0].id, 'solid'), disabled: false, color: 'text-emerald-400' });
-      buttons.push({ label: 'Convert to\nBlade', icon: <IconSquare />, angle: -135, action: () => onPromote(selectedItemsData[0].id, 'blade'), disabled: false, color: 'text-amber-400' });
+  if (isSingleSheet || hasFaces) {
+      buttons.push({ label: 'Sew\nSurfaces', icon: <IconSew />, angle: 45, action: onSew, disabled: selectedItemsData.length < 2, color: 'text-blue-400' });
+      if (isSingleSheet) {
+          buttons.push({ label: 'Promote to\nSolid', icon: <IconExtrude />, angle: -45, action: () => onPromote(selectedItemsData[0].id, 'solid'), disabled: false, color: 'text-emerald-400' });
+          buttons.push({ label: 'Convert to\nBlade', icon: <IconSquare />, angle: -135, action: () => onPromote(selectedItemsData[0].id, 'blade'), disabled: false, color: 'text-amber-400' });
+      }
   } else if (isSingleExtrusion) {
       buttons.push({ label: 'Flip\nDirection', icon: <IconFlip />, angle: 90, action: () => onUpdateDepth(selectedItemsData[0].id, (selectedItemsData[0].payload?.extrude_depth || extrudeDepth) * -1), disabled: false, color: 'text-amber-400' });
   }
@@ -144,8 +166,8 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
           label: 'Delete', 
           icon: <IconTrash />, 
           angle: -135, 
-          action: () => onDeleteItem(selectedItemsData.map(i => i.id)), 
-          disabled: selectedItemsData.length === 0 && selectedLoops.length === 0, 
+          action: () => onDeleteItem([...selectedItemsData.map(i => i.id), ...selectedLoops.map(l => l.id).filter(Boolean)]), 
+          disabled: selectedItemsData.length === 0 && selectedLoops.filter(l => l.id).length === 0, 
           color: 'text-red-500' 
       });
       outerButtons.push({ label: 'Clear\nSelection', icon: <IconClear />, angle: 45, action: onClear, disabled: false, color: 'text-zinc-400' });
@@ -233,14 +255,16 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
           const rad = (btn.angle * Math.PI) / 180;
           const x = Math.cos(rad) * radius;
           const y = Math.sin(rad) * radius;
+          const glowClass = btn.glow ? 'shadow-[0_0_15px_rgba(16,185,129,0.8)] border-emerald-400' : 'shadow-xl border-zinc-600';
           return (
              <button
                key={`inner-${i}`}
                onClick={(e) => { e.stopPropagation(); btn.action(); }}
                disabled={btn.disabled}
                style={{ transform: `translate(${x}px, ${y}px)` }}
-               className={`absolute pointer-events-auto flex flex-col items-center justify-center w-14 h-14 rounded-full transition-all shadow-xl backdrop-blur-md border 
-                 ${btn.disabled ? 'bg-zinc-800/80 text-zinc-600 border-zinc-700/50 cursor-not-allowed' : `bg-zinc-800/90 border-zinc-600 hover:bg-zinc-700 hover:scale-110 hover:border-zinc-300 ${btn.color}`}`}
+               className={`absolute pointer-events-auto flex flex-col items-center justify-center w-14 h-14 rounded-full transition-all backdrop-blur-md border 
+                 ${glowClass}
+                 ${btn.disabled ? 'bg-zinc-800/80 text-zinc-600 border-zinc-700/50 cursor-not-allowed' : `bg-zinc-800/90 hover:bg-zinc-700 hover:scale-110 hover:border-zinc-300 ${btn.color}`}`}
              >
                <span className="mb-0.5 pointer-events-none">{btn.icon}</span>
                <span className="text-[6.5px] font-black uppercase tracking-tighter text-zinc-300 pointer-events-none text-center whitespace-pre-line leading-tight mt-0.5">{btn.label}</span>
@@ -329,8 +353,6 @@ export default function App() {
         try {
             const res = await fetch('http://localhost:8000/undo-geometry', { method: 'POST' });
             if (res.ok) {
-                // Actually deleting the last item mathematically is hard in a pure dict without order,
-                // but soft-deleting in React is enough because React drives the Export active_geo_ids list anyway.
                 setRebuildHistory(prev => prev.slice(0, -1));
                 setSelectedItemIds([]);
             }
@@ -344,6 +366,18 @@ export default function App() {
     if (historyIndex < featuresHistory.length - 1) {
         setHistoryIndex(prev => prev + 1);
     }
+  };
+
+  const handleGlobalDelete = (ids) => {
+    const idList = Array.isArray(ids) ? ids : [ids];
+    setRebuildHistory(prev => prev.map(geo => idList.includes(geo.id) ? { ...geo, deleted: true } : geo));
+    setSelectedItemIds(prev => prev.filter(id => !idList.includes(id)));
+    
+    const newFeatures = currentFeatures.filter(f => !idList.includes(f.id));
+    if (newFeatures.length !== currentFeatures.length) {
+        commitFeatures(newFeatures);
+    }
+    setSelectedLoops(prev => prev.filter(l => !idList.includes(l.id)));
   };
 
   useEffect(() => {
@@ -369,35 +403,33 @@ export default function App() {
 
       if (key === 'delete' || key === 'backspace') {
          e.preventDefault();
-         if (selectedItemIds.length > 0) {
-             setRebuildHistory(prev => prev.map(geo => selectedItemIds.includes(geo.id) ? { ...geo, deleted: true } : geo));
-             setSelectedItemIds([]);
-         } else if (selectedLoops.length > 0) {
-             const loopsToRemove = selectedLoops.map(l => l.id);
-             commitFeatures(currentFeatures.filter(f => !loopsToRemove.includes(f.id)));
-             setSelectedLoops([]);
-             setPatchAnalysis(null);
+         const idsToDelete = [...selectedItemIds, ...selectedLoops.map(l => l.id).filter(Boolean)];
+         if (idsToDelete.length > 0) {
+             handleGlobalDelete(idsToDelete);
          }
+         setPatchAnalysis(null);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [historyIndex, featuresHistory.length, rebuildHistory, selectedItemIds, selectedLoops, currentFeatures]);
 
-  const handleDeleteFeature = (id) => {
-    const filtered = currentFeatures.filter(f => f.id !== id);
-    commitFeatures(filtered);
-  };
-
-  const handleDeleteGeometry = (ids) => {
-    const idList = Array.isArray(ids) ? ids : [ids];
-    setRebuildHistory(prev => prev.map(geo => idList.includes(geo.id) ? { ...geo, deleted: true } : geo));
-    setSelectedItemIds(prev => prev.filter(id => !idList.includes(id)));
-  };
+  const handleDeleteFeature = (id) => handleGlobalDelete(id);
+  const handleDeleteGeometry = (ids) => handleGlobalDelete(ids);
 
   const handleClearAllFeatures = () => {
     if (currentFeatures.length === 0) return;
     commitFeatures([]);
+  };
+
+  const handleHideAllWires = (e) => {
+    e.stopPropagation();
+    const allVisible = currentFeatures.length > 0 && hiddenCurveIds.length !== currentFeatures.length;
+    if (allVisible) {
+        setHiddenCurveIds(currentFeatures.map(f => f.id));
+    } else {
+        setHiddenCurveIds([]);
+    }
   };
 
   const toggleCurveVisibility = (id) => {
@@ -405,30 +437,25 @@ export default function App() {
   };
 
   const handleExtractCurveFromRing = async () => {
-    if (selectedLoops.length === 0) return;
+    const scoutedLoops = selectedLoops.filter(l => l.clickPoint);
+    if (scoutedLoops.length === 0) return;
     setIsCommitting(true);
     const newFeatures = [];
     
-    for (const loop of selectedLoops) {
-      if (loop.clickPoint) {
-        try {
-          const res = await fetch(`http://localhost:8000/extract-feature`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-              x: loop.clickPoint.x, y: loop.clickPoint.y, z: loop.clickPoint.z, 
-              sharpness_angle: sharpnessAngle 
-            })
-          });
-          if (res.ok) {
-            newFeatures.push(await res.json());
-          } else {
-            newFeatures.push(loop); 
-          }
-        } catch (e) { newFeatures.push(loop); }
-      } else {
-         newFeatures.push(loop);
-      }
+    for (const loop of scoutedLoops) {
+      try {
+        const res = await fetch(`http://localhost:8000/extract-feature`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            x: loop.clickPoint.x, y: loop.clickPoint.y, z: loop.clickPoint.z, 
+            sharpness_angle: sharpnessAngle 
+          })
+        });
+        if (res.ok) {
+          newFeatures.push(await res.json());
+        } 
+      } catch (e) { }
     }
 
     if (newFeatures.length > 0) {
@@ -444,7 +471,6 @@ export default function App() {
   const executeGeometryOperation = async (endpoint, payload, type, defaultName) => {
     setIsCommitting(true);
     
-    // Automatically inject the strict geo_id into the payload if not present (to update an existing block)
     const geoId = payload.geo_id || Math.random().toString(36).substr(2, 9);
     const finalPayload = { ...payload, geo_id: geoId };
 
@@ -479,6 +505,21 @@ export default function App() {
     setIsCommitting(false);
   };
 
+  const handleCreatePatch = () => {
+    if (selectedLoops.length < 1) return;
+    const payloadLoops = selectedLoops.map(loop => ({
+        ...loop,
+        type: loop.type || 'planar'
+    }));
+    executeGeometryOperation('create-patch', { loops: payloadLoops, sharpness_angle: sharpnessAngle }, 'sheet', 'Patch');
+  };
+
+  const handleSew = () => {
+    if (selectedItemIds.length < 2) return;
+    setServerLogs(prev => [...prev, `[System] Sewing ${selectedItemIds.length} faces... (Queued for Export)`]);
+    setSelectedLoops([]);
+    setSelectedItemIds([]);
+  };
 
   const handleCreatePrimitive = async () => {
     if (selectedLoops.length === 0 || !patchAnalysis) return;
@@ -854,6 +895,8 @@ export default function App() {
         onExtrude={handleExtrude}
         onLoft={handleLoft}
         onSheet={handleSheet}
+        onPatch={handleCreatePatch}
+        onSew={handleSew}
         onCut={handleCut}
         onSubtract={handleSubtract}
         onPromote={handlePromoteSheet}
@@ -1018,20 +1061,42 @@ export default function App() {
             </div>
 
             <div className="flex flex-col gap-0.5">
-               <button onClick={() => toggleOutliner('curves')} className="flex items-center justify-between px-2 py-1.5 hover:bg-zinc-800/50 rounded transition-colors group">
+               <div className="flex items-center justify-between px-2 py-1.5 hover:bg-zinc-800/50 rounded transition-colors group cursor-pointer" onClick={() => toggleOutliner('curves')}>
                   <div className="flex items-center gap-1.5">
                      <span className="text-purple-500/80 scale-75"><IconWave /></span>
-                     <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 group-hover:text-zinc-200">Curves</span>
+                     <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 group-hover:text-zinc-200">Wires</span>
                   </div>
-                  <span className="text-zinc-600 text-[7px]">{outlinerExpanded.curves ? '▼' : '▶'}</span>
-               </button>
+                  <div className="flex items-center gap-2">
+                     <button 
+                        onClick={handleHideAllWires} 
+                        className="text-[7px] px-1.5 py-0.5 rounded border border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-white hover:bg-zinc-700 transition-colors pointer-events-auto"
+                     >
+                        {hiddenCurveIds.length === currentFeatures.length && currentFeatures.length > 0 ? 'SHOW ALL' : 'HIDE ALL'}
+                     </button>
+                     <span className="text-zinc-600 text-[7px]">{outlinerExpanded.curves ? '▼' : '▶'}</span>
+                  </div>
+               </div>
                {outlinerExpanded.curves && (
                  <div className="flex flex-col gap-0.5 pl-3 pr-1 mt-0.5">
                     {currentFeatures.length === 0 ? <span className="px-2 text-[8px] text-zinc-600 italic">Empty</span> : currentFeatures.map((feat) => {
                       const isHidden = hiddenCurveIds.includes(feat.id);
+                      const isSelected = selectedLoops.some(l => l.id === feat.id);
                       return (
-                        <div key={feat.id} className="flex items-center justify-between px-2 py-1 rounded border transition-colors bg-zinc-900 border-zinc-800 hover:border-zinc-600">
-                          <span className="text-[9px] text-zinc-300 font-mono truncate">{feat.type === 'circle' ? 'Circle' : 'Curve'}_{feat.id.substring(0,4)}</span>
+                        <div 
+                          key={feat.id} 
+                          onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedLoops(prev => {
+                                  if (e.shiftKey || e.ctrlKey || e.metaKey) {
+                                      return prev.some(l => l.id === feat.id) ? prev.filter(l => l.id !== feat.id) : [...prev, feat];
+                                  }
+                                  return [feat];
+                              });
+                              setMenuAnchor({ x: e.clientX, y: e.clientY });
+                          }}
+                          className={`flex items-center justify-between px-2 py-1 rounded border cursor-pointer transition-colors ${isSelected ? 'bg-zinc-800 border-purple-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
+                        >
+                          <span className="text-[9px] text-zinc-300 font-mono truncate">{feat.type === 'circle' ? 'Circle' : 'Curve'}_{feat.id?.substring(0,4) || 'xxx'}</span>
                           <div className="flex gap-1">
                             <button onClick={(e) => { e.stopPropagation(); toggleCurveVisibility(feat.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0 scale-75">
                               {!isHidden ? <IconEye /> : <IconEyeOff />}
@@ -1051,7 +1116,7 @@ export default function App() {
                <button onClick={() => toggleOutliner('sheets')} className="flex items-center justify-between px-2 py-1.5 hover:bg-zinc-800/50 rounded transition-colors group">
                   <div className="flex items-center gap-1.5">
                      <span className="text-green-500/80 scale-75"><IconSquare /></span>
-                     <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 group-hover:text-zinc-200">Surfaces</span>
+                     <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 group-hover:text-zinc-200">Faces</span>
                   </div>
                   <span className="text-zinc-600 text-[7px]">{outlinerExpanded.sheets ? '▼' : '▶'}</span>
                </button>
@@ -1071,7 +1136,7 @@ export default function App() {
                         }} 
                         className={`flex items-center justify-between px-2 py-1 rounded border cursor-pointer transition-colors ${selectedItemIds.includes(geo.id) ? 'bg-zinc-800 border-green-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
                       >
-                        <span className="text-[9px] text-zinc-300 font-mono truncate w-20">{geo.name || `Sheet_${geo.id}`}</span>
+                        <span className="text-[9px] text-zinc-300 font-mono truncate w-20">{geo.name || `Face_${geo.id}`}</span>
                         <div className="flex gap-1">
                           <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0 scale-75">
                             {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
@@ -1144,7 +1209,6 @@ export default function App() {
             meshOpacity={meshOpacity}
             selectedLoops={selectedLoops}
             
-            // Critical filter to hide soft-deleted geometries from Viewport
             rebuildHistory={rebuildHistory.filter(h => !h.deleted)}
             
             selectedItemIds={selectedItemIds}
@@ -1256,14 +1320,14 @@ export default function App() {
                   <>
                     {selectedLoops.map((loop, i) => (
                       <div key={`loop-${i}`} className="flex justify-between items-center bg-zinc-800/50 px-2 py-1 rounded text-[10px] font-mono text-zinc-300">
-                        <span>Curve #{loop.id.split('_')[1] || i}</span>
+                        <span>Curve #{loop.id?.split('_')[1] || i}</span>
                         <span className="text-purple-400">[{loop.points?.length || 'Analytic'}]</span>
                       </div>
                     ))}
                     {selectedItemsData.map((item, i) => (
                       <div key={`item-${i}`} className="flex justify-between items-center bg-zinc-800/50 px-2 py-1 rounded text-[10px] font-mono text-zinc-300">
                         <span className="truncate w-32">{item.name}</span>
-                        <span className={item.type === 'sheet' ? 'text-green-400' : item.type === 'blade' ? 'text-amber-400' : 'text-blue-400'}>{item.type.toUpperCase()}</span>
+                        <span className={item.type === 'sheet' || item.type === 'face' ? 'text-green-400' : item.type === 'blade' ? 'text-amber-400' : 'text-blue-400'}>{item.type.toUpperCase()}</span>
                       </div>
                     ))}
                   </>
@@ -1319,7 +1383,7 @@ export default function App() {
             <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-3">
               <div className="flex justify-between items-center border-b border-zinc-800 pb-2">
                 <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Classification</span>
-                <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${selectedItemsData[0].type === 'sheet' ? 'bg-green-900/30 text-green-400 border border-green-800' : selectedItemsData[0].type === 'blade' ? 'bg-amber-900/30 text-amber-400 border border-amber-800' : 'bg-blue-900/30 text-blue-400 border border-blue-800'}`}>
+                <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${selectedItemsData[0].type === 'sheet' || selectedItemsData[0].type === 'face' ? 'bg-green-900/30 text-green-400 border border-green-800' : selectedItemsData[0].type === 'blade' ? 'bg-amber-900/30 text-amber-400 border border-amber-800' : 'bg-blue-900/30 text-blue-400 border border-blue-800'}`}>
                   {selectedItemsData[0].type}
                 </span>
               </div>

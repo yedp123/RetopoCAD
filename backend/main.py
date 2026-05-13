@@ -10,6 +10,7 @@ import sys
 import subprocess
 import pickle
 import traceback
+import uuid
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,7 +30,7 @@ class AppState:
     mesh = None
     cleaned_mesh = None 
     live_logs = []
-    rebuild_geometry = {} # UPGRADED TO DICTIONARY FOR STRICT ID LOCKING
+    rebuild_geometry = {} # DICTIONARY FOR STRICT ID LOCKING
 
 state = AppState()
 
@@ -93,6 +94,11 @@ class CreatePrimitiveParams(BaseModel):
     sharpness_angle: float = 30.0
     symmetry: dict = None
     extrude_depth: float = 0.0
+
+class CreatePatchParams(BaseModel):
+    geo_id: str
+    loops: list
+    sharpness_angle: float = 30.0
 
 class TransformParams(BaseModel):
     target_id: str
@@ -365,7 +371,9 @@ async def scout_loop(params: Point3D):
         start_ref_face = ref_face_ids[0]
         ref_components = get_patch_components(ref_mesh, params.sharpness_angle)
         ref_target_region = next((comp for comp in ref_components if start_ref_face in comp), [start_ref_face])
-        patch_id = f"patch_{min(ref_target_region)}"
+        
+        # Scout receives a transient id
+        patch_id = f"scout_{min(ref_target_region)}"
 
         math_mesh = state.cleaned_mesh if state.cleaned_mesh is not None else state.mesh
         _, _, math_face_ids = math_mesh.nearest.on_surface(target_pt)
@@ -417,8 +425,6 @@ async def scout_loop(params: Point3D):
 
 @app.post("/undo-geometry")
 async def undo_geometry():
-    # Since React controls the list of active IDs, global undo just re-syncs visibility.
-    # No backend arrays to pop anymore!
     broadcast_log("[System] Undo synchronized with React State.")
     return {"success": True}
 
@@ -447,6 +453,87 @@ def resample_loop(points, target_count=100):
     for i in range(3):
         resampled[:, i] = np.interp(target_dists, cum_dists, np.append(pts[:, i], pts[0, i]))
     return resampled.tolist()
+
+@app.post("/create-patch")
+async def create_patch(params: CreatePatchParams):
+    try:
+        import build123d as b3d
+        from OCP.GeomAbs import GeomAbs_C0
+    except ImportError:
+        raise HTTPException(status_code=500, detail="build123d missing")
+
+    broadcast_log(f"[System] Committing PATCH-FROM-WIRES to Stack [{params.geo_id}]...")
+    
+    if not params.loops:
+        raise ValueError("Creating a patch requires at least 1 loop.")
+
+    try:
+        # 1. Aggregate and process the input curves
+        processed_loop = []
+        for loop in params.loops:
+            processed_loop.extend(loop.get('points', []))
+        
+        pts = [b3d.Vector(p) for p in processed_loop]
+        
+        # Ensure the wire boundary is closed
+        if len(pts) > 0 and (pts[0] - pts[-1]).length > 1e-5:
+            pts.append(pts[0])
+            
+        wire = b3d.Wire.make_polygon(pts)
+        patch_face = None
+        
+        # 2. The Math: Attempt native planar surface from wires
+        try:
+            patch_face = b3d.Face.make_from_wires(wire)
+        except Exception:
+            pass
+            
+        # 3. Refinement & Edge-Matching
+        # Use OCP BRepOffsetAPI_MakeFilling to "shrinkwrap" non-planar loops 
+        # while forcing the exact bounding edges (G0 continuity) to guarantee B-Rep stitching.
+        if patch_face is None or state.mesh is not None:
+            broadcast_log("[System] Shrinkwrapping face to mesh curvature...")
+            try:
+                from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+                filler = BRepOffsetAPI_MakeFilling()
+                
+                # Enforce strict edge matching
+                for edge in wire.edges():
+                    filler.Add(edge.wrapped, GeomAbs_C0)
+                    
+                filler.Build()
+                if filler.IsDone():
+                    patch_face = b3d.Face(filler.Shape())
+            except Exception as e:
+                broadcast_log(f"[Warning] Advanced shrinkwrap filling fallback: {e}")
+
+        if patch_face is None:
+            raise ValueError("Could not generate a valid B-Rep face from the provided wires.")
+
+        # 4. DICTIONARY LOCK
+        state.rebuild_geometry[params.geo_id] = patch_face
+
+        fd, path = tempfile.mkstemp(suffix=".stl")
+        os.close(fd)
+        
+        try:
+            from build123d.exporters3d import export_stl
+            export_stl(patch_face, path)
+                
+            tmesh = trimesh.load(path, file_type='stl')
+            vertices = tmesh.vertices.tolist()
+            faces_out = tmesh.faces.tolist()
+            
+            broadcast_log(f"[Success] B-Rep Surface Patch created. Returning {len(faces_out)} faces.")
+            return {"vertices": vertices, "faces": faces_out}
+        finally:
+            try: os.remove(path)
+            except: pass
+
+    except Exception as e:
+        err_msg = str(e)
+        broadcast_log(f"[Error] Failed to build Surface Patch: {err_msg}")
+        raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
 
 @app.post("/create-primitive")
 async def create_primitive(params: CreatePrimitiveParams):
@@ -601,7 +688,6 @@ async def create_primitive(params: CreatePrimitiveParams):
             if (pts_vec[0] - pts_vec[-1]).length > 1e-5:
                 pts_vec.append(pts_vec[0])
             
-            # THE MAGIC FIX: If user wants a negative depth, we simply flip the 2D face inside-out first!
             if params.extrude_depth < 0:
                 pts_vec.reverse()
                 
@@ -609,7 +695,6 @@ async def create_primitive(params: CreatePrimitiveParams):
             solid = b3d.Face(wire)
 
             if params.extrude_depth != 0.0:
-                # We always extrude forward (positive amount) because the face has already been flipped if needed
                 solid = b3d.extrude(solid, amount=abs(params.extrude_depth))
         
         else:
@@ -943,7 +1028,8 @@ async def extract_feature(params: FeatureParams):
     start_ref_face = ref_face_ids[0]
     ref_components = get_patch_components(ref_mesh, params.sharpness_angle)
     ref_target_region = next((comp for comp in ref_components if start_ref_face in comp), [start_ref_face])
-    patch_id = f"patch_{min(ref_target_region)}"
+    
+    wire_id = f"wire_{uuid.uuid4().hex[:8]}"
 
     # 2. Math
     math_mesh = state.cleaned_mesh if state.cleaned_mesh is not None else state.mesh
@@ -1018,7 +1104,7 @@ async def extract_feature(params: FeatureParams):
                         "radius": radius,
                         "normal": normal.tolist(),
                         "patch_faces": ref_target_region.tolist(),
-                        "id": patch_id
+                        "id": wire_id
                     }
             except:
                 pass
@@ -1037,7 +1123,7 @@ async def extract_feature(params: FeatureParams):
                 "points": ordered_points.tolist(),
                 "normal": region_normal.tolist(),
                 "patch_faces": ref_target_region.tolist(),
-                "id": patch_id
+                "id": wire_id
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail="Failed to trace shape boundary.")
@@ -1121,7 +1207,9 @@ def auto_extract(params: AutoExtractParams):
                             "type": "circle",
                             "center": center_3d.tolist(),
                             "radius": radius,
-                            "normal": normal.tolist()
+                            "normal": normal.tolist(),
+                            "patch_faces": comp.tolist(),
+                            "id": f"wire_{uuid.uuid4().hex[:8]}"
                         })
                         is_circle = True
                 except:
@@ -1139,7 +1227,9 @@ def auto_extract(params: AutoExtractParams):
                     extracted_features.append({
                         "type": "planar",
                         "points": ordered_points.tolist(),
-                        "normal": region_normal.tolist()
+                        "normal": region_normal.tolist(),
+                        "patch_faces": comp.tolist(),
+                        "id": f"wire_{uuid.uuid4().hex[:8]}"
                     })
                 except:
                     pass

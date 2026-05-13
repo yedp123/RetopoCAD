@@ -113,7 +113,7 @@ function SplashHighlight({ feature, originalMeshes, centerOffset }) {
   return <mesh geometry={result.geo} material={material} />;
 }
 
-function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, originalMeshes, disabled, isSelected }) {
+function CircleCurve({ feature, centerOffset, hoveredOverride, originalMeshes, isSelected, disabled }) {
   const [hovered, setHovered] = useState(false);
   const { center, normal, radius } = feature;
 
@@ -145,7 +145,7 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, origina
   if (centerOffset) pos.sub(centerOffset);
   
   const finalHover = hoveredOverride !== undefined ? hoveredOverride : hovered;
-  const activeColor = isSelected ? "#f97316" : "#10b981"; // Vibrant Orange for selection
+  const activeColor = isSelected ? "#06b6d4" : "#10b981"; 
 
   return (
     <group>
@@ -158,16 +158,7 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, origina
           setHovered(true); 
         }}
         onPointerOut={() => setHovered(false)}
-        onClick={(e) => {
-          if (disabled) return;
-          if (e.delta > 5) return; 
-          e.stopPropagation();
-          if (onSelect) {
-            const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
-            const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
-            onSelect(feature, { x: screenX, y: screenY });
-          }
-        }}
+        userData={{ isCurve: true, feature: feature }}
       >
         <lineBasicMaterial color={activeColor} linewidth={finalHover || isSelected ? 3 : 2} depthTest={false} />
       </line>
@@ -175,7 +166,7 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, origina
   );
 }
 
-function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSelect, originalMeshes, disabled, isSelected }) {
+function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, originalMeshes, disabled, isSelected }) {
   const [hovered, setHovered] = useState(false);
   const { points } = feature;
 
@@ -192,7 +183,7 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSe
   if (!geometry) return null;
 
   const baseColor = customColor ? customColor : '#10b981';
-  const activeColor = isSelected ? "#f97316" : baseColor; // Vibrant Orange for selection
+  const activeColor = isSelected ? "#06b6d4" : baseColor; 
   const finalHover = hoveredOverride !== undefined ? hoveredOverride : hovered;
 
   return (
@@ -206,16 +197,7 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSe
           setHovered(true); 
         }}
         onPointerOut={() => setHovered(false)}
-        onClick={(e) => {
-          if (disabled) return;
-          if (e.delta > 5) return; 
-          e.stopPropagation();
-          if (onSelect) {
-            const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
-            const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
-            onSelect(feature, { x: screenX, y: screenY });
-          }
-        }}
+        userData={{ isCurve: true, feature: feature }}
       >
         <lineBasicMaterial color={activeColor} linewidth={finalHover || isSelected ? 3 : 2} depthTest={false} />
       </line>
@@ -223,7 +205,7 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSe
   );
 }
 
-function ActiveTransformSolid({ geo, material, centerOffset, transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap, onSelect, onTransformEnd }) {
+function ActiveTransformSolid({ geo, material, centerOffset, transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap, onTransformEnd }) {
   const groupRef = useRef();
   const inputRef = useRef(null);
   const isDraggingRef = useRef(false);
@@ -346,14 +328,14 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
   return (
     <TransformControls
       mode={transformMode}
-      space="local"
+      space="world"
       translationSnap={linearSnap > 0 ? linearSnap : null}
       rotationSnap={angleSnap > 0 ? angleSnap * Math.PI / 180 : null}
       scaleSnap={linearSnap > 0 ? linearSnap : null}
       onChange={handleChange}
       onDraggingChanged={handleDraggingChanged}
     >
-      <group ref={groupRef} onClick={onSelect}>
+      <group ref={groupRef} userData={{ isSolidGroup: true, id: geo.id }}>
         <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={absoluteCenter} material={material} />
         
         <Html center position={[0, 1.5, 0]} zIndexRange={[100, 0]}>
@@ -521,30 +503,62 @@ function GhostModel({
     clearTimeout(scoutTimeout.current);
   };
 
-  const handleClick = async (e) => {
+  const handleGroupClick = (e) => {
     if (transformMode) return;
     if (e.delta > 5) return; 
     
     e.stopPropagation(); 
     if (!cursorGroupRef.current) return;
 
+    const intersections = e.intersections;
+    let curveHit = null;
+    let solidHit = null;
+
+    // 1. Traverse intersections strictly based on requested priority
+    for (let i = 0; i < intersections.length; i++) {
+        const object = intersections[i].object;
+        if (!object.visible) continue;
+        
+        // Priority 1: Curves win instantly
+        if (object.userData && object.userData.isCurve) {
+            curveHit = intersections[i];
+            break; 
+        }
+        
+        // Priority 2: Record the first Solid hit but keep checking for curves behind it
+        if (!solidHit && object.parent && object.parent.userData && object.parent.userData.isSolidGroup) {
+            solidHit = intersections[i];
+        }
+    }
+
     const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
     const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
 
-    if (scoutLoop) {
-      const worldPoint = e.point.clone();
-      const localPoint = cursorGroupRef.current.worldToLocal(worldPoint);
-      const rawPoint = localPoint.clone().add(centerOffset);
-      onSelectLoop({ ...scoutLoop, clickPoint: { x: rawPoint.x, y: rawPoint.y, z: rawPoint.z } }, { x: screenX, y: screenY });
-      setScoutLoop(null);
+    // 2. Dispatch the chosen event
+    if (curveHit) {
+        const feature = curveHit.object.userData.feature;
+        const localPoint = cursorGroupRef.current.worldToLocal(curveHit.point.clone());
+        const rawPoint = localPoint.clone().add(centerOffset);
+        onSelectLoop({ ...feature, clickPoint: { x: rawPoint.x, y: rawPoint.y, z: rawPoint.z } }, { x: screenX, y: screenY });
+        if (scoutLoop) setScoutLoop(null);
+    } else if (solidHit) {
+        const id = solidHit.object.parent.userData.id;
+        onSelectSolid(id, { x: screenX, y: screenY }, e);
+    } else if (scoutLoop) {
+        // Fallback: If clicked pure empty space but scout is active
+        const worldPoint = e.point.clone();
+        const localPoint = cursorGroupRef.current.worldToLocal(worldPoint);
+        const rawPoint = localPoint.clone().add(centerOffset);
+        onSelectLoop({ ...scoutLoop, clickPoint: { x: rawPoint.x, y: rawPoint.y, z: rawPoint.z } }, { x: screenX, y: screenY });
+        setScoutLoop(null);
     }
   };
 
   return (
-    <group ref={cursorGroupRef}>
+    <group ref={cursorGroupRef} onClick={handleGroupClick}>
       <group>
         {meshes?.map((mesh, index) => (
-          <mesh key={`base-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onClick={handleClick} visible={showMesh}>
+          <mesh key={`base-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} visible={showMesh}>
             <meshStandardMaterial color="#cccccc" transparent opacity={meshOpacity} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
             <Edges raycast={() => null} threshold={15} color="#18181b" visible={showWireframe} />
           </mesh>
@@ -553,17 +567,12 @@ function GhostModel({
         {showCurvesFolder && extractedFeatures?.map((feat) => {
           if (hiddenCurveIds?.includes(feat.id)) return null;
           const isSelected = selectedLoops?.some(l => l.id === feat.id);
-          if (isSelected) return null; 
           return feat.type === 'circle' 
-            ? <CircleCurve key={feat.id} feature={feat} centerOffset={centerOffset} onSelect={onSelectLoop} originalMeshes={meshes} disabled={!!transformMode} />
-            : <PlanarCurve key={feat.id} feature={feat} centerOffset={centerOffset} onSelect={onSelectLoop} originalMeshes={meshes} disabled={!!transformMode} />
+            ? <CircleCurve key={feat.id} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} disabled={!!transformMode} isSelected={isSelected} />
+            : <PlanarCurve key={feat.id} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} disabled={!!transformMode} isSelected={isSelected} />
         })}
 
-        {scoutLoop && <PlanarCurve feature={scoutLoop} centerOffset={centerOffset} customColor="#f97316" hoveredOverride={true} originalMeshes={meshes} disabled={!!transformMode} />}
-        
-        {selectedLoops?.map((feat, idx) => (
-          <PlanarCurve key={`sel-${feat.id}-${idx}`} isSelected={true} feature={feat} centerOffset={centerOffset} hoveredOverride={true} originalMeshes={meshes} disabled={!!transformMode} />
-        ))}
+        {scoutLoop && <PlanarCurve feature={scoutLoop} centerOffset={centerOffset} customColor="#f97316" hoveredOverride={true} originalMeshes={meshes} disabled={true} isSelected={false} />}
         
         {rebuildHistory?.map((geo, idx) => {
            const isVisible = geo.visible !== false &&
@@ -574,14 +583,6 @@ function GhostModel({
            const isSelected = selectedItemIds?.includes(geo.id);
            const mat = isSelected ? selectedSolidMaterial : (geo.type === 'sheet' ? sheetMaterial : solidMaterial);
            
-           const handleSelect = (e) => { 
-              if (e.delta > 5) return; 
-              e.stopPropagation(); 
-              const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
-              const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
-              if (onSelectSolid) onSelectSolid(geo.id, { x: screenX, y: screenY }, e); 
-           };
-
            if (isSelected && transformMode && (transformMode === 'translate' || transformMode === 'rotate' || transformMode === 'scale')) {
                return (
                   <ActiveTransformSolid 
@@ -594,14 +595,13 @@ function GhostModel({
                      setLinearSnap={setLinearSnap}
                      angleSnap={angleSnap}
                      setAngleSnap={setAngleSnap}
-                     onSelect={handleSelect}
                      onTransformEnd={onTransformEnd}
                   />
                );
            }
 
            return (
-             <group key={`geo-${geo.id || idx}`} onClick={handleSelect}>
+             <group key={`geo-${geo.id || idx}`} userData={{ isSolidGroup: true, id: geo.id }}>
                <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={centerOffset} material={mat} />
              </group>
            );
@@ -621,8 +621,8 @@ function GhostModel({
             {showCurvesFolder && extractedFeatures?.map((feat) => {
                if (hiddenCurveIds?.includes(feat.id)) return null;
                return feat.type === 'circle' 
-                ? <CircleCurve key={`mirror-circ-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} disabled={!!transformMode} />
-                : <PlanarCurve key={`mirror-plan-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} disabled={!!transformMode} />
+                ? <CircleCurve key={`mirror-circ-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} disabled={true} isSelected={false} />
+                : <PlanarCurve key={`mirror-plan-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} disabled={true} isSelected={false} />
             })}
             {rebuildHistory?.map((geo, idx) => {
                const isVisible = geo.visible !== false &&
@@ -671,7 +671,7 @@ export default function Viewport(props) {
 
   return (
     <div className="relative w-full h-full">
-      <Canvas camera={{ position: [5, 5, 5], fov: 45 }} gl={{ antialias: true }} raycaster={{ params: { Line: { threshold: 0.15 } } }}>
+      <Canvas camera={{ position: [5, 5, 5], fov: 45 }} gl={{ antialias: true }} raycaster={{ params: { Line: { threshold: 0.5 } } }}>
         <color attach="background" args={['#18181b']} />
         <ambientLight intensity={0.4} />
         <hemisphereLight skyColor="#ffffff" groundColor="#444444" intensity={0.6} />
