@@ -113,7 +113,7 @@ function SplashHighlight({ feature, originalMeshes, centerOffset }) {
   return <mesh geometry={result.geo} material={material} />;
 }
 
-function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, originalMeshes, disabled }) {
+function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, originalMeshes, disabled, isSelected }) {
   const [hovered, setHovered] = useState(false);
   const { center, normal, radius } = feature;
 
@@ -145,6 +145,7 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, origina
   if (centerOffset) pos.sub(centerOffset);
   
   const finalHover = hoveredOverride !== undefined ? hoveredOverride : hovered;
+  const activeColor = isSelected ? "#f97316" : "#10b981"; // Vibrant Orange for selection
 
   return (
     <group>
@@ -168,13 +169,13 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, onSelect, origina
           }
         }}
       >
-        <lineBasicMaterial color="#10b981" linewidth={finalHover ? 3 : 2} depthTest={false} />
+        <lineBasicMaterial color={activeColor} linewidth={finalHover || isSelected ? 3 : 2} depthTest={false} />
       </line>
     </group>
   );
 }
 
-function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSelect, originalMeshes, disabled }) {
+function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSelect, originalMeshes, disabled, isSelected }) {
   const [hovered, setHovered] = useState(false);
   const { points } = feature;
 
@@ -190,7 +191,8 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSe
 
   if (!geometry) return null;
 
-  const color = customColor ? customColor : '#10b981';
+  const baseColor = customColor ? customColor : '#10b981';
+  const activeColor = isSelected ? "#f97316" : baseColor; // Vibrant Orange for selection
   const finalHover = hoveredOverride !== undefined ? hoveredOverride : hovered;
 
   return (
@@ -215,7 +217,7 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSe
           }
         }}
       >
-        <lineBasicMaterial color={color} linewidth={finalHover ? 3 : 2} depthTest={false} />
+        <lineBasicMaterial color={activeColor} linewidth={finalHover || isSelected ? 3 : 2} depthTest={false} />
       </line>
     </group>
   );
@@ -344,7 +346,7 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
   return (
     <TransformControls
       mode={transformMode}
-      space="world"
+      space="local"
       translationSnap={linearSnap > 0 ? linearSnap : null}
       rotationSnap={angleSnap > 0 ? angleSnap * Math.PI / 180 : null}
       scaleSnap={linearSnap > 0 ? linearSnap : null}
@@ -409,7 +411,7 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
 function GhostModel({ 
   url, symmetry, onSelectLoop, onSelectSolid, onTransformEnd,
   extractedFeatures, showMesh, showWireframe, meshOpacity,
-  selectedLoops, rebuildHistory, selectedSolidIndex, cursorScale,
+  selectedLoops, rebuildHistory, selectedItemIds, cursorScale,
   showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle,
   transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap,
   outlinerExpanded
@@ -560,7 +562,7 @@ function GhostModel({
         {scoutLoop && <PlanarCurve feature={scoutLoop} centerOffset={centerOffset} customColor="#f97316" hoveredOverride={true} originalMeshes={meshes} disabled={!!transformMode} />}
         
         {selectedLoops?.map((feat, idx) => (
-          <PlanarCurve key={`sel-${feat.id}-${idx}`} feature={feat} centerOffset={centerOffset} customColor="#38bdf8" hoveredOverride={true} originalMeshes={meshes} disabled={!!transformMode} />
+          <PlanarCurve key={`sel-${feat.id}-${idx}`} isSelected={true} feature={feat} centerOffset={centerOffset} hoveredOverride={true} originalMeshes={meshes} disabled={!!transformMode} />
         ))}
         
         {rebuildHistory?.map((geo, idx) => {
@@ -569,8 +571,8 @@ function GhostModel({
              !(['solid','blade'].includes(geo.type) && !showSolidsFolder);
            if (!isVisible) return null;
 
-           const isSelected = geo.id === selectedSolidIndex;
-           const mat = geo.type === 'sheet' ? (isSelected ? selectedSolidMaterial : sheetMaterial) : (isSelected ? selectedSolidMaterial : solidMaterial);
+           const isSelected = selectedItemIds?.includes(geo.id);
+           const mat = isSelected ? selectedSolidMaterial : (geo.type === 'sheet' ? sheetMaterial : solidMaterial);
            
            const handleSelect = (e) => { 
               if (e.delta > 5) return; 
@@ -659,7 +661,7 @@ export default function Viewport(props) {
   const { 
      objUrl, cleanedObjUrl, symmetry, onSelectLoop, onSelectSolid, onTransformEnd,
      extractedFeatures, showMesh, showWireframe, meshOpacity,
-     selectedLoops, rebuildHistory, selectedSolidIndex, cursorScale,
+     selectedLoops, rebuildHistory, selectedItemIds, cursorScale,
      showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle,
      linearSnap, setLinearSnap, angleSnap, setAngleSnap, toggleSymmetry,
      transformMode, setTransformMode, outlinerExpanded

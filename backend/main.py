@@ -29,7 +29,7 @@ class AppState:
     mesh = None
     cleaned_mesh = None 
     live_logs = []
-    rebuild_geometry = [] 
+    rebuild_geometry = {} # UPGRADED TO DICTIONARY FOR STRICT ID LOCKING
 
 state = AppState()
 
@@ -68,32 +68,34 @@ class HullParams(BaseModel):
     skip_decimation: bool = False
 
 class CommitGeometryParams(BaseModel):
+    geo_id: str
     operation: str
     loops: list
     extrude_depth: float = 2.0
-    target_index: int = None
 
 class BooleanCutParams(BaseModel):
+    geo_id: str
     loops: list
     extrude_depth: float
-    target_index: int
+    target_id: str
 
 class BooleanOpParams(BaseModel):
-    target_index: int
-    tool_index: int
+    geo_id: str
+    target_id: str
+    tool_id: str
     keep_tool: bool = False
     operation: str = 'subtract'
 
 class CreatePrimitiveParams(BaseModel):
+    geo_id: str
     patch_faces: list
     primitive_type: str
     sharpness_angle: float = 30.0
     symmetry: dict = None
     extrude_depth: float = 0.0
-    target_index: int = None
 
 class TransformParams(BaseModel):
-    target_index: int
+    target_id: str
     dx: float
     dy: float
     dz: float
@@ -110,6 +112,13 @@ class TransformParams(BaseModel):
 class PreprocessParams(BaseModel):
     decimation_target: int = 25000
     sharpening_iters: int = 3
+
+class ExportStepParams(BaseModel):
+    hulls: list = []
+    features: list = []
+    merge_hulls: bool = False
+    symmetry: dict = None
+    active_geo_ids: list = []
 
 @app.get("/api/logs")
 async def get_logs():
@@ -159,7 +168,7 @@ async def preprocess_mesh(params: PreprocessParams, background_tasks: Background
 async def upload_mesh(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     try:
         state.live_logs = [] 
-        state.rebuild_geometry = [] 
+        state.rebuild_geometry = {} 
         broadcast_log(f"[System] Receiving {file.filename}...")
         contents = await file.read()
         
@@ -408,11 +417,10 @@ async def scout_loop(params: Point3D):
 
 @app.post("/undo-geometry")
 async def undo_geometry():
-    if len(state.rebuild_geometry) > 0:
-        state.rebuild_geometry.pop()
-        broadcast_log("[System] Undo: Restored previous geometry state.")
-        return {"success": True}
-    return {"success": False, "message": "Nothing to undo."}
+    # Since React controls the list of active IDs, global undo just re-syncs visibility.
+    # No backend arrays to pop anymore!
+    broadcast_log("[System] Undo synchronized with React State.")
+    return {"success": True}
 
 def apply_pca_firewall(points):
     pts = np.array(points)
@@ -449,7 +457,7 @@ async def create_primitive(params: CreatePrimitiveParams):
     except ImportError:
         raise HTTPException(status_code=500, detail="build123d missing")
 
-    broadcast_log(f"[System] Committing {params.primitive_type.upper()} primitive to Stack...")
+    broadcast_log(f"[System] Committing {params.primitive_type.upper()} primitive to Stack [{params.geo_id}]...")
     
     math_mesh = state.cleaned_mesh if state.cleaned_mesh is not None else state.mesh
     if not math_mesh:
@@ -568,7 +576,7 @@ async def create_primitive(params: CreatePrimitiveParams):
             except Exception as e:
                 raise ValueError(f"Torus fitting failed: {e}")
 
-        elif params.primitive_type == 'plane':
+        elif params.primitive_type == 'plane' or params.primitive_type == 'planar':
             faces = math_mesh.faces[math_target_region]
             edges = trimesh.geometry.faces_to_edges(faces)
             edges_sorted = np.sort(edges, axis=1)
@@ -593,7 +601,7 @@ async def create_primitive(params: CreatePrimitiveParams):
             if (pts_vec[0] - pts_vec[-1]).length > 1e-5:
                 pts_vec.append(pts_vec[0])
             
-            # The Magic Fix for Inverse Extrude:
+            # THE MAGIC FIX: If user wants a negative depth, we simply flip the 2D face inside-out first!
             if params.extrude_depth < 0:
                 pts_vec.reverse()
                 
@@ -601,15 +609,14 @@ async def create_primitive(params: CreatePrimitiveParams):
             solid = b3d.Face(wire)
 
             if params.extrude_depth != 0.0:
+                # We always extrude forward (positive amount) because the face has already been flipped if needed
                 solid = b3d.extrude(solid, amount=abs(params.extrude_depth))
         
         else:
             raise ValueError(f"Unknown primitive type: {params.primitive_type}")
 
-        if params.target_index is not None and 0 <= params.target_index < len(state.rebuild_geometry):
-            state.rebuild_geometry[params.target_index] = solid
-        else:
-            state.rebuild_geometry.append(solid)
+        # DICTIONARY LOCK
+        state.rebuild_geometry[params.geo_id] = solid
 
         fd, path = tempfile.mkstemp(suffix=".stl")
         os.close(fd)
@@ -635,7 +642,7 @@ async def create_sheet(params: CommitGeometryParams):
     except ImportError:
         raise HTTPException(status_code=500, detail="build123d missing")
 
-    broadcast_log(f"[System] Committing SURFACE SHEET to Stack...")
+    broadcast_log(f"[System] Committing SURFACE SHEET [{params.geo_id}]...")
     
     if not params.loops or len(params.loops) != 1:
         raise ValueError("Creating a sheet requires exactly 1 loop.")
@@ -654,7 +661,8 @@ async def create_sheet(params: CommitGeometryParams):
         wire = b3d.Wire.make_polygon(pts)
         sheet_face = b3d.Face(wire)
 
-        state.rebuild_geometry.append(sheet_face)
+        # DICTIONARY LOCK
+        state.rebuild_geometry[params.geo_id] = sheet_face
 
         fd, path = tempfile.mkstemp(suffix=".stl")
         os.close(fd)
@@ -686,7 +694,7 @@ async def commit_geometry(params: CommitGeometryParams):
     except ImportError:
         raise HTTPException(status_code=500, detail="build123d missing")
 
-    broadcast_log(f"[System] Committing {params.operation.upper()} solid to Stack...")
+    broadcast_log(f"[System] Committing {params.operation.upper()} [{params.geo_id}]...")
     try:
         if not params.loops:
             raise ValueError("No loops provided.")
@@ -737,10 +745,8 @@ async def commit_geometry(params: CommitGeometryParams):
                 raise ValueError("Loft failed: The resulting geometry would self-intersect. Try simplifying your loops.")
             raise b3d_err
 
-        if params.target_index is not None and 0 <= params.target_index < len(state.rebuild_geometry):
-            state.rebuild_geometry[params.target_index] = solid
-        else:
-            state.rebuild_geometry.append(solid)
+        # DICTIONARY LOCK
+        state.rebuild_geometry[params.geo_id] = solid
 
         fd, path = tempfile.mkstemp(suffix=".stl")
         os.close(fd)
@@ -773,12 +779,9 @@ async def transform_geometry(params: TransformParams):
     import build123d as b3d
     from math import degrees
     try:
-        if params.target_index >= len(state.rebuild_geometry):
-            raise ValueError("Transform target not found.")
-            
-        solid = state.rebuild_geometry[params.target_index]
+        solid = state.rebuild_geometry.get(params.target_id)
         if solid is None:
-            raise ValueError("Target geometry is missing or corrupted.")
+            raise ValueError("Target geometry is missing or corrupted in backend dictionary.")
 
         pivot = (params.px, params.py, params.pz)
         
@@ -800,7 +803,7 @@ async def transform_geometry(params: TransformParams):
                 broadcast_log(f"[Warning] Engine rejected non-uniform scaling on this shape type: {e}")
             solid = solid.translate((params.px, params.py, params.pz))
             
-        state.rebuild_geometry[params.target_index] = solid
+        state.rebuild_geometry[params.target_id] = solid
         
         fd, path = tempfile.mkstemp(suffix=".stl")
         os.close(fd)
@@ -825,14 +828,11 @@ async def boolean_op(params: BooleanOpParams):
 
     broadcast_log(f"[System] Committing BOOLEAN {params.operation.upper()} to Stack...")
     try:
-        if params.target_index >= len(state.rebuild_geometry) or params.tool_index >= len(state.rebuild_geometry):
-            raise ValueError("Target or Tool solid not found. Array out of bounds.")
-
-        target_solid = state.rebuild_geometry[params.target_index]
-        tool_solid = state.rebuild_geometry[params.tool_index]
+        target_solid = state.rebuild_geometry.get(params.target_id)
+        tool_solid = state.rebuild_geometry.get(params.tool_id)
 
         if target_solid is None or tool_solid is None:
-            raise ValueError("One of the selected objects is empty or was previously hard-deleted.")
+            raise ValueError("One of the selected objects is empty or was previously deleted.")
         
         if params.operation == 'subtract':
             try:
@@ -845,7 +845,7 @@ async def boolean_op(params: BooleanOpParams):
         else:
             raise ValueError("Unsupported boolean operation.")
         
-        state.rebuild_geometry[params.target_index] = result_solid
+        state.rebuild_geometry[params.geo_id] = result_solid
 
         fd, path = tempfile.mkstemp(suffix=".stl")
         os.close(fd)
@@ -872,10 +872,8 @@ async def boolean_cut(params: BooleanCutParams):
 
     broadcast_log(f"[System] Committing BOOLEAN CUT to Stack...")
     try:
-        if not params.loops or params.target_index is None:
-            raise ValueError("Requires 1 loop and 1 target solid.")
-        if params.target_index >= len(state.rebuild_geometry) or params.target_index < 0:
-            raise ValueError("Target solid not found.")
+        if not params.loops:
+            raise ValueError("Requires 1 loop.")
 
         processed_loop = params.loops[0]['points']
         if params.loops[0].get('type') in ['planar', 'plane']:
@@ -893,10 +891,10 @@ async def boolean_cut(params: BooleanCutParams):
         face = b3d.Face(wire)
         
         tool_extrusion = b3d.extrude(face, amount=abs(params.extrude_depth))
-        target_solid = state.rebuild_geometry[params.target_index]
+        target_solid = state.rebuild_geometry.get(params.target_id)
         
         if target_solid is None:
-             raise ValueError("Target geometry is missing or corrupted.")
+             raise ValueError("Target geometry is missing or corrupted in dictionary.")
 
         try:
             result_solid = target_solid - tool_extrusion
@@ -906,7 +904,7 @@ async def boolean_cut(params: BooleanCutParams):
             cut_algo.Build()
             result_solid = b3d.Shape.cast(cut_algo.Shape())
         
-        state.rebuild_geometry[params.target_index] = result_solid
+        state.rebuild_geometry[params.geo_id] = result_solid
 
         fd, path = tempfile.mkstemp(suffix=".stl")
         os.close(fd)
@@ -1268,6 +1266,7 @@ if __name__ == '__main__':
         broadcast_log(f"[Error] CoACD failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"CoACD failed: {str(e)}")
 
+
 @app.post("/export-step")
 async def export_step(payload: dict):
     try:
@@ -1280,10 +1279,14 @@ async def export_step(payload: dict):
     merge_hulls = payload.get("merge_hulls", False)
     symmetry = payload.get("symmetry", {"x": False, "y": False, "z": False})
     
-    for shape in state.rebuild_geometry:
+    # 1. Fetch only the exact IDs that React deems currently active
+    active_ids = payload.get("active_geo_ids", [])
+    for gid in active_ids:
+        shape = state.rebuild_geometry.get(gid)
         if shape is not None:
             shapes.append(shape)
         
+    # 2. Process CoACD Hulls
     hulls = payload.get("hulls", [])
     hull_solids = []
     
@@ -1344,6 +1347,7 @@ async def export_step(payload: dict):
     else:
         shapes.extend(hull_solids)
             
+    # 3. Process Extracted Sketched Features
     features = payload.get("features", [])
     if features:
         broadcast_log(f"[System] Compiling {len(features)} CAD sketches...")
@@ -1366,6 +1370,7 @@ async def export_step(payload: dict):
             
     shapes = [s for s in shapes if s is not None and hasattr(s, 'wrapped')]
 
+    # 4. Symmetry Logic across all collected shapes
     if any([symmetry.get('x'), symmetry.get('y'), symmetry.get('z')]):
         broadcast_log("[System] Applying structural symmetry arrays using build123d.mirror()...")
         
@@ -1388,6 +1393,7 @@ async def export_step(payload: dict):
         broadcast_log("[Error] No geometry found to export.")
         raise HTTPException(status_code=400, detail="No geometry found to export.")
         
+    # 5. Native build123d robust export
     broadcast_log("[System] Writing STEP file to disk...")
     fd, path = tempfile.mkstemp(suffix=".step")
     os.close(fd)

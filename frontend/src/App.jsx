@@ -103,7 +103,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
       
       if (patchAnalysis) {
           buttons.push({ label: 'Create\nPrimitive', icon: <IconExtrude />, angle: 90, action: onCreatePrimitive, disabled: false, color: 'text-emerald-400' });
-          if (patchAnalysis.type === 'plane') {
+          if (patchAnalysis.type === 'plane' || patchAnalysis.type === 'planar') {
               buttons.push({ label: 'Create\nBlade', icon: <IconSquare />, angle: 135, action: onCreateBlade, disabled: false, color: 'text-amber-400' });
           }
       } else {
@@ -167,7 +167,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
                    Suggested: <span className="text-amber-400">{patchAnalysis.type}</span>
                 </span>
                 <div className="flex gap-1.5 mt-0.5">
-                   <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'plane'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'plane' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Plane"><IconSquare /></button>
+                   <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'plane'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'plane' || patchAnalysis.type === 'planar' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Plane"><IconSquare /></button>
                    <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'cylinder'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'cylinder' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Cylinder"><IconCylinderOutline /></button>
                    <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'sphere'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'sphere' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Sphere"><IconSphere /></button>
                    <button onClick={(e) => { e.stopPropagation(); setPatchAnalysis(prev => ({...prev, type: 'cone'})); }} className={`p-1.5 rounded-full border transition-all ${patchAnalysis.type === 'cone' ? 'bg-amber-500 text-zinc-900 border-amber-400' : 'bg-zinc-800 text-zinc-400 border-zinc-600 hover:text-white hover:bg-zinc-700'}`} title="Override to Cone"><IconCone /></button>
@@ -329,6 +329,8 @@ export default function App() {
         try {
             const res = await fetch('http://localhost:8000/undo-geometry', { method: 'POST' });
             if (res.ok) {
+                // Actually deleting the last item mathematically is hard in a pure dict without order,
+                // but soft-deleting in React is enough because React drives the Export active_geo_ids list anyway.
                 setRebuildHistory(prev => prev.slice(0, -1));
                 setSelectedItemIds([]);
             }
@@ -430,7 +432,7 @@ export default function App() {
     }
 
     if (newFeatures.length > 0) {
-      const mapped = newFeatures.map(f => ({ ...f, id: Math.random().toString(36).substr(2, 9) }));
+      const mapped = newFeatures.map(f => ({ ...f, id: f.id || Math.random().toString(36).substr(2, 9) }));
       commitFeatures([...currentFeatures, ...mapped]);
     }
     
@@ -439,45 +441,58 @@ export default function App() {
     setIsCommitting(false);
   };
 
+  const executeGeometryOperation = async (endpoint, payload, type, defaultName) => {
+    setIsCommitting(true);
+    
+    // Automatically inject the strict geo_id into the payload if not present (to update an existing block)
+    const geoId = payload.geo_id || Math.random().toString(36).substr(2, 9);
+    const finalPayload = { ...payload, geo_id: geoId };
+
+    try {
+      const res = await fetch(`http://localhost:8000/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(finalPayload)
+      });
+      if (res.ok) {
+        const geometryData = await res.json();
+        
+        setRebuildHistory(prev => {
+            const existingIdx = prev.findIndex(g => g.id === geoId);
+            if (existingIdx >= 0) {
+                const newArr = [...prev];
+                newArr[existingIdx] = { ...newArr[existingIdx], ...geometryData, type, payload: finalPayload, endpoint };
+                return newArr;
+            } else {
+                return [...prev, { ...geometryData, type, id: geoId, visible: true, name: `${defaultName} ${prev.length + 1}`, payload: finalPayload, endpoint }];
+            }
+        });
+
+        setSelectedLoops([]); 
+        setSelectedItemIds(prev => prev.includes(geoId) ? prev : [geoId]); 
+        setPatchAnalysis(null);
+      } else {
+        const errData = await res.json();
+        setServerLogs(prev => [...prev, `[Error] ${errData.detail || 'Unknown CAD Engine crash.'}`]);
+      }
+    } catch (err) { setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]); }
+    setIsCommitting(false);
+  };
+
+
   const handleCreatePrimitive = async () => {
     if (selectedLoops.length === 0 || !patchAnalysis) return;
     const loop = selectedLoops[0];
     if (!loop.patch_faces) return;
     
-    setIsCommitting(true);
-    try {
-        const payload = {
-            patch_faces: loop.patch_faces,
-            primitive_type: patchAnalysis.type,
-            sharpness_angle: sharpnessAngle,
-            symmetry: symmetry
-        };
-        
-        const res = await fetch(`http://localhost:8000/create-primitive`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        
-        if (res.ok) {
-            const geometryData = await res.json();
-            const type = patchAnalysis.type === 'plane' ? 'sheet' : 'solid';
-            const defaultName = patchAnalysis.type.charAt(0).toUpperCase() + patchAnalysis.type.slice(1);
-            setRebuildHistory(prev => [...prev, { 
-              ...geometryData, type, id: Math.random().toString(36).substr(2, 9), 
-              visible: true, name: `${defaultName} ${prev.length + 1}`, payload: { operation: 'primitive', primitive_type: patchAnalysis.type, patch_faces: loop.patch_faces }, endpoint: 'create-primitive' 
-            }]);
-            setSelectedLoops([]); 
-            setSelectedItemIds([]);
-            setPatchAnalysis(null);
-        } else {
-            const errData = await res.json();
-            setServerLogs(prev => [...prev, `[Error] ${errData.detail}`]);
-        }
-    } catch (err) {
-        setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]);
-    }
-    setIsCommitting(false);
+    const payload = {
+        patch_faces: loop.patch_faces,
+        primitive_type: patchAnalysis.type,
+        sharpness_angle: sharpnessAngle,
+        symmetry: symmetry,
+        extrude_depth: 0.0
+    };
+    executeGeometryOperation('create-primitive', payload, patchAnalysis.type === 'plane' || patchAnalysis.type === 'planar' ? 'sheet' : 'solid', patchAnalysis.type.charAt(0).toUpperCase() + patchAnalysis.type.slice(1));
   };
 
   const handleCreateBlade = async () => {
@@ -485,41 +500,14 @@ export default function App() {
     const loop = selectedLoops[0];
     if (!loop.patch_faces) return;
 
-    setIsCommitting(true);
-    try {
-        const payload = {
-            patch_faces: loop.patch_faces,
-            primitive_type: patchAnalysis.type,
-            sharpness_angle: sharpnessAngle,
-            symmetry: symmetry,
-            extrude_depth: extrudeDepth 
-        };
-
-        const res = await fetch(`http://localhost:8000/create-primitive`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-
-        if (res.ok) {
-            const geometryData = await res.json();
-            setRebuildHistory(prev => [...prev, {
-              ...geometryData, type: 'blade', id: Math.random().toString(36).substr(2, 9),
-              visible: true, name: `Blade ${prev.length + 1}`,
-              payload: { operation: 'primitive', primitive_type: patchAnalysis.type, patch_faces: loop.patch_faces, extrude_depth: extrudeDepth },
-              endpoint: 'create-primitive'
-            }]);
-            setSelectedLoops([]);
-            setSelectedItemIds([]);
-            setPatchAnalysis(null);
-        } else {
-            const errData = await res.json();
-            setServerLogs(prev => [...prev, `[Error] ${errData.detail}`]);
-        }
-    } catch (err) {
-        setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]);
-    }
-    setIsCommitting(false);
+    const payload = {
+        patch_faces: loop.patch_faces,
+        primitive_type: patchAnalysis.type,
+        sharpness_angle: sharpnessAngle,
+        symmetry: symmetry,
+        extrude_depth: extrudeDepth 
+    };
+    executeGeometryOperation('create-primitive', payload, 'blade', 'Blade');
   };
 
   const handleAutoExtract = async () => {
@@ -588,30 +576,6 @@ export default function App() {
     ));
   };
 
-  const executeGeometryOperation = async (endpoint, payload, type, defaultName) => {
-    setIsCommitting(true);
-    try {
-      const res = await fetch(`http://localhost:8000/${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (res.ok) {
-        const geometryData = await res.json();
-        setRebuildHistory(prev => [...prev, { 
-          ...geometryData, type, id: Math.random().toString(36).substr(2, 9), 
-          visible: true, name: `${defaultName} ${prev.length + 1}`, payload, endpoint 
-        }]);
-        setSelectedLoops([]); 
-        setSelectedItemIds([]);
-        setPatchAnalysis(null);
-      } else {
-        const errData = await res.json();
-        setServerLogs(prev => [...prev, `[Error] ${errData.detail || 'Unknown CAD Engine crash.'}`]);
-      }
-    } catch (err) { setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]); }
-    setIsCommitting(false);
-  };
 
   const handleExtrude = () => {
       const payloadLoops = selectedLoops.map(loop => ({
@@ -625,8 +589,8 @@ export default function App() {
   const handleSheet = () => executeGeometryOperation('create-sheet', { operation: 'sheet', loops: selectedLoops }, 'sheet', 'Sheet');
 
   const handleTransformEnd = async (id, dP, dR, dS, absoluteCenter) => {
-    const index = rebuildHistory.findIndex(geo => geo.id === id);
-    if (index === -1) return;
+    const item = rebuildHistory.find(geo => geo.id === id);
+    if (!item) return;
     
     setIsCommitting(true);
     try {
@@ -634,7 +598,7 @@ export default function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                target_index: index,
+                target_id: id,
                 dx: dP.x, dy: dP.y, dz: dP.z,
                 rx: dR[0], ry: dR[1], rz: dR[2],
                 sx: dS.x, sy: dS.y, sz: dS.z,
@@ -643,11 +607,7 @@ export default function App() {
         });
         if (res.ok) {
             const data = await res.json();
-            setRebuildHistory(prev => {
-                const newHistory = [...prev];
-                newHistory[index] = { ...newHistory[index], vertices: data.vertices, faces: data.faces };
-                return newHistory;
-            });
+            setRebuildHistory(prev => prev.map(geoItem => geoItem.id === id ? { ...geoItem, vertices: data.vertices, faces: data.faces } : geoItem));
             setServerLogs(prev => [...prev, `[Success] Solid structurally transformed.`]);
         } else {
             const err = await res.json();
@@ -670,72 +630,27 @@ export default function App() {
     
     if (!isExtrude) return;
     
-    setIsCommitting(true);
-    try {
-      const res = await fetch(`http://localhost:8000/${item.endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...item.payload, extrude_depth: newDepth })
-      });
-      if (res.ok) {
-        const geo = await res.json();
-        setRebuildHistory(prev => prev.map(geoItem => geoItem.id === id ? { 
-            ...geoItem, vertices: geo.vertices, faces: geo.faces, payload: { ...geoItem.payload, extrude_depth: newDepth } 
-        } : geoItem));
-        setServerLogs(prev => [...prev, `[Success] Entity successfully rebuilt with new depth.`]);
-      } else {
-        setServerLogs(prev => [...prev, `[Error] Failed to update geometry.`]);
-      }
-    } catch (err) { setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]); }
-    setIsCommitting(false);
+    executeGeometryOperation(item.endpoint, { ...item.payload, geo_id: item.id, extrude_depth: newDepth }, item.type, item.name);
   };
 
   const handleCut = async () => {
     if (selectedItemIds.length !== 1) return;
-    const targetIndex = rebuildHistory.findIndex(geo => geo.id === selectedItemIds[0]);
-    if (targetIndex === -1) return;
-
-    setIsCommitting(true);
-    try {
-      const payloadLoops = selectedLoops.map(loop => ({
-          ...loop,
-          type: patchAnalysis && selectedLoops.length === 1 ? patchAnalysis.type : loop.type
-      }));
-      const res = await fetch(`http://localhost:8000/boolean-cut`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ loops: payloadLoops, extrude_depth: extrudeDepth, target_index: targetIndex })
-      });
-      if (res.ok) {
-        const geometryData = await res.json();
-        setRebuildHistory(prev => {
-            const newHistory = [...prev];
-            newHistory[targetIndex] = { 
-              ...geometryData, type: 'solid', id: prev[targetIndex].id, visible: prev[targetIndex].visible, 
-              name: prev[targetIndex].name + ' (Cut)', payload: prev[targetIndex].payload, endpoint: prev[targetIndex].endpoint
-            };
-            return newHistory;
-        });
-        setSelectedLoops([]); 
-        setSelectedItemIds([]);
-        setPatchAnalysis(null);
-      } else {
-        const errData = await res.json();
-        setServerLogs(prev => [...prev, `[Error] ${errData.detail}`]);
-      }
-    } catch (err) { console.error(err); }
-    setIsCommitting(false);
+    const targetId = selectedItemIds[0];
+    
+    const payloadLoops = selectedLoops.map(loop => ({
+        ...loop,
+        type: patchAnalysis && selectedLoops.length === 1 ? patchAnalysis.type : loop.type
+    }));
+    
+    executeGeometryOperation('boolean-cut', { geo_id: targetId, target_id: targetId, loops: payloadLoops, extrude_depth: extrudeDepth }, 'solid', 'Solid');
   };
 
   const handleSubtract = async (keepTool) => {
     if (selectedItemIds.length !== 2) return;
     
-    // Selection order dictates Target vs Tool
+    // Selection order strictly dictates Target vs Tool
     const targetId = selectedItemIds[0];
     const toolId = selectedItemIds[1];
-
-    const targetIndex = rebuildHistory.findIndex(geo => geo.id === targetId);
-    const toolIndex = rebuildHistory.findIndex(geo => geo.id === toolId);
 
     setIsCommitting(true);
     try {
@@ -743,8 +658,9 @@ export default function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ 
-                target_index: targetIndex, 
-                tool_index: toolIndex, 
+                geo_id: targetId,
+                target_id: targetId, 
+                tool_id: toolId, 
                 keep_tool: keepTool,
                 operation: 'subtract'
             })
@@ -753,15 +669,19 @@ export default function App() {
             const geometryData = await res.json();
             setRebuildHistory(prev => {
                 let newHistory = [...prev];
-                newHistory[targetIndex] = { 
-                    ...newHistory[targetIndex], 
+                
+                const tIndex = newHistory.findIndex(geo => geo.id === targetId);
+                const toIndex = newHistory.findIndex(geo => geo.id === toolId);
+                
+                newHistory[tIndex] = { 
+                    ...newHistory[tIndex], 
                     ...geometryData, 
-                    name: newHistory[targetIndex].name + ' (Subtracted)',
+                    name: newHistory[tIndex].name + ' (Subtracted)',
                     endpoint: 'boolean-op',
-                    payload: { operation: 'subtract', target_index: targetIndex, tool_index: toolIndex, keep_tool: keepTool }
+                    payload: { operation: 'subtract', geo_id: targetId, target_id: targetId, tool_id: toolId, keep_tool: keepTool }
                 };
-                if (!keepTool) {
-                    newHistory[toolIndex] = { ...newHistory[toolIndex], deleted: true };
+                if (!keepTool && toIndex >= 0) {
+                    newHistory[toIndex] = { ...newHistory[toIndex], deleted: true };
                 }
                 return newHistory;
             });
@@ -778,45 +698,18 @@ export default function App() {
     const targetId = typeof idToPromote === 'string' ? idToPromote : selectedItemIds[0];
     if (!targetId) return;
     
-    const targetIndex = rebuildHistory.findIndex(geo => geo.id === targetId);
-    if (targetIndex === -1) return;
+    const item = rebuildHistory.find(geo => geo.id === targetId);
+    if (!item) return;
 
-    const item = rebuildHistory[targetIndex];
-    setIsCommitting(true);
+    let targetEndpoint = item.endpoint;
+    const newPayload = { ...item.payload, geo_id: targetId, target_id: targetId, extrude_depth: extrudeDepth };
 
-    try {
-      let targetEndpoint = item.endpoint;
-      const newPayload = { ...item.payload, target_index: targetIndex, extrude_depth: extrudeDepth };
+    if (targetEndpoint === 'create-sheet') {
+        targetEndpoint = 'commit-geometry';
+        newPayload.operation = 'extrude';
+    }
 
-      if (targetEndpoint === 'create-sheet') {
-          targetEndpoint = 'commit-geometry';
-          newPayload.operation = 'extrude';
-      }
-
-      const res = await fetch(`http://localhost:8000/${targetEndpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newPayload)
-      });
-
-      if (res.ok) {
-        const geometryData = await res.json();
-        setRebuildHistory(prev => {
-            const newHistory = [...prev];
-            newHistory[targetIndex] = { 
-              ...item, ...geometryData, type: targetType, 
-              name: (item.name || `Sheet_${item.id}`).replace('Sheet', targetType === 'blade' ? 'Blade' : 'Solid').replace('Plane', targetType === 'blade' ? 'Blade' : 'Solid'), 
-              payload: newPayload, endpoint: targetEndpoint
-            };
-            return newHistory;
-        });
-        setSelectedItemIds([]);
-      } else {
-        const errData = await res.json();
-        setServerLogs(prev => [...prev, `[Error] ${errData.detail}`]);
-      }
-    } catch (err) { console.error(err); }
-    setIsCommitting(false);
+    executeGeometryOperation(targetEndpoint, newPayload, targetType, (item.name || `Sheet_${item.id}`).replace('Sheet', targetType === 'blade' ? 'Blade' : 'Solid').replace('Plane', targetType === 'blade' ? 'Blade' : 'Solid'));
   };
 
   const applyPreprocessing = async () => {
@@ -913,7 +806,13 @@ export default function App() {
       const res = await fetch('http://localhost:8000/export-step', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hulls: [], features: currentFeatures, merge_hulls: mergeExportHulls, symmetry: symmetry })
+        body: JSON.stringify({ 
+            hulls: [], 
+            features: currentFeatures, 
+            merge_hulls: mergeExportHulls, 
+            symmetry: symmetry,
+            active_geo_ids: rebuildHistory.filter(h => !h.deleted).map(h => h.id)
+        })
       });
       
       if (res.ok) {
@@ -1245,10 +1144,10 @@ export default function App() {
             meshOpacity={meshOpacity}
             selectedLoops={selectedLoops}
             
-            // This is the critical fix for the ghosting bug! We filter out soft-deleted items before sending to Viewport.
+            // Critical filter to hide soft-deleted geometries from Viewport
             rebuildHistory={rebuildHistory.filter(h => !h.deleted)}
             
-            selectedSolidIndex={selectedItemIds.length > 0 ? selectedItemIds[selectedItemIds.length - 1] : null}
+            selectedItemIds={selectedItemIds}
             cursorScale={cursorScale}
             showSheetsFolder={outlinerExpanded.sheets}
             showSolidsFolder={outlinerExpanded.solids}
@@ -1393,7 +1292,7 @@ export default function App() {
                   <div className="flex flex-col gap-1 mt-1.5 text-[10px] font-mono">
                      <div className="flex justify-between items-center">
                         <span className="text-zinc-400">Plane</span>
-                        <span className={patchAnalysis.type === 'plane' ? 'text-amber-400 font-bold bg-amber-900/20 px-1 rounded' : 'text-zinc-300'}>{patchAnalysis.errors?.plane?.toExponential(2) || 'N/A'}</span>
+                        <span className={patchAnalysis.type === 'plane' || patchAnalysis.type === 'planar' ? 'text-amber-400 font-bold bg-amber-900/20 px-1 rounded' : 'text-zinc-300'}>{patchAnalysis.errors?.plane?.toExponential(2) || 'N/A'}</span>
                      </div>
                      <div className="flex justify-between items-center">
                         <span className="text-zinc-400">Cylinder</span>
