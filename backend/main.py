@@ -78,6 +78,12 @@ class BooleanCutParams(BaseModel):
     extrude_depth: float
     target_index: int
 
+class BooleanOpParams(BaseModel):
+    target_index: int
+    tool_index: int
+    keep_tool: bool = False
+    operation: str = 'subtract'
+
 class CreatePrimitiveParams(BaseModel):
     patch_faces: list
     primitive_type: str
@@ -85,6 +91,21 @@ class CreatePrimitiveParams(BaseModel):
     symmetry: dict = None
     extrude_depth: float = 0.0
     target_index: int = None
+
+class TransformParams(BaseModel):
+    target_index: int
+    dx: float
+    dy: float
+    dz: float
+    rx: float
+    ry: float
+    rz: float
+    sx: float
+    sy: float
+    sz: float
+    px: float
+    py: float
+    pz: float
 
 class PreprocessParams(BaseModel):
     decimation_target: int = 25000
@@ -306,7 +327,6 @@ def perform_fitting_race(target_pt, sharpness_angle):
         "id": patch_id
     }
 
-
 @app.post("/classify-patch")
 async def classify_patch(params: ClassifyParams):
     if state.mesh is None:
@@ -515,7 +535,7 @@ async def create_primitive(params: CreatePrimitiveParams):
                 h_vals = np.dot(pts - apex, axis)
                 h_min, h_max = min(h_vals), max(h_vals)
                 
-                h_cone = max(abs(h_min), abs(h_max)) 
+                h_cone = max(abs(h_min), abs(h_max))
                 r_base = h_cone * np.tan(theta)
                 
                 base_center = apex - axis * h_cone
@@ -572,18 +592,20 @@ async def create_primitive(params: CreatePrimitiveParams):
             pts_vec = [b3d.Vector(p) for p in processed_loop]
             if (pts_vec[0] - pts_vec[-1]).length > 1e-5:
                 pts_vec.append(pts_vec[0])
+            
+            # The Magic Fix for Inverse Extrude:
+            if params.extrude_depth < 0:
+                pts_vec.reverse()
                 
             wire = b3d.Wire.make_polygon(pts_vec)
             solid = b3d.Face(wire)
 
-            # Dynamically extrude if promoted
-            if params.extrude_depth > 0:
-                solid = b3d.extrude(solid, amount=params.extrude_depth)
+            if params.extrude_depth != 0.0:
+                solid = b3d.extrude(solid, amount=abs(params.extrude_depth))
         
         else:
             raise ValueError(f"Unknown primitive type: {params.primitive_type}")
 
-        # Sync correctly with backend stack indices to avoid desync
         if params.target_index is not None and 0 <= params.target_index < len(state.rebuild_geometry):
             state.rebuild_geometry[params.target_index] = solid
         else:
@@ -693,6 +715,10 @@ async def commit_geometry(params: CommitGeometryParams):
             pts = [b3d.Vector(p) for p in pts_list]
             if (pts[0] - pts[-1]).length > 1e-5:
                 pts.append(pts[0])
+            
+            if params.operation == 'extrude' and params.extrude_depth < 0:
+                pts.reverse()
+                
             wire = b3d.Wire.make_polygon(pts)
             faces.append(b3d.Face(wire))
 
@@ -700,7 +726,7 @@ async def commit_geometry(params: CommitGeometryParams):
         
         try:
             if params.operation == 'extrude' and len(faces) == 1:
-                solid = b3d.extrude(faces[0], amount=params.extrude_depth)
+                solid = b3d.extrude(faces[0], amount=abs(params.extrude_depth))
             elif params.operation == 'loft' and len(faces) == 2:
                 solid = b3d.loft(faces)
             else:
@@ -711,7 +737,6 @@ async def commit_geometry(params: CommitGeometryParams):
                 raise ValueError("Loft failed: The resulting geometry would self-intersect. Try simplifying your loops.")
             raise b3d_err
 
-        # Sync correctly with backend stack indices to avoid desync
         if params.target_index is not None and 0 <= params.target_index < len(state.rebuild_geometry):
             state.rebuild_geometry[params.target_index] = solid
         else:
@@ -743,6 +768,101 @@ async def commit_geometry(params: CommitGeometryParams):
         broadcast_log(f"[Error] Failed to build CAD Solid: {err_msg}")
         raise HTTPException(status_code=400, detail=err_msg)
 
+@app.post("/transform-geometry")
+async def transform_geometry(params: TransformParams):
+    import build123d as b3d
+    from math import degrees
+    try:
+        if params.target_index >= len(state.rebuild_geometry):
+            raise ValueError("Transform target not found.")
+            
+        solid = state.rebuild_geometry[params.target_index]
+        if solid is None:
+            raise ValueError("Target geometry is missing or corrupted.")
+
+        pivot = (params.px, params.py, params.pz)
+        
+        if params.dx != 0 or params.dy != 0 or params.dz != 0:
+            solid = solid.translate((params.dx, params.dy, params.dz))
+
+        if params.rx != 0: 
+            solid = solid.rotate(b3d.Axis(pivot, (1,0,0)), degrees(params.rx))
+        if params.ry != 0: 
+            solid = solid.rotate(b3d.Axis(pivot, (0,1,0)), degrees(params.ry))
+        if params.rz != 0: 
+            solid = solid.rotate(b3d.Axis(pivot, (0,0,1)), degrees(params.rz))
+
+        if params.sx != 1.0 or params.sy != 1.0 or params.sz != 1.0:
+            solid = solid.translate((-params.px, -params.py, -params.pz))
+            try:
+                solid = solid.scale((params.sx, params.sy, params.sz))
+            except Exception as e:
+                broadcast_log(f"[Warning] Engine rejected non-uniform scaling on this shape type: {e}")
+            solid = solid.translate((params.px, params.py, params.pz))
+            
+        state.rebuild_geometry[params.target_index] = solid
+        
+        fd, path = tempfile.mkstemp(suffix=".stl")
+        os.close(fd)
+        try:
+            from build123d.exporters3d import export_stl
+            export_stl(solid, path)
+            tmesh = trimesh.load(path, file_type='stl')
+            return {"vertices": tmesh.vertices.tolist(), "faces": tmesh.faces.tolist()}
+        finally:
+            try: os.remove(path)
+            except: pass
+    except Exception as e:
+        broadcast_log(f"[Error] Transform failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/boolean-op")
+async def boolean_op(params: BooleanOpParams):
+    try:
+        import build123d as b3d
+    except ImportError:
+        raise HTTPException(status_code=500, detail="build123d missing")
+
+    broadcast_log(f"[System] Committing BOOLEAN {params.operation.upper()} to Stack...")
+    try:
+        if params.target_index >= len(state.rebuild_geometry) or params.tool_index >= len(state.rebuild_geometry):
+            raise ValueError("Target or Tool solid not found. Array out of bounds.")
+
+        target_solid = state.rebuild_geometry[params.target_index]
+        tool_solid = state.rebuild_geometry[params.tool_index]
+
+        if target_solid is None or tool_solid is None:
+            raise ValueError("One of the selected objects is empty or was previously hard-deleted.")
+        
+        if params.operation == 'subtract':
+            try:
+                result_solid = target_solid - tool_solid
+            except Exception:
+                from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+                cut_algo = BRepAlgoAPI_Cut(target_solid.wrapped, tool_solid.wrapped)
+                cut_algo.Build()
+                result_solid = b3d.Shape.cast(cut_algo.Shape())
+        else:
+            raise ValueError("Unsupported boolean operation.")
+        
+        state.rebuild_geometry[params.target_index] = result_solid
+
+        fd, path = tempfile.mkstemp(suffix=".stl")
+        os.close(fd)
+        try:
+            from build123d.exporters3d import export_stl
+            export_stl(result_solid, path)
+            tmesh = trimesh.load(path, file_type='stl')
+            broadcast_log(f"[Success] Boolean Op created. Returning {len(tmesh.faces)} faces.")
+            return {"vertices": tmesh.vertices.tolist(), "faces": tmesh.faces.tolist()}
+        finally:
+            try: os.remove(path)
+            except: pass
+            
+    except Exception as e:
+        broadcast_log(f"[Error] Failed Boolean operation: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Geometry Error: {str(e)}")
+
 @app.post("/boolean-cut")
 async def boolean_cut(params: BooleanCutParams):
     try:
@@ -765,12 +885,19 @@ async def boolean_cut(params: BooleanCutParams):
         pts = [b3d.Vector(p) for p in processed_loop]
         if (pts[0] - pts[-1]).length > 1e-5:
             pts.append(pts[0])
+            
+        if params.extrude_depth < 0:
+            pts.reverse()
+            
         wire = b3d.Wire.make_polygon(pts)
         face = b3d.Face(wire)
         
-        tool_extrusion = b3d.extrude(face, amount=params.extrude_depth)
+        tool_extrusion = b3d.extrude(face, amount=abs(params.extrude_depth))
         target_solid = state.rebuild_geometry[params.target_index]
         
+        if target_solid is None:
+             raise ValueError("Target geometry is missing or corrupted.")
+
         try:
             result_solid = target_solid - tool_extrusion
         except Exception:
@@ -1154,7 +1281,8 @@ async def export_step(payload: dict):
     symmetry = payload.get("symmetry", {"x": False, "y": False, "z": False})
     
     for shape in state.rebuild_geometry:
-        shapes.append(shape)
+        if shape is not None:
+            shapes.append(shape)
         
     hulls = payload.get("hulls", [])
     hull_solids = []

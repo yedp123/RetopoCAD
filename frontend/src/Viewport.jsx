@@ -221,7 +221,7 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, onSe
   );
 }
 
-function ActiveTransformSolid({ geo, material, centerOffset, transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap, onSelect }) {
+function ActiveTransformSolid({ geo, material, centerOffset, transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap, onSelect, onTransformEnd }) {
   const groupRef = useRef();
   const inputRef = useRef(null);
   const isDraggingRef = useRef(false);
@@ -300,33 +300,42 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
 
   const handleDraggingChanged = (e) => {
     isDraggingRef.current = e.value;
-    if (e.value && groupRef.current) {
-      startPos.current.copy(groupRef.current.position);
-      startRot.current.copy(groupRef.current.rotation);
-      startScale.current.copy(groupRef.current.scale);
-      if (inputRef.current) inputRef.current.value = '0';
+    if (!e.value && groupRef.current) {
+        const dP = groupRef.current.position.clone().sub(startPos.current);
+        const dR = [
+            groupRef.current.rotation.x - startRot.current.x,
+            groupRef.current.rotation.y - startRot.current.y,
+            groupRef.current.rotation.z - startRot.current.z
+        ];
+        const dS = groupRef.current.scale.clone().divide(startScale.current);
+
+        if (dP.lengthSq() > 0.0001 || Math.abs(dR[0])>0.001 || Math.abs(dR[1])>0.001 || Math.abs(dR[2])>0.001 || Math.abs(dS.x-1)>0.001 || Math.abs(dS.y-1)>0.001 || Math.abs(dS.z-1)>0.001) {
+            onTransformEnd(geo.id, dP, dR, dS, absoluteCenter);
+        }
+    } else if (e.value && groupRef.current) {
+        startPos.current.copy(groupRef.current.position);
+        startRot.current.copy(groupRef.current.rotation);
+        startScale.current.copy(groupRef.current.scale);
+        if (inputRef.current) inputRef.current.value = '0';
     }
   };
 
   const handleManualInput = (e) => {
     if (e.key === 'Enter') {
       const val = parseFloat(inputRef.current.value.replace(/[^0-9.-]/g, '')) || 0;
+      let dP = new THREE.Vector3();
+      let dR = [0,0,0];
+      let dS = new THREE.Vector3(1,1,1);
+
       if (transformMode === 'translate') {
-        const newPos = startPos.current.clone();
-        newPos[dominantAxis.current] += val;
-        groupRef.current.position.copy(newPos);
-        startPos.current.copy(newPos);
+        dP[dominantAxis.current] = val;
       } else if (transformMode === 'rotate') {
-        const newRot = startRot.current.clone();
-        newRot[dominantAxis.current] += (val * Math.PI / 180);
-        groupRef.current.rotation.copy(newRot);
-        startRot.current.copy(newRot);
+        dR[dominantAxis.current === 'x' ? 0 : dominantAxis.current === 'y' ? 1 : 2] = val * Math.PI / 180;
       } else if (transformMode === 'scale') {
-        const newScale = startScale.current.clone();
-        newScale[dominantAxis.current] += val;
-        groupRef.current.scale.copy(newScale);
-        startScale.current.copy(newScale);
+        dS[dominantAxis.current] += val; 
       }
+      
+      onTransformEnd(geo.id, dP, dR, dS, absoluteCenter);
       if (inputRef.current) inputRef.current.value = '0';
       e.target.blur();
     }
@@ -398,7 +407,7 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
 }
 
 function GhostModel({ 
-  url, symmetry, onSelectLoop, onSelectSolid,
+  url, symmetry, onSelectLoop, onSelectSolid, onTransformEnd,
   extractedFeatures, showMesh, showWireframe, meshOpacity,
   selectedLoops, rebuildHistory, selectedSolidIndex, cursorScale,
   showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle,
@@ -557,7 +566,7 @@ function GhostModel({
         {rebuildHistory?.map((geo, idx) => {
            const isVisible = geo.visible !== false &&
              !(geo.type === 'sheet' && !showSheetsFolder) &&
-             !(geo.type === 'solid' && !showSolidsFolder);
+             !(['solid','blade'].includes(geo.type) && !showSolidsFolder);
            if (!isVisible) return null;
 
            const isSelected = geo.id === selectedSolidIndex;
@@ -568,7 +577,7 @@ function GhostModel({
               e.stopPropagation(); 
               const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
               const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
-              if (onSelectSolid) onSelectSolid(geo.id, { x: screenX, y: screenY }); 
+              if (onSelectSolid) onSelectSolid(geo.id, { x: screenX, y: screenY }, e); 
            };
 
            if (isSelected && transformMode && (transformMode === 'translate' || transformMode === 'rotate' || transformMode === 'scale')) {
@@ -584,6 +593,7 @@ function GhostModel({
                      angleSnap={angleSnap}
                      setAngleSnap={setAngleSnap}
                      onSelect={handleSelect}
+                     onTransformEnd={onTransformEnd}
                   />
                );
            }
@@ -615,7 +625,7 @@ function GhostModel({
             {rebuildHistory?.map((geo, idx) => {
                const isVisible = geo.visible !== false &&
                  !(geo.type === 'sheet' && !showSheetsFolder) &&
-                 !(geo.type === 'solid' && !showSolidsFolder);
+                 !(['solid','blade'].includes(geo.type) && !showSolidsFolder);
                if (!isVisible) return null;
                return (
                  <group key={`mirror-geo-${mirrorKey}-${idx}`}>
@@ -647,7 +657,7 @@ function GhostModel({
 
 export default function Viewport(props) {
   const { 
-     objUrl, cleanedObjUrl, symmetry, onSelectLoop, onSelectSolid,
+     objUrl, cleanedObjUrl, symmetry, onSelectLoop, onSelectSolid, onTransformEnd,
      extractedFeatures, showMesh, showWireframe, meshOpacity,
      selectedLoops, rebuildHistory, selectedSolidIndex, cursorScale,
      showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle,

@@ -17,33 +17,38 @@ const IconCone = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="non
 const IconTorus = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="4"></circle></svg>;
 const IconWave = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 12c-2.66 0-4.33-3-7-3s-4.34 3-7 3-4.33-3-7-3"></path></svg>;
 const IconTrash = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>;
-
 const IconCursor = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/></svg>;
 const IconMove = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 9l-3 3 3 3M9 5l3-3 3 3M19 9l3 3-3 3M9 19l3 3 3 3M2 12h20M12 2v20"/></svg>;
 const IconRotate = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>;
 const IconScale = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 3l-6 6M21 3v6M21 3h-6M3 21l6-6M3 21v-6M3 21h6M14 10L10 14"/></svg>;
+const IconLink = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>;
+const IconFlip = () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="16 3 21 3 21 8"></polyline><line x1="4" y1="20" x2="21" y2="3"></line><polyline points="21 16 21 21 16 21"></polyline><line x1="15" y1="15" x2="21" y2="21"></line><line x1="4" y1="4" x2="9" y2="9"></line></svg>;
 
 const applySnap = (value, snapThreshold) => {
     if (!snapThreshold || snapThreshold <= 0) return value;
     return Math.round(value / snapThreshold) * snapThreshold;
 };
 
-function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive, linearSnap, transformMode }) {
+function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onSubtract, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive, onCreateBlade, linearSnap, transformMode }) {
   const [pos, setPos] = useState({ x: -1000, y: -1000 });
-  
-  const isEditingExtrude = selectedItemData?.payload?.operation === 'extrude' || 
-                           (selectedItemData?.payload?.primitive_type === 'plane' && selectedItemData?.payload?.extrude_depth !== undefined) || 
-                           selectedItemData?.payload?.operation === 'extrude_sheet';
+  const [keepTool, setKeepTool] = useState(false);
+
+  const isSingleExtrusion = selectedItemsData.length === 1 && (
+      selectedItemsData[0].payload?.operation === 'extrude' || 
+      selectedItemsData[0].type === 'blade' ||
+      (selectedItemsData[0].payload?.primitive_type === 'plane' && selectedItemsData[0].payload?.extrude_depth !== undefined) || 
+      selectedItemsData[0].payload?.operation === 'extrude_sheet'
+  );
                            
   const [localDepth, setLocalDepth] = useState(extrudeDepth);
 
   useEffect(() => {
-    if (isEditingExtrude) {
-        setLocalDepth(selectedItemData.payload.extrude_depth || 0);
+    if (isSingleExtrusion && selectedItemsData[0]) {
+        setLocalDepth(selectedItemsData[0].payload?.extrude_depth || 0);
     } else {
         setLocalDepth(extrudeDepth);
     }
-  }, [selectedItemData, extrudeDepth, isEditingExtrude]);
+  }, [selectedItemsData, extrudeDepth, isSingleExtrusion]);
 
   useEffect(() => {
     if (!anchorPos) return;
@@ -52,24 +57,29 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
     const offset = transformActive ? 320 : 120;
     const ringSize = 135; 
 
-    let targetX = anchorPos.x + offset + (selectedItemData ? 160 : 0);
+    let targetX = anchorPos.x + offset + (selectedItemsData.length > 0 ? 160 : 0);
     let targetY = anchorPos.y + offset;
 
-    if (targetX + ringSize > window.innerWidth) targetX = anchorPos.x - offset - (selectedItemData ? 160 : 0); 
+    if (targetX + ringSize > window.innerWidth) targetX = anchorPos.x - offset - (selectedItemsData.length > 0 ? 160 : 0); 
     if (targetY + ringSize > window.innerHeight) targetY = anchorPos.y - offset;
 
     setPos({ x: targetX, y: targetY });
-  }, [anchorPos, selectedItemData, transformMode]);
+  }, [anchorPos, selectedItemsData, transformMode]);
 
-  if ((!selectedLoops || selectedLoops.length === 0) && !selectedItemData) return null;
+  if ((!selectedLoops || selectedLoops.length === 0) && selectedItemsData.length === 0) return null;
 
   const planeCount = selectedLoops.filter(l => l.type !== 'circle').length;
   const circleCount = selectedLoops.filter(l => l.type === 'circle').length;
   let selectionText = [];
   if (planeCount > 0) selectionText.push(`${planeCount} Plane${planeCount > 1 ? 's' : ''}`);
   if (circleCount > 0) selectionText.push(`${circleCount} Cylinder${circleCount > 1 ? 's' : ''}`);
-  if (selectedItemData && selectedLoops.length === 0) {
-      selectionText.push(`1 ${selectedItemData.type === 'sheet' ? 'Sheet' : 'Solid'}`);
+  
+  if (selectedItemsData.length > 0) {
+      const typeCounts = {};
+      selectedItemsData.forEach(i => typeCounts[i.type] = (typeCounts[i.type] || 0) + 1);
+      Object.entries(typeCounts).forEach(([type, count]) => {
+          selectionText.push(`${count} ${type.charAt(0).toUpperCase() + type.slice(1)}${count > 1 ? 's' : ''}`);
+      });
   }
   const selectionString = selectionText.length > 0 ? `Selected: ${selectionText.join(', ')}` : '';
 
@@ -81,30 +91,63 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
   const buttons = [];
   const outerButtons = [];
 
-  if (selectedLoops.length > 0) {
+  const isSingleSheet = selectedItemsData.length === 1 && selectedItemsData[0].type === 'sheet';
+  const hasVolume = selectedItemsData.some(i => i.type === 'solid' || i.type === 'blade');
+  const isTwoVolumes = selectedItemsData.length === 2 && 
+      selectedItemsData.every(i => i.type === 'solid' || i.type === 'blade');
+  const isLoopAndSolid = selectedLoops.length === 1 && selectedItemsData.length === 1 && selectedItemsData[0].type === 'solid';
+
+  if (selectedLoops.length > 0 && selectedItemsData.length === 0) {
       buttons.push({ label: extrudeLabel, icon: isCylinderLoop ? <IconCylinderFill /> : <IconExtrude />, angle: -90, action: onExtrude, disabled: selectedLoops.length !== 1, color: 'text-blue-400' });
       buttons.push({ label: 'Loft', icon: <IconLoft />, angle: 0, action: onLoft, disabled: selectedLoops.length !== 2, color: 'text-blue-400' });
       
       if (patchAnalysis) {
           buttons.push({ label: 'Create\nPrimitive', icon: <IconExtrude />, angle: 90, action: onCreatePrimitive, disabled: false, color: 'text-emerald-400' });
+          if (patchAnalysis.type === 'plane') {
+              buttons.push({ label: 'Create\nBlade', icon: <IconSquare />, angle: 135, action: onCreateBlade, disabled: false, color: 'text-amber-400' });
+          }
       } else {
           buttons.push({ label: 'Sheet', icon: <IconSheet />, angle: 90, action: onSheet, disabled: selectedLoops.length !== 1, color: 'text-green-400' });
       }
       
       buttons.push({ label: 'Extract\nCurve', icon: <IconWave />, angle: 180, action: onExtractCurve, disabled: selectedLoops.length === 0, color: 'text-purple-400' });
-      
-      if (selectedItemData) {
-          buttons.push({ label: 'Cut', icon: <IconCut />, angle: -45, action: onCut, disabled: selectedLoops.length !== 1, color: 'text-orange-400' });
-      }
-  } else if (selectedItemData) {
-      if (selectedItemData.type === 'sheet') {
-          buttons.push({ label: 'Extrude', icon: <IconExtrude />, angle: -90, action: () => onPromote(selectedItemData.id), disabled: false, color: 'text-emerald-400' });
-      }
-      buttons.push({ label: 'Cut', icon: <IconCut />, angle: -45, action: onCut, disabled: true, color: 'text-orange-400' });
+  } 
+
+  if (isSingleSheet) {
+      buttons.push({ label: 'Promote to\nSolid', icon: <IconExtrude />, angle: -45, action: () => onPromote(selectedItemsData[0].id, 'solid'), disabled: false, color: 'text-emerald-400' });
+      buttons.push({ label: 'Convert to\nBlade', icon: <IconSquare />, angle: -135, action: () => onPromote(selectedItemsData[0].id, 'blade'), disabled: false, color: 'text-amber-400' });
+  } else if (isSingleExtrusion) {
+      buttons.push({ label: 'Flip\nDirection', icon: <IconFlip />, angle: 90, action: () => onUpdateDepth(selectedItemsData[0].id, (selectedItemsData[0].payload?.extrude_depth || extrudeDepth) * -1), disabled: false, color: 'text-amber-400' });
   }
 
-  if (selectedLoops.length > 0 || selectedItemData) {
-      outerButtons.push({ label: 'Delete', icon: <IconTrash />, angle: -45, action: onDeleteItem, disabled: !selectedItemData, color: 'text-red-500' });
+  if (isTwoVolumes) {
+      buttons.push({ label: 'Subtract', icon: <IconCut />, angle: -90, action: () => onSubtract(keepTool), disabled: false, color: 'text-orange-400' });
+  }
+  
+  if (hasVolume) {
+      outerButtons.push({ 
+          label: keepTool ? 'Keep Tool:\nON' : 'Keep Tool:\nOFF', 
+          icon: <IconLink />, 
+          angle: -45, 
+          action: () => setKeepTool(!keepTool), 
+          disabled: false, 
+          color: keepTool ? 'text-emerald-400' : 'text-zinc-500' 
+      });
+  }
+
+  if (isLoopAndSolid) {
+      buttons.push({ label: 'Cut', icon: <IconCut />, angle: -45, action: onCut, disabled: false, color: 'text-orange-400' });
+  }
+
+  if (selectedLoops.length > 0 || selectedItemsData.length > 0) {
+      outerButtons.push({ 
+          label: 'Delete', 
+          icon: <IconTrash />, 
+          angle: -135, 
+          action: () => onDeleteItem(selectedItemsData.map(i => i.id)), 
+          disabled: selectedItemsData.length === 0 && selectedLoops.length === 0, 
+          color: 'text-red-500' 
+      });
       outerButtons.push({ label: 'Clear\nSelection', icon: <IconClear />, angle: 45, action: onClear, disabled: false, color: 'text-zinc-400' });
   }
 
@@ -113,7 +156,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
        
        <div className="absolute bottom-[130px] flex flex-col items-center gap-1.5 pointer-events-none w-80 text-center">
           {selectionString && (
-            <span className={`font-black px-3 py-1 rounded text-[10px] uppercase tracking-widest ${isEditingExtrude ? 'bg-amber-600 text-white border border-amber-500 shadow-[0_0_15px_rgba(217,119,6,0.5)]' : 'bg-amber-500 text-zinc-950 border border-amber-400 shadow-[0_0_15px_rgba(245,158,11,0.3)]'}`}>
+            <span className={`font-black px-3 py-1 rounded text-[10px] uppercase tracking-widest ${isSingleExtrusion ? 'bg-amber-600 text-white border border-amber-500 shadow-[0_0_15px_rgba(217,119,6,0.5)]' : 'bg-amber-500 text-zinc-950 border border-amber-400 shadow-[0_0_15px_rgba(245,158,11,0.3)]'}`}>
               {selectionString}
             </span>
           )}
@@ -138,12 +181,12 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
        
        <div 
           onPointerDown={(e) => e.stopPropagation()}
-          className={`absolute pointer-events-auto flex flex-col items-center justify-center w-14 h-14 rounded-full border shadow-xl backdrop-blur-md animate-in zoom-in transition-colors ${isEditingExtrude ? 'bg-zinc-800/95 border-amber-500/50' : 'bg-zinc-800/90 border-zinc-600'}`}
+          className={`absolute pointer-events-auto flex flex-col items-center justify-center w-14 h-14 rounded-full border shadow-xl backdrop-blur-md animate-in zoom-in transition-colors ${isSingleExtrusion ? 'bg-zinc-800/95 border-amber-500/50' : 'bg-zinc-800/90 border-zinc-600'}`}
        >
          {isCylinderLoop && (
              <span className="text-[7.5px] font-black uppercase text-emerald-400 tracking-tighter leading-none mb-1">R: {selectedLoops[0].radius.toFixed(2)}</span>
          )}
-         <span className={`text-[7px] font-black uppercase tracking-tighter leading-none mb-0.5 mt-0.5 ${isEditingExtrude ? 'text-amber-400' : 'text-zinc-400'}`}>Depth</span>
+         <span className={`text-[7px] font-black uppercase tracking-tighter leading-none mb-0.5 mt-0.5 ${isSingleExtrusion ? 'text-amber-400' : 'text-zinc-400'}`}>Depth</span>
          <input 
            type="number" 
            value={localDepth} 
@@ -151,9 +194,9 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
            onBlur={(e) => {
                const snappedVal = applySnap(parseFloat(e.target.value) || 0, linearSnap);
                setLocalDepth(snappedVal);
-               if (isEditingExtrude) {
-                   if (snappedVal !== (selectedItemData.payload.extrude_depth || 0)) {
-                       onUpdateDepth(selectedItemData.id, snappedVal);
+               if (isSingleExtrusion && selectedItemsData[0]) {
+                   if (snappedVal !== (selectedItemsData[0].payload?.extrude_depth || 0)) {
+                       onUpdateDepth(selectedItemsData[0].id, snappedVal);
                    }
                } else {
                    setExtrudeDepth(snappedVal);
@@ -162,7 +205,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
            onKeyDown={(e) => {
                if (e.key === 'Enter') e.target.blur();
            }}
-           className={`w-10 bg-transparent text-center text-[10px] font-mono outline-none focus:bg-zinc-700/50 rounded transition-colors ${isEditingExtrude ? 'text-amber-400 font-bold' : 'text-white'}`}
+           className={`w-10 bg-transparent text-center text-[10px] font-mono outline-none focus:bg-zinc-700/50 rounded transition-colors ${isSingleExtrusion ? 'text-amber-400 font-bold' : 'text-white'}`}
            step={linearSnap > 0 ? linearSnap : 0.5}
          />
        </div>
@@ -233,7 +276,7 @@ export default function App() {
 
   const [selectedLoops, setSelectedLoops] = useState([]);
   const [rebuildHistory, setRebuildHistory] = useState([]); 
-  const [selectedItemId, setSelectedItemId] = useState(null); 
+  const [selectedItemIds, setSelectedItemIds] = useState([]); 
   const [extrudeDepth, setExtrudeDepth] = useState(5.0);
   const [isCommitting, setIsCommitting] = useState(false);
   
@@ -287,7 +330,7 @@ export default function App() {
             const res = await fetch('http://localhost:8000/undo-geometry', { method: 'POST' });
             if (res.ok) {
                 setRebuildHistory(prev => prev.slice(0, -1));
-                setSelectedItemId(null);
+                setSelectedItemIds([]);
             }
         } catch (err) { console.error(err); }
     } else if (historyIndex > 0) {
@@ -306,13 +349,12 @@ export default function App() {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
       
       const key = e.key.toLowerCase();
-      // CAD Hotkeys (Q, W, E, R)
+      
       if (key === 'q') setTransformMode(null);
       if (key === 'w') setTransformMode('translate');
       if (key === 'e') setTransformMode('rotate');
       if (key === 'r') setTransformMode('scale');
 
-      // Undo/Redo Hotkeys
       if (e.ctrlKey || e.metaKey) {
         if (key === 'z') {
           e.preventDefault();
@@ -323,12 +365,11 @@ export default function App() {
         }
       }
 
-      // Delete/Backspace hook
       if (key === 'delete' || key === 'backspace') {
          e.preventDefault();
-         if (selectedItemId) {
-             setRebuildHistory(prev => prev.filter(geo => geo.id !== selectedItemId));
-             setSelectedItemId(null);
+         if (selectedItemIds.length > 0) {
+             setRebuildHistory(prev => prev.map(geo => selectedItemIds.includes(geo.id) ? { ...geo, deleted: true } : geo));
+             setSelectedItemIds([]);
          } else if (selectedLoops.length > 0) {
              const loopsToRemove = selectedLoops.map(l => l.id);
              commitFeatures(currentFeatures.filter(f => !loopsToRemove.includes(f.id)));
@@ -339,16 +380,17 @@ export default function App() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [historyIndex, featuresHistory.length, rebuildHistory, selectedItemId, selectedLoops, currentFeatures]);
+  }, [historyIndex, featuresHistory.length, rebuildHistory, selectedItemIds, selectedLoops, currentFeatures]);
 
   const handleDeleteFeature = (id) => {
     const filtered = currentFeatures.filter(f => f.id !== id);
     commitFeatures(filtered);
   };
 
-  const handleDeleteGeometry = (id) => {
-    setRebuildHistory(prev => prev.filter(geo => geo.id !== id));
-    if (selectedItemId === id) setSelectedItemId(null);
+  const handleDeleteGeometry = (ids) => {
+    const idList = Array.isArray(ids) ? ids : [ids];
+    setRebuildHistory(prev => prev.map(geo => idList.includes(geo.id) ? { ...geo, deleted: true } : geo));
+    setSelectedItemIds(prev => prev.filter(id => !idList.includes(id)));
   };
 
   const handleClearAllFeatures = () => {
@@ -426,7 +468,49 @@ export default function App() {
               visible: true, name: `${defaultName} ${prev.length + 1}`, payload: { operation: 'primitive', primitive_type: patchAnalysis.type, patch_faces: loop.patch_faces }, endpoint: 'create-primitive' 
             }]);
             setSelectedLoops([]); 
-            setSelectedItemId(null);
+            setSelectedItemIds([]);
+            setPatchAnalysis(null);
+        } else {
+            const errData = await res.json();
+            setServerLogs(prev => [...prev, `[Error] ${errData.detail}`]);
+        }
+    } catch (err) {
+        setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]);
+    }
+    setIsCommitting(false);
+  };
+
+  const handleCreateBlade = async () => {
+    if (selectedLoops.length === 0 || !patchAnalysis) return;
+    const loop = selectedLoops[0];
+    if (!loop.patch_faces) return;
+
+    setIsCommitting(true);
+    try {
+        const payload = {
+            patch_faces: loop.patch_faces,
+            primitive_type: patchAnalysis.type,
+            sharpness_angle: sharpnessAngle,
+            symmetry: symmetry,
+            extrude_depth: extrudeDepth 
+        };
+
+        const res = await fetch(`http://localhost:8000/create-primitive`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (res.ok) {
+            const geometryData = await res.json();
+            setRebuildHistory(prev => [...prev, {
+              ...geometryData, type: 'blade', id: Math.random().toString(36).substr(2, 9),
+              visible: true, name: `Blade ${prev.length + 1}`,
+              payload: { operation: 'primitive', primitive_type: patchAnalysis.type, patch_faces: loop.patch_faces, extrude_depth: extrudeDepth },
+              endpoint: 'create-primitive'
+            }]);
+            setSelectedLoops([]);
+            setSelectedItemIds([]);
             setPatchAnalysis(null);
         } else {
             const errData = await res.json();
@@ -491,7 +575,9 @@ export default function App() {
   };
 
   const handleSelectSolid = (id, clickPos) => {
-    setSelectedItemId(id);
+    setSelectedItemIds(prev => {
+        return prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id];
+    });
     if (clickPos) setMenuAnchor(clickPos);
     else setMenuAnchor({ x: window.innerWidth / 2, y: window.innerHeight / 2 }); 
   };
@@ -517,7 +603,7 @@ export default function App() {
           visible: true, name: `${defaultName} ${prev.length + 1}`, payload, endpoint 
         }]);
         setSelectedLoops([]); 
-        setSelectedItemId(null);
+        setSelectedItemIds([]);
         setPatchAnalysis(null);
       } else {
         const errData = await res.json();
@@ -538,11 +624,47 @@ export default function App() {
   const handleLoft = () => executeGeometryOperation('commit-geometry', { operation: 'loft', loops: selectedLoops }, 'solid', 'Loft');
   const handleSheet = () => executeGeometryOperation('create-sheet', { operation: 'sheet', loops: selectedLoops }, 'sheet', 'Sheet');
 
+  const handleTransformEnd = async (id, dP, dR, dS, absoluteCenter) => {
+    const index = rebuildHistory.findIndex(geo => geo.id === id);
+    if (index === -1) return;
+    
+    setIsCommitting(true);
+    try {
+        const res = await fetch('http://localhost:8000/transform-geometry', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                target_index: index,
+                dx: dP.x, dy: dP.y, dz: dP.z,
+                rx: dR[0], ry: dR[1], rz: dR[2],
+                sx: dS.x, sy: dS.y, sz: dS.z,
+                px: absoluteCenter.x, py: absoluteCenter.y, pz: absoluteCenter.z
+            })
+        });
+        if (res.ok) {
+            const data = await res.json();
+            setRebuildHistory(prev => {
+                const newHistory = [...prev];
+                newHistory[index] = { ...newHistory[index], vertices: data.vertices, faces: data.faces };
+                return newHistory;
+            });
+            setServerLogs(prev => [...prev, `[Success] Solid structurally transformed.`]);
+        } else {
+            const err = await res.json();
+            setServerLogs(prev => [...prev, `[Error] Transform failed: ${err.detail}`]);
+        }
+    } catch (e) {
+        setServerLogs(prev => [...prev, `[Error] Network Failure during transform.`]);
+    }
+    setIsCommitting(false);
+  };
+
   const handleUpdateHistoryItemDepth = async (id, newDepth) => {
     const item = rebuildHistory.find(i => i.id === id);
     if (!item || !item.payload) return;
     
     const isExtrude = item.payload.operation === 'extrude' || 
+                      item.type === 'blade' ||
                       (item.payload.primitive_type === 'plane' && item.payload.extrude_depth !== undefined) || 
                       item.payload.operation === 'extrude_sheet';
     
@@ -569,7 +691,8 @@ export default function App() {
   };
 
   const handleCut = async () => {
-    const targetIndex = rebuildHistory.findIndex(geo => geo.id === selectedItemId);
+    if (selectedItemIds.length !== 1) return;
+    const targetIndex = rebuildHistory.findIndex(geo => geo.id === selectedItemIds[0]);
     if (targetIndex === -1) return;
 
     setIsCommitting(true);
@@ -594,7 +717,7 @@ export default function App() {
             return newHistory;
         });
         setSelectedLoops([]); 
-        setSelectedItemId(null);
+        setSelectedItemIds([]);
         setPatchAnalysis(null);
       } else {
         const errData = await res.json();
@@ -604,8 +727,55 @@ export default function App() {
     setIsCommitting(false);
   };
 
-  const handlePromoteSheet = async (idToPromote) => {
-    const targetId = typeof idToPromote === 'string' ? idToPromote : selectedItemId;
+  const handleSubtract = async (keepTool) => {
+    if (selectedItemIds.length !== 2) return;
+    
+    // Selection order dictates Target vs Tool
+    const targetId = selectedItemIds[0];
+    const toolId = selectedItemIds[1];
+
+    const targetIndex = rebuildHistory.findIndex(geo => geo.id === targetId);
+    const toolIndex = rebuildHistory.findIndex(geo => geo.id === toolId);
+
+    setIsCommitting(true);
+    try {
+        const res = await fetch(`http://localhost:8000/boolean-op`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                target_index: targetIndex, 
+                tool_index: toolIndex, 
+                keep_tool: keepTool,
+                operation: 'subtract'
+            })
+        });
+        if (res.ok) {
+            const geometryData = await res.json();
+            setRebuildHistory(prev => {
+                let newHistory = [...prev];
+                newHistory[targetIndex] = { 
+                    ...newHistory[targetIndex], 
+                    ...geometryData, 
+                    name: newHistory[targetIndex].name + ' (Subtracted)',
+                    endpoint: 'boolean-op',
+                    payload: { operation: 'subtract', target_index: targetIndex, tool_index: toolIndex, keep_tool: keepTool }
+                };
+                if (!keepTool) {
+                    newHistory[toolIndex] = { ...newHistory[toolIndex], deleted: true };
+                }
+                return newHistory;
+            });
+            setSelectedItemIds([targetId]);
+        } else {
+            const errData = await res.json();
+            setServerLogs(prev => [...prev, `[Error] ${errData.detail}`]);
+        }
+    } catch (err) { console.error(err); }
+    setIsCommitting(false);
+  };
+
+  const handlePromoteSheet = async (idToPromote, targetType = 'solid') => {
+    const targetId = typeof idToPromote === 'string' ? idToPromote : selectedItemIds[0];
     if (!targetId) return;
     
     const targetIndex = rebuildHistory.findIndex(geo => geo.id === targetId);
@@ -618,7 +788,6 @@ export default function App() {
       let targetEndpoint = item.endpoint;
       const newPayload = { ...item.payload, target_index: targetIndex, extrude_depth: extrudeDepth };
 
-      // Reroute sheets created from curves to the geometry extrude engine
       if (targetEndpoint === 'create-sheet') {
           targetEndpoint = 'commit-geometry';
           newPayload.operation = 'extrude';
@@ -635,13 +804,13 @@ export default function App() {
         setRebuildHistory(prev => {
             const newHistory = [...prev];
             newHistory[targetIndex] = { 
-              ...item, ...geometryData, type: 'solid', 
-              name: (item.name || `Sheet_${item.id}`).replace('Sheet', 'Solid').replace('Plane', 'Extrude'), 
+              ...item, ...geometryData, type: targetType, 
+              name: (item.name || `Sheet_${item.id}`).replace('Sheet', targetType === 'blade' ? 'Blade' : 'Solid').replace('Plane', targetType === 'blade' ? 'Blade' : 'Solid'), 
               payload: newPayload, endpoint: targetEndpoint
             };
             return newHistory;
         });
-        setSelectedItemId(null);
+        setSelectedItemIds([]);
       } else {
         const errData = await res.json();
         setServerLogs(prev => [...prev, `[Error] ${errData.detail}`]);
@@ -673,7 +842,7 @@ export default function App() {
     setFeaturesHistory([[]]);
     setHistoryIndex(0);
     setSelectedLoops([]);
-    setSelectedItemId(null);
+    setSelectedItemIds([]);
     setPatchAnalysis(null);
     setRebuildHistory([]);
 
@@ -761,9 +930,9 @@ export default function App() {
     setIsExporting(false);
   };
 
-  const sheets = rebuildHistory.filter(h => h.type === 'sheet');
-  const solids = rebuildHistory.filter(h => h.type === 'solid');
-  const selectedItemData = rebuildHistory.find(geo => geo.id === selectedItemId);
+  const sheets = rebuildHistory.filter(h => h.type === 'sheet' && !h.deleted);
+  const solids = rebuildHistory.filter(h => (h.type === 'solid' || h.type === 'blade') && !h.deleted);
+  const selectedItemsData = selectedItemIds.map(id => rebuildHistory.find(h => h.id === id && !h.deleted)).filter(Boolean);
 
   return (
     <div 
@@ -780,21 +949,23 @@ export default function App() {
       <ActionRing 
         anchorPos={menuAnchor} 
         selectedLoops={selectedLoops} 
-        selectedItemData={selectedItemData}
+        selectedItemsData={selectedItemsData}
         extrudeDepth={extrudeDepth}
         setExtrudeDepth={setExtrudeDepth}
         onExtrude={handleExtrude}
         onLoft={handleLoft}
         onSheet={handleSheet}
         onCut={handleCut}
+        onSubtract={handleSubtract}
         onPromote={handlePromoteSheet}
         onExtractCurve={handleExtractCurveFromRing}
-        onDeleteItem={() => handleDeleteGeometry(selectedItemId)}
-        onClear={() => { setSelectedLoops([]); setSelectedItemId(null); setPatchAnalysis(null); }}
+        onDeleteItem={(ids) => handleDeleteGeometry(ids)}
+        onClear={() => { setSelectedLoops([]); setSelectedItemIds([]); setPatchAnalysis(null); }}
         onUpdateDepth={handleUpdateHistoryItemDepth}
         patchAnalysis={patchAnalysis}
         setPatchAnalysis={setPatchAnalysis}
         onCreatePrimitive={handleCreatePrimitive}
+        onCreateBlade={handleCreateBlade}
         linearSnap={linearSnap}
         transformMode={transformMode}
       />
@@ -988,7 +1159,19 @@ export default function App() {
                {outlinerExpanded.sheets && (
                  <div className="flex flex-col gap-0.5 pl-3 pr-1 mt-0.5">
                     {sheets.length === 0 ? <span className="px-2 text-[8px] text-zinc-600 italic">Empty</span> : sheets.map((geo) => (
-                      <div key={geo.id} onClick={() => setSelectedItemId(geo.id)} className={`flex items-center justify-between px-2 py-1 rounded border cursor-pointer transition-colors ${selectedItemId === geo.id ? 'bg-zinc-800 border-green-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}>
+                      <div 
+                        key={geo.id} 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedItemIds(prev => {
+                              if (e.shiftKey || e.ctrlKey || e.metaKey) {
+                                  return prev.includes(geo.id) ? prev.filter(x => x !== geo.id) : [...prev, geo.id];
+                              }
+                              return [geo.id];
+                          });
+                        }} 
+                        className={`flex items-center justify-between px-2 py-1 rounded border cursor-pointer transition-colors ${selectedItemIds.includes(geo.id) ? 'bg-zinc-800 border-green-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
+                      >
                         <span className="text-[9px] text-zinc-300 font-mono truncate w-20">{geo.name || `Sheet_${geo.id}`}</span>
                         <div className="flex gap-1">
                           <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0 scale-75">
@@ -1008,15 +1191,27 @@ export default function App() {
                <button onClick={() => toggleOutliner('solids')} className="flex items-center justify-between px-2 py-1.5 hover:bg-zinc-800/50 rounded transition-colors group">
                   <div className="flex items-center gap-1.5">
                      <span className="text-blue-500/80 scale-75"><IconCylinderOutline /></span>
-                     <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 group-hover:text-zinc-200">Solids</span>
+                     <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 group-hover:text-zinc-200">Solids & Blades</span>
                   </div>
                   <span className="text-zinc-600 text-[7px]">{outlinerExpanded.solids ? '▼' : '▶'}</span>
                </button>
                {outlinerExpanded.solids && (
                  <div className="flex flex-col gap-0.5 pl-3 pr-1 mt-0.5">
                     {solids.length === 0 ? <span className="px-2 text-[8px] text-zinc-600 italic">Empty</span> : solids.map((geo) => (
-                      <div key={geo.id} onClick={() => setSelectedItemId(geo.id)} className={`flex items-center justify-between px-2 py-1 rounded border cursor-pointer transition-colors ${selectedItemId === geo.id ? 'bg-zinc-800 border-blue-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}>
-                        <span className="text-[9px] text-zinc-300 font-mono truncate w-20">{geo.name || `Solid_${geo.id}`}</span>
+                      <div 
+                        key={geo.id} 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedItemIds(prev => {
+                              if (e.shiftKey || e.ctrlKey || e.metaKey) {
+                                  return prev.includes(geo.id) ? prev.filter(x => x !== geo.id) : [...prev, geo.id];
+                              }
+                              return [geo.id];
+                          });
+                        }}  
+                        className={`flex items-center justify-between px-2 py-1 rounded border cursor-pointer transition-colors ${selectedItemIds.includes(geo.id) ? (geo.type === 'blade' ? 'bg-zinc-800 border-amber-500/50' : 'bg-zinc-800 border-blue-500/50') : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
+                      >
+                        <span className="text-[9px] text-zinc-300 font-mono truncate w-20">{geo.name || `${geo.type === 'blade' ? 'Blade' : 'Solid'}_${geo.id}`}</span>
                         <div className="flex gap-1">
                           <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0 scale-75">
                             {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
@@ -1043,13 +1238,17 @@ export default function App() {
             symmetry={symmetry} 
             onSelectLoop={handleSelectLoop}
             onSelectSolid={handleSelectSolid}
+            onTransformEnd={handleTransformEnd}
             extractedFeatures={currentFeatures}
             showMesh={showMesh} 
             showWireframe={showWireframe}
             meshOpacity={meshOpacity}
             selectedLoops={selectedLoops}
-            rebuildHistory={rebuildHistory}
-            selectedSolidIndex={selectedItemId}
+            
+            // This is the critical fix for the ghosting bug! We filter out soft-deleted items before sending to Viewport.
+            rebuildHistory={rebuildHistory.filter(h => !h.deleted)}
+            
+            selectedSolidIndex={selectedItemIds.length > 0 ? selectedItemIds[selectedItemIds.length - 1] : null}
             cursorScale={cursorScale}
             showSheetsFolder={outlinerExpanded.sheets}
             showSolidsFolder={outlinerExpanded.solids}
@@ -1146,21 +1345,29 @@ export default function App() {
           <div className="bg-zinc-900 rounded border border-amber-900/50 p-2 flex flex-col gap-2">
              <div className="flex justify-between items-center pb-1 border-b border-zinc-800">
                 <span className="text-[10px] font-bold uppercase text-amber-500 tracking-wider">Selection Stack</span>
-                <span className="text-[10px] font-mono text-zinc-500 bg-zinc-950 px-2 py-0.5 rounded">{selectedLoops.length} Items</span>
+                <span className="text-[10px] font-mono text-zinc-500 bg-zinc-950 px-2 py-0.5 rounded">{selectedLoops.length + selectedItemIds.length} Items</span>
              </div>
              
-             <p className="text-[9px] text-zinc-400 italic">Select tool: hover mesh and click loops to add to stack.</p>
+             <p className="text-[9px] text-zinc-400 italic">Select tool: hover mesh and click loops or geometries to add to stack. Use Shift/Ctrl in outliner for multi-select.</p>
 
              <div className="min-h-16 max-h-40 overflow-y-auto bg-zinc-950 border border-zinc-800 rounded p-1 flex flex-col gap-1">
-                {selectedLoops.length === 0 ? (
+                {selectedLoops.length === 0 && selectedItemIds.length === 0 ? (
                   <span className="text-zinc-600 text-[10px] text-center mt-4 mb-4">Stack is empty.</span>
                 ) : (
-                  selectedLoops.map((loop, i) => (
-                    <div key={i} className="flex justify-between items-center bg-zinc-800/50 px-2 py-1 rounded text-[10px] font-mono text-zinc-300">
-                      <span>Loop #{loop.id.split('_')[1] || i}</span>
-                      <span className="text-amber-500">[{loop.points.length} pts]</span>
-                    </div>
-                  ))
+                  <>
+                    {selectedLoops.map((loop, i) => (
+                      <div key={`loop-${i}`} className="flex justify-between items-center bg-zinc-800/50 px-2 py-1 rounded text-[10px] font-mono text-zinc-300">
+                        <span>Curve #{loop.id.split('_')[1] || i}</span>
+                        <span className="text-purple-400">[{loop.points?.length || 'Analytic'}]</span>
+                      </div>
+                    ))}
+                    {selectedItemsData.map((item, i) => (
+                      <div key={`item-${i}`} className="flex justify-between items-center bg-zinc-800/50 px-2 py-1 rounded text-[10px] font-mono text-zinc-300">
+                        <span className="truncate w-32">{item.name}</span>
+                        <span className={item.type === 'sheet' ? 'text-green-400' : item.type === 'blade' ? 'text-amber-400' : 'text-blue-400'}>{item.type.toUpperCase()}</span>
+                      </div>
+                    ))}
+                  </>
                 )}
              </div>
           </div>
@@ -1209,12 +1416,12 @@ export default function App() {
             </div>
           )}
 
-          {selectedItemData ? (
+          {selectedItemsData.length === 1 ? (
             <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-3">
               <div className="flex justify-between items-center border-b border-zinc-800 pb-2">
                 <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Classification</span>
-                <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${selectedItemData.type === 'sheet' ? 'bg-green-900/30 text-green-400 border border-green-800' : 'bg-blue-900/30 text-blue-400 border border-blue-800'}`}>
-                  {selectedItemData.type}
+                <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${selectedItemsData[0].type === 'sheet' ? 'bg-green-900/30 text-green-400 border border-green-800' : selectedItemsData[0].type === 'blade' ? 'bg-amber-900/30 text-amber-400 border border-amber-800' : 'bg-blue-900/30 text-blue-400 border border-blue-800'}`}>
+                  {selectedItemsData[0].type}
                 </span>
               </div>
 
@@ -1225,29 +1432,36 @@ export default function App() {
                   <span className="text-[10px] font-mono text-zinc-500">Name</span>
                   <input 
                     className="text-[10px] font-mono text-zinc-300 bg-transparent text-right outline-none w-32 border-b border-transparent focus:border-indigo-500 transition-colors"
-                    value={selectedItemData.name || `${selectedItemData.type}_${selectedItemData.id}`}
-                    onChange={(e) => setRebuildHistory(prev => prev.map(geo => geo.id === selectedItemId ? { ...geo, name: e.target.value } : geo))}
+                    value={selectedItemsData[0].name || `${selectedItemsData[0].type}_${selectedItemsData[0].id}`}
+                    onChange={(e) => setRebuildHistory(prev => prev.map(geo => geo.id === selectedItemsData[0].id ? { ...geo, name: e.target.value } : geo))}
                   />
                 </div>
 
                 <div className="flex justify-between items-center bg-zinc-950 p-2 rounded border border-zinc-800 mt-1">
                   <span className="text-[10px] font-mono text-zinc-500">Faces Count</span>
-                  <span className="text-[10px] font-mono text-zinc-300">{selectedItemData.faces?.length || 0}</span>
+                  <span className="text-[10px] font-mono text-zinc-300">{selectedItemsData[0].faces?.length || 0}</span>
                 </div>
               </div>
 
-              {selectedItemData.type === 'sheet' && (
+              {selectedItemsData[0].type === 'blade' && (
                 <div className="mt-2 pt-3 border-t border-zinc-800">
                   <button 
-                    onClick={() => handlePromoteSheet(selectedItemId)}
-                    className="w-full py-2 bg-blue-600/20 text-blue-400 hover:bg-blue-600 hover:text-white border border-blue-600/50 rounded text-[10px] font-bold uppercase tracking-wider transition-colors"
+                    onClick={() => {
+                      const currentDepth = selectedItemsData[0].payload?.extrude_depth || extrudeDepth;
+                      handleUpdateHistoryItemDepth(selectedItemsData[0].id, currentDepth * -1);
+                    }}
+                    className="w-full py-2 bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white border border-zinc-700 rounded text-[10px] font-bold uppercase tracking-wider transition-colors flex items-center justify-center gap-2"
                   >
-                    Promote to Solid
+                    <IconFlip />
+                    Flip Extrude Direction
                   </button>
-                  <p className="text-[9px] text-zinc-500 text-center mt-2">Applies thickness and moves to CAD Solids</p>
                 </div>
               )}
             </div>
+          ) : selectedItemsData.length > 1 ? (
+             <div className="text-[10px] text-zinc-600 text-center italic mt-2">
+               Multiple items selected. Use the Action Ring for bulk operations.
+             </div>
           ) : (
             <div className="text-[10px] text-zinc-600 text-center italic mt-2">
               Select an object in the viewport or outliner to edit properties.
