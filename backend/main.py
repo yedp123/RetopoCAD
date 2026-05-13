@@ -71,6 +71,7 @@ class CommitGeometryParams(BaseModel):
     operation: str
     loops: list
     extrude_depth: float = 2.0
+    target_index: int = None
 
 class BooleanCutParams(BaseModel):
     loops: list
@@ -82,6 +83,8 @@ class CreatePrimitiveParams(BaseModel):
     primitive_type: str
     sharpness_angle: float = 30.0
     symmetry: dict = None
+    extrude_depth: float = 0.0
+    target_index: int = None
 
 class PreprocessParams(BaseModel):
     decimation_target: int = 25000
@@ -92,12 +95,10 @@ async def get_logs():
     return {"logs": state.live_logs}
 
 def run_preprocessing_engine(mesh_in, decimation_target=25000, sharpening_iters=3):
-    """Background Task: Decimates and Sharpens geometry."""
     try:
         broadcast_log(f"[System] Background: Pre-Processing Engine Started (Target: {decimation_target}, Iters: {sharpening_iters})...")
         clean_mesh = mesh_in.copy()
         
-        # 1. Decimation
         if len(clean_mesh.faces) > decimation_target:
             try:
                 broadcast_log("[System] Background: Running simplification...")
@@ -110,7 +111,6 @@ def run_preprocessing_engine(mesh_in, decimation_target=25000, sharpening_iters=
             except Exception as e:
                 broadcast_log(f"[Warning] Decimation skipped: {e}")
 
-        # 2. Sharpening
         if sharpening_iters > 0:
             try:
                 broadcast_log("[System] Background: Applying feature sharpening...")
@@ -128,13 +128,11 @@ def run_preprocessing_engine(mesh_in, decimation_target=25000, sharpening_iters=
         state.cleaned_mesh = mesh_in
         broadcast_log(f"[Error] Pre-processing crashed, falling back to raw mesh: {e}")
 
-
 @app.post("/preprocess-mesh")
 async def preprocess_mesh(params: PreprocessParams, background_tasks: BackgroundTasks):
     if state.mesh is None: raise HTTPException(status_code=400)
     background_tasks.add_task(run_preprocessing_engine, state.mesh, params.decimation_target, params.sharpening_iters)
     return {"status": "Processing in background"}
-
 
 @app.post("/upload-mesh")
 async def upload_mesh(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -163,7 +161,6 @@ async def upload_mesh(background_tasks: BackgroundTasks, file: UploadFile = File
         broadcast_log(f"[Error] Failed to load mesh: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to load mesh: {str(e)}")
 
-
 def get_patch_components(mesh, sharpness_angle_deg):
     if mesh is None: return []
     threshold_rad = np.radians(sharpness_angle_deg)
@@ -171,7 +168,6 @@ def get_patch_components(mesh, sharpness_angle_deg):
     angles = mesh.face_adjacency_angles
     smooth_edges = adjacency[angles < threshold_rad]
     return list(trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces))))
-
 
 def perform_fitting_race(target_pt, sharpness_angle):
     import scipy.optimize
@@ -579,11 +575,19 @@ async def create_primitive(params: CreatePrimitiveParams):
                 
             wire = b3d.Wire.make_polygon(pts_vec)
             solid = b3d.Face(wire)
+
+            # Dynamically extrude if promoted
+            if params.extrude_depth > 0:
+                solid = b3d.extrude(solid, amount=params.extrude_depth)
         
         else:
             raise ValueError(f"Unknown primitive type: {params.primitive_type}")
 
-        state.rebuild_geometry.append(solid)
+        # Sync correctly with backend stack indices to avoid desync
+        if params.target_index is not None and 0 <= params.target_index < len(state.rebuild_geometry):
+            state.rebuild_geometry[params.target_index] = solid
+        else:
+            state.rebuild_geometry.append(solid)
 
         fd, path = tempfile.mkstemp(suffix=".stl")
         os.close(fd)
@@ -653,7 +657,6 @@ async def create_sheet(params: CommitGeometryParams):
         broadcast_log(f"[Error] Failed to build Surface Sheet: {err_msg}")
         raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
 
-
 @app.post("/commit-geometry")
 async def commit_geometry(params: CommitGeometryParams):
     try:
@@ -708,7 +711,11 @@ async def commit_geometry(params: CommitGeometryParams):
                 raise ValueError("Loft failed: The resulting geometry would self-intersect. Try simplifying your loops.")
             raise b3d_err
 
-        state.rebuild_geometry.append(solid)
+        # Sync correctly with backend stack indices to avoid desync
+        if params.target_index is not None and 0 <= params.target_index < len(state.rebuild_geometry):
+            state.rebuild_geometry[params.target_index] = solid
+        else:
+            state.rebuild_geometry.append(solid)
 
         fd, path = tempfile.mkstemp(suffix=".stl")
         os.close(fd)
@@ -1133,7 +1140,6 @@ if __name__ == '__main__':
     except Exception as e:
         broadcast_log(f"[Error] CoACD failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"CoACD failed: {str(e)}")
-
 
 @app.post("/export-step")
 async def export_step(payload: dict):

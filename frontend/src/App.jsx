@@ -23,7 +23,6 @@ const IconMove = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="non
 const IconRotate = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>;
 const IconScale = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 3l-6 6M21 3v6M21 3h-6M3 21l6-6M3 21v-6M3 21h6M14 10L10 14"/></svg>;
 
-
 const applySnap = (value, snapThreshold) => {
     if (!snapThreshold || snapThreshold <= 0) return value;
     return Math.round(value / snapThreshold) * snapThreshold;
@@ -31,12 +30,16 @@ const applySnap = (value, snapThreshold) => {
 
 function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onCut, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive, linearSnap, transformMode }) {
   const [pos, setPos] = useState({ x: -1000, y: -1000 });
-  const isEditingExtrude = selectedItemData?.payload?.operation === 'extrude';
+  
+  const isEditingExtrude = selectedItemData?.payload?.operation === 'extrude' || 
+                           (selectedItemData?.payload?.primitive_type === 'plane' && selectedItemData?.payload?.extrude_depth !== undefined) || 
+                           selectedItemData?.payload?.operation === 'extrude_sheet';
+                           
   const [localDepth, setLocalDepth] = useState(extrudeDepth);
 
   useEffect(() => {
     if (isEditingExtrude) {
-        setLocalDepth(selectedItemData.payload.extrude_depth);
+        setLocalDepth(selectedItemData.payload.extrude_depth || 0);
     } else {
         setLocalDepth(extrudeDepth);
     }
@@ -46,7 +49,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
     if (!anchorPos) return;
     
     const transformActive = transformMode !== null;
-    const offset = transformActive ? 320 : 120; // Pushes ring much further away to clear Gizmo
+    const offset = transformActive ? 320 : 120;
     const ringSize = 135; 
 
     let targetX = anchorPos.x + offset + (selectedItemData ? 160 : 0);
@@ -149,7 +152,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemData, extrudeDepth, 
                const snappedVal = applySnap(parseFloat(e.target.value) || 0, linearSnap);
                setLocalDepth(snappedVal);
                if (isEditingExtrude) {
-                   if (snappedVal !== selectedItemData.payload.extrude_depth) {
+                   if (snappedVal !== (selectedItemData.payload.extrude_depth || 0)) {
                        onUpdateDepth(selectedItemData.id, snappedVal);
                    }
                } else {
@@ -420,7 +423,7 @@ export default function App() {
             const defaultName = patchAnalysis.type.charAt(0).toUpperCase() + patchAnalysis.type.slice(1);
             setRebuildHistory(prev => [...prev, { 
               ...geometryData, type, id: Math.random().toString(36).substr(2, 9), 
-              visible: true, name: `${defaultName} ${prev.length + 1}`, payload: { operation: 'primitive', primitive_type: patchAnalysis.type }, endpoint: 'create-primitive' 
+              visible: true, name: `${defaultName} ${prev.length + 1}`, payload: { operation: 'primitive', primitive_type: patchAnalysis.type, patch_faces: loop.patch_faces }, endpoint: 'create-primitive' 
             }]);
             setSelectedLoops([]); 
             setSelectedItemId(null);
@@ -537,7 +540,13 @@ export default function App() {
 
   const handleUpdateHistoryItemDepth = async (id, newDepth) => {
     const item = rebuildHistory.find(i => i.id === id);
-    if (!item || !item.payload || item.payload.operation !== 'extrude') return;
+    if (!item || !item.payload) return;
+    
+    const isExtrude = item.payload.operation === 'extrude' || 
+                      (item.payload.primitive_type === 'plane' && item.payload.extrude_depth !== undefined) || 
+                      item.payload.operation === 'extrude_sheet';
+    
+    if (!isExtrude) return;
     
     setIsCommitting(true);
     try {
@@ -554,33 +563,6 @@ export default function App() {
         setServerLogs(prev => [...prev, `[Success] Entity successfully rebuilt with new depth.`]);
       } else {
         setServerLogs(prev => [...prev, `[Error] Failed to update geometry.`]);
-      }
-    } catch (err) { setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]); }
-    setIsCommitting(false);
-  };
-
-  const handleUpdateHistoryItemRadius = async (id, newRadius) => {
-    const item = rebuildHistory.find(i => i.id === id);
-    if (!item || !item.payload || !item.payload.loops || item.payload.loops[0].type !== 'circle') return;
-    
-    setIsCommitting(true);
-    const newPayload = { ...item.payload };
-    newPayload.loops = [{ ...newPayload.loops[0], radius: newRadius }];
-    
-    try {
-      const res = await fetch(`http://localhost:8000/${item.endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newPayload)
-      });
-      if (res.ok) {
-        const geo = await res.json();
-        setRebuildHistory(prev => prev.map(geoItem => geoItem.id === id ? { 
-            ...geoItem, vertices: geo.vertices, faces: geo.faces, payload: newPayload 
-        } : geoItem));
-        setServerLogs(prev => [...prev, `[Success] Entity successfully rebuilt with new radius.`]);
-      } else {
-        setServerLogs(prev => [...prev, `[Error] Failed to update geometry radius.`]);
       }
     } catch (err) { setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]); }
     setIsCommitting(false);
@@ -622,16 +604,50 @@ export default function App() {
     setIsCommitting(false);
   };
 
-  const handlePromoteSheet = (idToPromote) => {
+  const handlePromoteSheet = async (idToPromote) => {
     const targetId = typeof idToPromote === 'string' ? idToPromote : selectedItemId;
     if (!targetId) return;
-    setRebuildHistory(prev => prev.map(geo => {
-      if (geo.id === targetId && geo.type === 'sheet') {
-        return { ...geo, type: 'solid', name: (geo.name || `Sheet_${geo.id}`).replace('Sheet', 'Solid') };
+    
+    const targetIndex = rebuildHistory.findIndex(geo => geo.id === targetId);
+    if (targetIndex === -1) return;
+
+    const item = rebuildHistory[targetIndex];
+    setIsCommitting(true);
+
+    try {
+      let targetEndpoint = item.endpoint;
+      const newPayload = { ...item.payload, target_index: targetIndex, extrude_depth: extrudeDepth };
+
+      // Reroute sheets created from curves to the geometry extrude engine
+      if (targetEndpoint === 'create-sheet') {
+          targetEndpoint = 'commit-geometry';
+          newPayload.operation = 'extrude';
       }
-      return geo;
-    }));
-    setSelectedItemId(null);
+
+      const res = await fetch(`http://localhost:8000/${targetEndpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newPayload)
+      });
+
+      if (res.ok) {
+        const geometryData = await res.json();
+        setRebuildHistory(prev => {
+            const newHistory = [...prev];
+            newHistory[targetIndex] = { 
+              ...item, ...geometryData, type: 'solid', 
+              name: (item.name || `Sheet_${item.id}`).replace('Sheet', 'Solid').replace('Plane', 'Extrude'), 
+              payload: newPayload, endpoint: targetEndpoint
+            };
+            return newHistory;
+        });
+        setSelectedItemId(null);
+      } else {
+        const errData = await res.json();
+        setServerLogs(prev => [...prev, `[Error] ${errData.detail}`]);
+      }
+    } catch (err) { console.error(err); }
+    setIsCommitting(false);
   };
 
   const applyPreprocessing = async () => {
