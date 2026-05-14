@@ -32,7 +32,7 @@ const applySnap = (value, snapThreshold) => {
     return Math.round(value / snapThreshold) * snapThreshold;
 };
 
-function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onPatch, onMagicPatch, onPatchSplit, onSew, onCut, onSubtract, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive, onCreateBlade, linearSnap, transformMode }) {
+function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onPatch, onMagicPatch, onSew, onCut, onSubtract, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive, onCreateBlade, linearSnap, transformMode }) {
   const [pos, setPos] = useState({ x: -1000, y: -1000 });
   const [keepTool, setKeepTool] = useState(false);
 
@@ -106,8 +106,6 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
   const isLoopAndSolid = selectedLoops.length === 1 && selectedItemsData.length === 1 && selectedItemsData[0].type === 'solid';
   const hasFaces = selectedItemsData.length > 0 && selectedItemsData.every(i => i.type === 'sheet');
 
-  const isClosedLoop = selectedLoops.length === 1 && selectedLoops[0].points && selectedLoops[0].points.length > 2;
-
   if (selectedLoops.length > 0 && selectedItemsData.length === 0) {
       
       if (selectedLoops.length === 1) {
@@ -124,17 +122,6 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
 
           if (hasPatchFaces) {
               buttons.push({ label: 'Magic\nPatch', icon: <IconMagicWand />, angle: 180, action: onMagicPatch, disabled: false, color: 'text-indigo-400', glow: true });
-          } else {
-              buttons.push({
-                  label: 'Patch\nSplit',
-                  icon: <IconMagicWand />,
-                  angle: 180,
-                  action: onPatchSplit,
-                  disabled: !isClosedLoop,
-                  color: 'text-indigo-400',
-                  glow: true,
-                  tooltip: !isClosedLoop ? 'Curve must be a closed loop to Auto-Patch.' : ''
-              });
           }
 
           if (scoutedCount > 0) {
@@ -267,7 +254,6 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
           return (
              <button
                key={`outer-${i}`}
-               title={btn.tooltip || btn.label}
                onClick={(e) => { e.stopPropagation(); btn.action(); }}
                disabled={btn.disabled}
                style={{ transform: `translate(${x}px, ${y}px)` }}
@@ -288,7 +274,6 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
           return (
              <button
                key={`inner-${i}`}
-               title={btn.tooltip || btn.label}
                onClick={(e) => { e.stopPropagation(); btn.action(); }}
                disabled={btn.disabled}
                style={{ transform: `translate(${x}px, ${y}px)` }}
@@ -547,42 +532,45 @@ export default function App() {
 
   const handleMagicPatch = () => {
     if (selectedLoops.length < 1 || !selectedLoops[0].patch_faces) return;
-    executeGeometryOperation('magic-patch', { patch_faces: selectedLoops[0].patch_faces }, 'sheet', 'Patch');
+    executeGeometryOperation('magic-patch', { patch_faces: selectedLoops[0].patch_faces, sharpness_angle: sharpnessAngle }, 'sheet', 'Patch');
   };
-  
-  const handlePatchSplit = async () => {
-    if (selectedLoops.length !== 1) return;
-    const loop = selectedLoops[0];
-    setBackendStatus("Processing Math...");
+
+  const handleSew = async () => {
+    if (selectedItemIds.length < 2) return;
     setIsCommitting(true);
+    const geoId = Math.random().toString(36).substr(2, 9);
+    setServerLogs(prev => [...prev, `[System] Sewing ${selectedItemIds.length} faces...`]);
     try {
-        const geoId = Math.random().toString(36).substr(2, 9);
-        const res = await fetch(`http://localhost:8000/patch-split`, {
+        const res = await fetch(`http://localhost:8000/sew-surfaces`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ geo_id: geoId, points: loop.points, sharpness_angle: sharpnessAngle })
+            body: JSON.stringify({ geo_id: geoId, target_ids: selectedItemIds })
         });
         if (res.ok) {
             const geometryData = await res.json();
-            setRebuildHistory(prev => [...prev, { ...geometryData, type: 'sheet', id: geoId, visible: true, name: `AutoPatch_${geoId}` }]);
-            setHiddenCurveIds(prev => [...prev, loop.id]); 
+            setRebuildHistory(prev => {
+                let newHistory = prev.map(geo => selectedItemIds.includes(geo.id) ? { ...geo, deleted: true } : geo);
+                newHistory.push({ 
+                    ...geometryData, 
+                    type: geometryData.is_solid ? 'solid' : 'sheet', 
+                    id: geoId, 
+                    visible: true, 
+                    name: `Sewn_${geoId}`, 
+                    endpoint: 'sew-surfaces', 
+                    payload: { target_ids: selectedItemIds } 
+                });
+                return newHistory;
+            });
+            setSelectedItemIds([geoId]);
             setSelectedLoops([]);
-            setBackendStatus("Ready");
         } else {
             const err = await res.json();
             setServerLogs(prev => [...prev, `[Error] ${err.detail}`]);
         }
-    } catch (e) {
+    } catch (err) {
         setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]);
     }
     setIsCommitting(false);
-  };
-
-  const handleSew = () => {
-    if (selectedItemIds.length < 2) return;
-    setServerLogs(prev => [...prev, `[System] Sewing ${selectedItemIds.length} faces... (Queued for Export)`]);
-    setSelectedLoops([]);
-    setSelectedItemIds([]);
   };
 
   const handleCreatePrimitive = async () => {
@@ -961,7 +949,6 @@ export default function App() {
         onSheet={handleSheet}
         onPatch={handleCreatePatch}
         onMagicPatch={handleMagicPatch}
-        onPatchSplit={handlePatchSplit}
         onSew={handleSew}
         onCut={handleCut}
         onSubtract={handleSubtract}
@@ -1090,7 +1077,7 @@ export default function App() {
                <label htmlFor="mergeHulls" className="text-[8px] text-zinc-300 uppercase tracking-wide cursor-pointer select-none">Merge Solids</label>
              </div>
              <button onClick={handleExportSTEP} disabled={isExporting || (currentFeatures.length === 0 && rebuildHistory.length === 0)} className={`w-full py-2 rounded text-[9px] font-bold uppercase tracking-widest transition-all flex items-center justify-center gap-2 ${isExporting ? 'bg-emerald-900 text-emerald-400 cursor-wait' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-lg shadow-emerald-900/20 disabled:opacity-30 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:shadow-none'}`}>
-               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4-4m0 0l-4-4m4 4V4" /></svg>
                {isExporting ? 'WAIT...' : 'Export STEP'}
              </button>
           </div>

@@ -103,6 +103,7 @@ class CreatePatchParams(BaseModel):
 class MagicPatchParams(BaseModel):
     geo_id: str
     patch_faces: list
+    sharpness_angle: float = 30.0
 
 class PatchSplitParams(BaseModel):
     geo_id: str
@@ -127,6 +128,10 @@ class TransformParams(BaseModel):
 class PreprocessParams(BaseModel):
     decimation_target: int = 25000
     sharpening_iters: int = 3
+
+class SewParams(BaseModel):
+    geo_id: str
+    target_ids: list
 
 class ExportStepParams(BaseModel):
     hulls: list = []
@@ -462,6 +467,72 @@ def resample_loop(points, target_count=100):
         resampled[:, i] = np.interp(target_dists, cum_dists, np.append(pts[:, i], pts[0, i]))
     return resampled.tolist()
 
+# === DYNAMIC CORNER DETECTION ALGORITHM ===
+def find_dynamic_corners(pts, threshold_deg=30.0):
+    n = len(pts)
+    if n < 3: return list(range(n))
+
+    v_in = pts - np.roll(pts, 1, axis=0)
+    v_out = np.roll(pts, -1, axis=0) - pts
+    
+    v_in_norm = np.linalg.norm(v_in, axis=1, keepdims=True) + 1e-9
+    v_out_norm = np.linalg.norm(v_out, axis=1, keepdims=True) + 1e-9
+    
+    v_in_unit = v_in / v_in_norm
+    v_out_unit = v_out / v_out_norm
+    
+    dot = np.sum(v_in_unit * v_out_unit, axis=1)
+    angles = np.arccos(np.clip(dot, -1.0, 1.0))
+    angles_deg = np.degrees(angles)
+    
+    window = max(2, n // 20)
+    is_peak = np.ones(n, dtype=bool)
+    for i in range(n):
+        if angles_deg[i] < threshold_deg:
+            is_peak[i] = False
+            continue
+            
+        for j in range(-window, window + 1):
+            if j == 0: continue
+            if angles[i] < angles[(i + j) % n]:
+                is_peak[i] = False
+                break
+                
+    corners = np.where(is_peak)[0].tolist()
+    
+    if len(corners) < 3:
+        diffs = np.linalg.norm(pts - np.roll(pts, 1, axis=0), axis=1)
+        cum_dists = np.cumsum(diffs)
+        total_len = cum_dists[-1]
+        
+        targets = [0, total_len * 0.25, total_len * 0.5, total_len * 0.75]
+        corners = []
+        for t in targets:
+            idx = np.searchsorted(cum_dists, t)
+            corners.append(min(idx, n - 1))
+            
+    return sorted(corners)
+
+def extract_segment(pts, start_idx, end_idx):
+    if start_idx < end_idx:
+        return pts[start_idx:end_idx+1]
+    else:
+        return np.vstack((pts[start_idx:], pts[:end_idx+1]))
+
+def resample_segment(seg_pts, target_count=25):
+    if len(seg_pts) < 2: return seg_pts.tolist()
+    diffs = np.diff(seg_pts, axis=0)
+    dists = np.linalg.norm(diffs, axis=1)
+    cum_dists = np.insert(np.cumsum(dists), 0, 0)
+    total_len = cum_dists[-1]
+    if total_len == 0: return seg_pts.tolist()
+    target_dists = np.linspace(0, total_len, target_count)
+    resampled = np.zeros((target_count, 3))
+    for i in range(3):
+        resampled[:, i] = np.interp(target_dists, cum_dists, seg_pts[:, i])
+    return resampled.tolist()
+
+
 @app.post("/patch-split")
 async def patch_split(params: PatchSplitParams):
     try:
@@ -475,38 +546,31 @@ async def patch_split(params: PatchSplitParams):
     if state.mesh is None:
         raise HTTPException(status_code=400, detail="No mesh loaded.")
 
-    broadcast_log(f"[System] Initiating Auto-Quad Patch Split [{params.geo_id}]...")
+    broadcast_log(f"[System] Initiating Auto-Patch Split [{params.geo_id}]...")
 
     try:
-        # 1 & 2. Arc-Length Parametrization
-        pts = resample_loop(params.points, 100) 
-        n = len(pts)
-        q1 = n // 4
-        q2 = n // 2
-        q3 = 3 * n // 4
+        raw_pts = np.array(params.points)
+        if len(raw_pts) > 0 and np.linalg.norm(raw_pts[0] - raw_pts[-1]) < 1e-5:
+            raw_pts = raw_pts[:-1]
 
-        b3d_pts = [b3d.Vector(p) for p in pts]
-        
-        # Overlap points slightly to guarantee C0 continuity for build123d
-        seg1 = b3d_pts[:q1+1]
-        seg2 = b3d_pts[q1:q2+1]
-        seg3 = b3d_pts[q2:q3+1]
-        seg4 = b3d_pts[q3:] + [b3d_pts[0]]
+        corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
+        broadcast_log(f"[System] Detected {len(corners)} hard corners for splitting.")
 
-        edge1 = b3d.Edge.make_spline(seg1)
-        edge2 = b3d.Edge.make_spline(seg2)
-        edge3 = b3d.Edge.make_spline(seg3)
-        edge4 = b3d.Edge.make_spline(seg4)
-        
-        # 3. Face Generation (API Fix: No 'make_wire')
-        wire = b3d.Wire([edge1, edge2, edge3, edge4])
+        edges = []
+        for i in range(len(corners)):
+            start_idx = corners[i]
+            end_idx = corners[(i + 1) % len(corners)]
+            
+            pts_count = max(10, 100 // len(corners)) 
+            seg_pts = resample_segment(extract_segment(raw_pts, start_idx, end_idx), pts_count)
+            edges.append(b3d.Edge.make_spline([b3d.Vector(p) for p in seg_pts]))
 
-        # 4. Surface Projection
+        wire = b3d.Wire(edges)
+
         filler = BRepOffsetAPI_MakeFilling()
         for edge in wire.edges():
             filler.Add(edge.wrapped, GeomAbs_C0)
 
-        # Grab mesh points internally to ensure organic flow
         if state.mesh is not None:
             np_pts = np.array(params.points)
             centroid = np.mean(np_pts, axis=0)
@@ -564,7 +628,6 @@ async def magic_patch(params: MagicPatchParams):
     broadcast_log(f"[System] Initiating Magic Patch for {len(params.patch_faces)} faces [{params.geo_id}]...")
 
     try:
-        # 1. Boundary Extraction
         submesh_faces = state.mesh.faces[params.patch_faces]
         edges = trimesh.geometry.faces_to_edges(submesh_faces)
         edges_sorted = np.sort(edges, axis=1)
@@ -583,41 +646,30 @@ async def magic_patch(params: MagicPatchParams):
         except:
             ordered_nodes = list(nx.dfs_preorder_nodes(G))
 
-        ordered_points = state.mesh.vertices[ordered_nodes]
+        raw_pts = state.mesh.vertices[ordered_nodes]
         
-        if len(ordered_points) < 4:
-            raise ValueError("Boundary loop has too few vertices to split into 4 segments.")
+        if len(raw_pts) < 3:
+            raise ValueError("Boundary loop has too few vertices to patch.")
 
-        # 2. Internal Quadrification (Split into U1, U2, V1, V2)
-        n = len(ordered_points)
-        q1 = n // 4
-        q2 = n // 2
-        q3 = 3 * n // 4
+        corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
+        broadcast_log(f"[System] Detected {len(corners)} hard corners for splitting.")
+
+        b3d_edges = []
+        for i in range(len(corners)):
+            start_idx = corners[i]
+            end_idx = corners[(i + 1) % len(corners)]
+            
+            pts_count = max(10, 100 // len(corners))
+            seg_pts = resample_segment(extract_segment(raw_pts, start_idx, end_idx), pts_count)
+            b3d_edges.append(b3d.Edge.make_spline([b3d.Vector(p) for p in seg_pts]))
+            
+        wire = b3d.Wire(b3d_edges)
         
-        pts = [b3d.Vector(p) for p in ordered_points]
-        
-        # Ensure continuity by overlapping segment endpoints
-        seg1 = pts[:q1+1]
-        seg2 = pts[q1:q2+1]
-        seg3 = pts[q2:q3+1]
-        seg4 = pts[q3:] + [pts[0]]
-        
-        # Create B-Splines for each segment
-        edge1 = b3d.Edge.make_spline(seg1)
-        edge2 = b3d.Edge.make_spline(seg2)
-        edge3 = b3d.Edge.make_spline(seg3)
-        edge4 = b3d.Edge.make_spline(seg4)
-        
-        # API FIX: No 'make_wire' in modern build123d. Instantiate list.
-        wire = b3d.Wire([edge1, edge2, edge3, edge4])
-        
-        # 3. Surface Shrinkwrap
         broadcast_log("[System] Shrinkwrapping NURBS patch to mesh curvature...")
         
-        # Gather internal points for constraints
         internal_nodes = list(set(np.unique(submesh_faces)) - set(ordered_nodes))
         np.random.shuffle(internal_nodes)
-        sample_size = min(len(internal_nodes), 50) # Cap constraints to avoid OCP freezing
+        sample_size = min(len(internal_nodes), 50)
         internal_pts = state.mesh.vertices[internal_nodes[:sample_size]]
 
         filler = BRepOffsetAPI_MakeFilling()
@@ -630,7 +682,6 @@ async def magic_patch(params: MagicPatchParams):
         filler.Build()
         
         if not filler.IsDone():
-            # Fallback to planar NURBS from the quad wire if shrinkwrap fails
             broadcast_log("[Warning] Complex shrinkwrap failed, falling back to planar wire face.")
             patch_face = b3d.Face(wire)
         else:
@@ -1052,6 +1103,91 @@ async def commit_geometry(params: CommitGeometryParams):
         err_msg = str(e)
         broadcast_log(f"[Error] Failed to build CAD Solid: {err_msg}")
         raise HTTPException(status_code=400, detail=err_msg)
+
+@app.post("/sew-surfaces")
+async def sew_surfaces(params: SewParams):
+    try:
+        import build123d as b3d
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
+    except ImportError:
+        raise HTTPException(status_code=500, detail="build123d missing")
+
+    broadcast_log(f"[System] Sewing {len(params.target_ids)} surfaces...")
+    try:
+        shapes = []
+        for tid in params.target_ids:
+            s = state.rebuild_geometry.get(tid)
+            if s is not None:
+                shapes.append(s)
+        
+        if len(shapes) < 2:
+            raise ValueError("Not enough valid surfaces found to sew.")
+
+        sewer = BRepBuilderAPI_Sewing()
+        sewer.SetTolerance(1e-2) 
+        for shape in shapes:
+            if isinstance(shape, b3d.Solid):
+                for f in shape.faces(): sewer.Add(f.wrapped)
+            elif isinstance(shape, b3d.Shell):
+                sewer.Add(shape.wrapped)
+            elif isinstance(shape, b3d.Face):
+                sewer.Add(shape.wrapped)
+            else:
+                sewer.Add(shape.wrapped)
+
+        sewer.Perform()
+        sewed_shape = sewer.SewedShape()
+        sewed_b3d = b3d.Shape.cast(sewed_shape)
+        
+        is_solid = False
+        final_solid = None
+
+        if isinstance(sewed_b3d, b3d.Shell):
+            if sewed_b3d.is_closed:
+                final_solid = b3d.Solid.make_solid(sewed_b3d)
+                is_solid = True
+            else:
+                final_solid = sewed_b3d
+        elif isinstance(sewed_b3d, b3d.Compound):
+            solids = sewed_b3d.solids()
+            if solids:
+                final_solid = solids[0]
+                is_solid = True
+            else:
+                shells = sewed_b3d.shells()
+                if shells and shells[0].is_closed:
+                    final_solid = b3d.Solid.make_solid(shells[0])
+                    is_solid = True
+                else:
+                    final_solid = sewed_b3d
+        else:
+            final_solid = sewed_b3d
+
+        if is_solid:
+            broadcast_log("[Success] Surfaces sewed into a Watertight Solid!")
+        else:
+            broadcast_log("[Warning] Surfaces sewed into a Shell, but it is NOT watertight (has holes). Try patching remaining gaps.")
+
+        state.rebuild_geometry[params.geo_id] = final_solid
+
+        fd, path = tempfile.mkstemp(suffix=".stl")
+        os.close(fd)
+        try:
+            from build123d.exporters3d import export_stl
+            export_stl(final_solid, path)
+            tmesh = trimesh.load(path, file_type='stl')
+            return {
+                "vertices": tmesh.vertices.tolist(), 
+                "faces": tmesh.faces.tolist(),
+                "is_solid": is_solid
+            }
+        finally:
+            try: os.remove(path)
+            except: pass
+
+    except Exception as e:
+        broadcast_log(f"[Error] Failed to sew surfaces: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Geometry Error: {str(e)}")
 
 @app.post("/transform-geometry")
 async def transform_geometry(params: TransformParams):

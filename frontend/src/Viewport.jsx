@@ -128,10 +128,11 @@ function SplashHighlight({ feature, originalMeshes, centerOffset }) {
 
   if (!result || !result.geo) return null;
 
+  // IMPORTANT: raycast={() => null} prevents the highlight from blocking pointer events!
   if (result.meshParams) {
-      return <mesh geometry={result.geo} material={material} position={result.meshParams.position} rotation={result.meshParams.rotation} scale={result.meshParams.scale} />;
+      return <mesh raycast={() => null} geometry={result.geo} material={material} position={result.meshParams.position} rotation={result.meshParams.rotation} scale={result.meshParams.scale} />;
   }
-  return <mesh geometry={result.geo} material={material} />;
+  return <mesh raycast={() => null} geometry={result.geo} material={material} />;
 }
 
 function CircleCurve({ feature, centerOffset, hoveredOverride, originalMeshes, isSelected, disabled }) {
@@ -166,7 +167,7 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, originalMeshes, i
   if (centerOffset) pos.sub(centerOffset);
   
   const finalHover = hoveredOverride !== undefined ? hoveredOverride : hovered;
-  const activeColor = isSelected ? "#39ff14" : "#10b981"; // Neon Green for Ghost Wire
+  const activeColor = isSelected ? "#39ff14" : "#10b981"; 
 
   return (
     <group>
@@ -204,7 +205,7 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, orig
   if (!geometry) return null;
 
   const baseColor = customColor ? customColor : '#10b981';
-  const activeColor = isSelected ? "#39ff14" : baseColor; // Neon Green for Ghost Wire
+  const activeColor = isSelected ? "#39ff14" : baseColor;
   const finalHover = hoveredOverride !== undefined ? hoveredOverride : hovered;
 
   return (
@@ -226,7 +227,7 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, orig
   );
 }
 
-function ActiveTransformSolid({ geo, material, centerOffset, transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap, onTransformEnd, animateOpacity }) {
+function ActiveTransformSolid({ geo, material, centerOffset, transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap, onTransformEnd, animateOpacity, showTransformUI }) {
   const groupRef = useRef();
   const inputRef = useRef(null);
   const isDraggingRef = useRef(false);
@@ -355,57 +356,62 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
       scaleSnap={linearSnap > 0 ? linearSnap : null}
       onChange={handleChange}
       onDraggingChanged={handleDraggingChanged}
+      showX={showTransformUI}
+      showY={showTransformUI}
+      showZ={showTransformUI}
     >
       <group ref={groupRef} userData={{ isSolidGroup: true, id: geo.id }}>
         <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={absoluteCenter} material={material} animateOpacity={animateOpacity} />
         
-        <Html center position={[0, 1.5, 0]} zIndexRange={[100, 0]}>
-          <div 
-            onPointerDown={(e) => e.stopPropagation()}
-            onPointerUp={(e) => e.stopPropagation()}
-            onClick={(e) => e.stopPropagation()}
-            onDoubleClick={(e) => e.stopPropagation()}
-            className="bg-zinc-900/95 border border-zinc-700 p-2 rounded shadow-2xl backdrop-blur-md font-mono text-[10px] w-40 flex flex-col gap-1.5 pointer-events-auto"
-          >
-            <div className="flex justify-between items-center text-zinc-400">
-              <span className="uppercase tracking-wider font-bold">Snap</span>
-              <select 
-                value={transformMode === 'rotate' ? angleSnap : linearSnap} 
-                onChange={(e) => transformMode === 'rotate' ? setAngleSnap(parseFloat(e.target.value)) : setLinearSnap(parseFloat(e.target.value))}
-                className="w-16 bg-zinc-950 border border-zinc-700 text-right text-white outline-none focus:border-blue-500 rounded px-1 py-0.5"
-              >
-                {transformMode === 'rotate' ? (
-                  <>
-                    <option value={0}>None</option>
-                    <option value={5}>5°</option>
-                    <option value={15}>15°</option>
-                    <option value={45}>45°</option>
-                    <option value={90}>90°</option>
-                  </>
-                ) : (
-                  <>
-                    <option value={0}>None</option>
-                    <option value={1}>1.0</option>
-                    <option value={0.5}>0.5</option>
-                    <option value={0.1}>0.1</option>
-                  </>
-                )}
-              </select>
-            </div>
-            <div className="flex justify-between items-center text-amber-400 font-bold">
-              <span className="uppercase tracking-wider">Delta</span>
-              <div className="relative">
-                <input
-                  ref={inputRef}
-                  type="text"
-                  defaultValue="0"
-                  onKeyDown={handleManualInput}
-                  className="w-16 bg-zinc-950 border border-zinc-700 text-right text-amber-400 outline-none focus:border-amber-500 rounded px-1 py-0.5"
-                />
+        {showTransformUI && (
+          <Html center position={[0, 1.5, 0]} zIndexRange={[100, 0]}>
+            <div 
+              onPointerDown={(e) => e.stopPropagation()}
+              onPointerUp={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
+              className="bg-zinc-900/95 border border-zinc-700 p-2 rounded shadow-2xl backdrop-blur-md font-mono text-[10px] w-40 flex flex-col gap-1.5 pointer-events-auto"
+            >
+              <div className="flex justify-between items-center text-zinc-400">
+                <span className="uppercase tracking-wider font-bold">Snap</span>
+                <select 
+                  value={transformMode === 'rotate' ? angleSnap : linearSnap} 
+                  onChange={(e) => transformMode === 'rotate' ? setAngleSnap(parseFloat(e.target.value)) : setLinearSnap(parseFloat(e.target.value))}
+                  className="w-16 bg-zinc-950 border border-zinc-700 text-right text-white outline-none focus:border-blue-500 rounded px-1 py-0.5"
+                >
+                  {transformMode === 'rotate' ? (
+                    <>
+                      <option value={0}>None</option>
+                      <option value={5}>5°</option>
+                      <option value={15}>15°</option>
+                      <option value={45}>45°</option>
+                      <option value={90}>90°</option>
+                    </>
+                  ) : (
+                    <>
+                      <option value={0}>None</option>
+                      <option value={1}>1.0</option>
+                      <option value={0.5}>0.5</option>
+                      <option value={0.1}>0.1</option>
+                    </>
+                  )}
+                </select>
+              </div>
+              <div className="flex justify-between items-center text-amber-400 font-bold">
+                <span className="uppercase tracking-wider">Delta</span>
+                <div className="relative">
+                  <input
+                    ref={inputRef}
+                    type="text"
+                    defaultValue="0"
+                    onKeyDown={handleManualInput}
+                    className="w-16 bg-zinc-950 border border-zinc-700 text-right text-amber-400 outline-none focus:border-amber-500 rounded px-1 py-0.5"
+                  />
+                </div>
               </div>
             </div>
-          </div>
-        </Html>
+          </Html>
+        )}
       </group>
     </TransformControls>
   );
@@ -511,8 +517,10 @@ function GhostModel({
           if (res.ok) {
             const data = await res.json();
             setScoutLoop(data);
+          } else {
+             setScoutLoop(null);
           }
-        } catch(err) {}
+        } catch(err) { setScoutLoop(null); }
       }, 50); 
     }
   };
@@ -599,6 +607,7 @@ function GhostModel({
            if (!isVisible) return null;
 
            const isSelected = selectedItemIds?.includes(geo.id);
+           const isPrimarySelection = isSelected && selectedItemIds[0] === geo.id;
            const mat = isSelected ? selectedSolidMaterial : (geo.type === 'sheet' ? sheetMaterial : solidMaterial);
            
            if (isSelected) {
@@ -608,13 +617,14 @@ function GhostModel({
                      geo={geo}
                      material={mat}
                      centerOffset={centerOffset}
-                     transformMode={transformMode} // Pass null to allow default fallback locally
+                     transformMode={transformMode}
                      linearSnap={linearSnap}
                      setLinearSnap={setLinearSnap}
                      angleSnap={angleSnap}
                      setAngleSnap={setAngleSnap}
                      onTransformEnd={onTransformEnd}
                      animateOpacity={true}
+                     showTransformUI={isPrimarySelection}
                   />
                );
            }
@@ -660,12 +670,13 @@ function GhostModel({
 
       {showMesh && !transformMode && selectionMode === 'curve-extract' && (
         <>
-          <mesh ref={cursorRef} visible={false} renderOrder={1}>
+          {/* IMPORTANT: raycast={() => null} prevents the cursor from blocking your mouse */}
+          <mesh ref={cursorRef} visible={false} renderOrder={1} raycast={() => null}>
             <sphereGeometry args={[cursorRadius, 16, 16]} />
             <meshBasicMaterial color="#3b82f6" depthTest={false} /> 
           </mesh>
           {activeScales?.map((scale, i) => (
-            <mesh key={`cursor-${scale.join(',')}`} ref={(el) => { if(el) mirroredCursorRefs.current[i] = el; }} visible={false} renderOrder={1}>
+            <mesh key={`cursor-${scale.join(',')}`} ref={(el) => { if(el) mirroredCursorRefs.current[i] = el; }} visible={false} renderOrder={1} raycast={() => null}>
               <sphereGeometry args={[cursorRadius, 16, 16]} />
               <meshBasicMaterial color="#ef4444" depthTest={false} />
             </mesh>
