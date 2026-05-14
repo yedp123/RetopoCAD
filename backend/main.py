@@ -100,6 +100,15 @@ class CreatePatchParams(BaseModel):
     loops: list
     sharpness_angle: float = 30.0
 
+class MagicPatchParams(BaseModel):
+    geo_id: str
+    patch_faces: list
+
+class PatchSplitParams(BaseModel):
+    geo_id: str
+    points: list
+    sharpness_angle: float = 30.0
+
 class TransformParams(BaseModel):
     target_id: str
     dx: float
@@ -372,7 +381,6 @@ async def scout_loop(params: Point3D):
         ref_components = get_patch_components(ref_mesh, params.sharpness_angle)
         ref_target_region = next((comp for comp in ref_components if start_ref_face in comp), [start_ref_face])
         
-        # Scout receives a transient id
         patch_id = f"scout_{min(ref_target_region)}"
 
         math_mesh = state.cleaned_mesh if state.cleaned_mesh is not None else state.mesh
@@ -454,6 +462,203 @@ def resample_loop(points, target_count=100):
         resampled[:, i] = np.interp(target_dists, cum_dists, np.append(pts[:, i], pts[0, i]))
     return resampled.tolist()
 
+@app.post("/patch-split")
+async def patch_split(params: PatchSplitParams):
+    try:
+        import build123d as b3d
+        from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+        from OCP.GeomAbs import GeomAbs_C0
+        from OCP.gp import gp_Pnt
+    except ImportError:
+        raise HTTPException(status_code=500, detail="build123d or OCP missing")
+
+    if state.mesh is None:
+        raise HTTPException(status_code=400, detail="No mesh loaded.")
+
+    broadcast_log(f"[System] Initiating Auto-Quad Patch Split [{params.geo_id}]...")
+
+    try:
+        # 1 & 2. Arc-Length Parametrization
+        pts = resample_loop(params.points, 100) 
+        n = len(pts)
+        q1 = n // 4
+        q2 = n // 2
+        q3 = 3 * n // 4
+
+        b3d_pts = [b3d.Vector(p) for p in pts]
+        
+        # Overlap points slightly to guarantee C0 continuity for build123d
+        seg1 = b3d_pts[:q1+1]
+        seg2 = b3d_pts[q1:q2+1]
+        seg3 = b3d_pts[q2:q3+1]
+        seg4 = b3d_pts[q3:] + [b3d_pts[0]]
+
+        edge1 = b3d.Edge.make_spline(seg1)
+        edge2 = b3d.Edge.make_spline(seg2)
+        edge3 = b3d.Edge.make_spline(seg3)
+        edge4 = b3d.Edge.make_spline(seg4)
+        
+        # 3. Face Generation (API Fix: No 'make_wire')
+        wire = b3d.Wire([edge1, edge2, edge3, edge4])
+
+        # 4. Surface Projection
+        filler = BRepOffsetAPI_MakeFilling()
+        for edge in wire.edges():
+            filler.Add(edge.wrapped, GeomAbs_C0)
+
+        # Grab mesh points internally to ensure organic flow
+        if state.mesh is not None:
+            np_pts = np.array(params.points)
+            centroid = np.mean(np_pts, axis=0)
+            distances = np.linalg.norm(state.mesh.vertices - centroid, axis=1)
+            closest_idx = np.argsort(distances)[:50]
+            internal_pts = state.mesh.vertices[closest_idx]
+            for pt in internal_pts:
+                filler.Add(gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])))
+
+        filler.Build()
+        
+        if not filler.IsDone():
+            broadcast_log("[Warning] Complex shrinkwrap failed, falling back to planar wire face.")
+            patch_face = b3d.Face(wire)
+        else:
+            patch_face = b3d.Face(filler.Shape())
+
+        state.rebuild_geometry[params.geo_id] = patch_face
+
+        fd, path = tempfile.mkstemp(suffix=".stl")
+        os.close(fd)
+        
+        try:
+            from build123d.exporters3d import export_stl
+            export_stl(patch_face, path)
+            tmesh = trimesh.load(path, file_type='stl')
+            vertices = tmesh.vertices.tolist()
+            faces_out = tmesh.faces.tolist()
+            broadcast_log(f"[Success] Patch Split created. Returning {len(faces_out)} faces.")
+            return {"vertices": vertices, "faces": faces_out}
+        finally:
+            try: os.remove(path)
+            except: pass
+
+    except Exception as e:
+        err_msg = str(e)
+        broadcast_log(f"[Error] Failed to execute Patch Split: {err_msg}")
+        raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
+
+
+@app.post("/magic-patch")
+async def magic_patch(params: MagicPatchParams):
+    try:
+        import build123d as b3d
+        import networkx as nx
+        from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+        from OCP.GeomAbs import GeomAbs_C0
+        from OCP.gp import gp_Pnt
+    except ImportError:
+        raise HTTPException(status_code=500, detail="build123d or OCP missing")
+
+    if state.mesh is None:
+        raise HTTPException(status_code=400, detail="No mesh loaded.")
+        
+    broadcast_log(f"[System] Initiating Magic Patch for {len(params.patch_faces)} faces [{params.geo_id}]...")
+
+    try:
+        # 1. Boundary Extraction
+        submesh_faces = state.mesh.faces[params.patch_faces]
+        edges = trimesh.geometry.faces_to_edges(submesh_faces)
+        edges_sorted = np.sort(edges, axis=1)
+        unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
+        boundary_edges = unique_edges[counts == 1]
+
+        if len(boundary_edges) == 0:
+            raise ValueError("No valid boundary found in selection.")
+
+        G = nx.Graph()
+        G.add_edges_from(boundary_edges)
+        
+        try:
+            cycle = nx.find_cycle(G)
+            ordered_nodes = [u for u, v in cycle]
+        except:
+            ordered_nodes = list(nx.dfs_preorder_nodes(G))
+
+        ordered_points = state.mesh.vertices[ordered_nodes]
+        
+        if len(ordered_points) < 4:
+            raise ValueError("Boundary loop has too few vertices to split into 4 segments.")
+
+        # 2. Internal Quadrification (Split into U1, U2, V1, V2)
+        n = len(ordered_points)
+        q1 = n // 4
+        q2 = n // 2
+        q3 = 3 * n // 4
+        
+        pts = [b3d.Vector(p) for p in ordered_points]
+        
+        # Ensure continuity by overlapping segment endpoints
+        seg1 = pts[:q1+1]
+        seg2 = pts[q1:q2+1]
+        seg3 = pts[q2:q3+1]
+        seg4 = pts[q3:] + [pts[0]]
+        
+        # Create B-Splines for each segment
+        edge1 = b3d.Edge.make_spline(seg1)
+        edge2 = b3d.Edge.make_spline(seg2)
+        edge3 = b3d.Edge.make_spline(seg3)
+        edge4 = b3d.Edge.make_spline(seg4)
+        
+        # API FIX: No 'make_wire' in modern build123d. Instantiate list.
+        wire = b3d.Wire([edge1, edge2, edge3, edge4])
+        
+        # 3. Surface Shrinkwrap
+        broadcast_log("[System] Shrinkwrapping NURBS patch to mesh curvature...")
+        
+        # Gather internal points for constraints
+        internal_nodes = list(set(np.unique(submesh_faces)) - set(ordered_nodes))
+        np.random.shuffle(internal_nodes)
+        sample_size = min(len(internal_nodes), 50) # Cap constraints to avoid OCP freezing
+        internal_pts = state.mesh.vertices[internal_nodes[:sample_size]]
+
+        filler = BRepOffsetAPI_MakeFilling()
+        for edge in wire.edges():
+            filler.Add(edge.wrapped, GeomAbs_C0)
+            
+        for pt in internal_pts:
+            filler.Add(gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])))
+            
+        filler.Build()
+        
+        if not filler.IsDone():
+            # Fallback to planar NURBS from the quad wire if shrinkwrap fails
+            broadcast_log("[Warning] Complex shrinkwrap failed, falling back to planar wire face.")
+            patch_face = b3d.Face(wire)
+        else:
+            patch_face = b3d.Face(filler.Shape())
+
+        state.rebuild_geometry[params.geo_id] = patch_face
+
+        fd, path = tempfile.mkstemp(suffix=".stl")
+        os.close(fd)
+        
+        try:
+            from build123d.exporters3d import export_stl
+            export_stl(patch_face, path)
+            tmesh = trimesh.load(path, file_type='stl')
+            vertices = tmesh.vertices.tolist()
+            faces_out = tmesh.faces.tolist()
+            broadcast_log(f"[Success] Magic Patch created. Returning {len(faces_out)} faces.")
+            return {"vertices": vertices, "faces": faces_out}
+        finally:
+            try: os.remove(path)
+            except: pass
+
+    except Exception as e:
+        err_msg = str(e)
+        broadcast_log(f"[Error] Failed to execute Magic Patch: {err_msg}")
+        raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
+
+
 @app.post("/create-patch")
 async def create_patch(params: CreatePatchParams):
     try:
@@ -468,36 +673,29 @@ async def create_patch(params: CreatePatchParams):
         raise ValueError("Creating a patch requires at least 1 loop.")
 
     try:
-        # 1. Aggregate and process the input curves
         processed_loop = []
         for loop in params.loops:
             processed_loop.extend(loop.get('points', []))
         
         pts = [b3d.Vector(p) for p in processed_loop]
         
-        # Ensure the wire boundary is closed
         if len(pts) > 0 and (pts[0] - pts[-1]).length > 1e-5:
             pts.append(pts[0])
             
         wire = b3d.Wire.make_polygon(pts)
         patch_face = None
         
-        # 2. The Math: Attempt native planar surface from wires
         try:
             patch_face = b3d.Face.make_from_wires(wire)
         except Exception:
             pass
             
-        # 3. Refinement & Edge-Matching
-        # Use OCP BRepOffsetAPI_MakeFilling to "shrinkwrap" non-planar loops 
-        # while forcing the exact bounding edges (G0 continuity) to guarantee B-Rep stitching.
         if patch_face is None or state.mesh is not None:
             broadcast_log("[System] Shrinkwrapping face to mesh curvature...")
             try:
                 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
                 filler = BRepOffsetAPI_MakeFilling()
                 
-                # Enforce strict edge matching
                 for edge in wire.edges():
                     filler.Add(edge.wrapped, GeomAbs_C0)
                     
@@ -510,7 +708,6 @@ async def create_patch(params: CreatePatchParams):
         if patch_face is None:
             raise ValueError("Could not generate a valid B-Rep face from the provided wires.")
 
-        # 4. DICTIONARY LOCK
         state.rebuild_geometry[params.geo_id] = patch_face
 
         fd, path = tempfile.mkstemp(suffix=".stl")
@@ -700,7 +897,6 @@ async def create_primitive(params: CreatePrimitiveParams):
         else:
             raise ValueError(f"Unknown primitive type: {params.primitive_type}")
 
-        # DICTIONARY LOCK
         state.rebuild_geometry[params.geo_id] = solid
 
         fd, path = tempfile.mkstemp(suffix=".stl")
@@ -746,7 +942,6 @@ async def create_sheet(params: CommitGeometryParams):
         wire = b3d.Wire.make_polygon(pts)
         sheet_face = b3d.Face(wire)
 
-        # DICTIONARY LOCK
         state.rebuild_geometry[params.geo_id] = sheet_face
 
         fd, path = tempfile.mkstemp(suffix=".stl")
@@ -830,7 +1025,6 @@ async def commit_geometry(params: CommitGeometryParams):
                 raise ValueError("Loft failed: The resulting geometry would self-intersect. Try simplifying your loops.")
             raise b3d_err
 
-        # DICTIONARY LOCK
         state.rebuild_geometry[params.geo_id] = solid
 
         fd, path = tempfile.mkstemp(suffix=".stl")

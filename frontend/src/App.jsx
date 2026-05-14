@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, Suspense } from 'react';
+import React, { useState, useRef, useEffect, Suspense, useMemo, useLayoutEffect } from 'react';
 import Viewport from './Viewport';
 
 // --- ICONS ---
@@ -25,13 +25,14 @@ const IconLink = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="non
 const IconFlip = () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="16 3 21 3 21 8"></polyline><line x1="4" y1="20" x2="21" y2="3"></line><polyline points="21 16 21 21 16 21"></polyline><line x1="15" y1="15" x2="21" y2="21"></line><line x1="4" y1="4" x2="9" y2="9"></line></svg>;
 const IconPatch = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><path d="M3 9h18M3 15h18M9 3v18M15 3v18"></path></svg>;
 const IconSew = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 12c1.5-1.5 3.5-1.5 5 0 1.5 1.5 3.5 1.5 5 0s3.5-1.5 5 0"></path><line x1="9" y1="4" x2="9" y2="20"></line><line x1="15" y1="4" x2="15" y2="20"></line></svg>;
+const IconMagicWand = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 21l18-18"></path><path d="M12.22 7.78l4 4"></path><path d="M8 8l-2 2"></path><path d="M16 16l-2 2"></path><path d="M4 4l2-2"></path><path d="M20 20l2-2"></path></svg>;
 
 const applySnap = (value, snapThreshold) => {
     if (!snapThreshold || snapThreshold <= 0) return value;
     return Math.round(value / snapThreshold) * snapThreshold;
 };
 
-function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onPatch, onSew, onCut, onSubtract, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive, onCreateBlade, linearSnap, transformMode }) {
+function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth, setExtrudeDepth, onExtrude, onLoft, onSheet, onPatch, onMagicPatch, onPatchSplit, onSew, onCut, onSubtract, onClear, onPromote, onExtractCurve, onDeleteItem, onUpdateDepth, patchAnalysis, setPatchAnalysis, onCreatePrimitive, onCreateBlade, linearSnap, transformMode }) {
   const [pos, setPos] = useState({ x: -1000, y: -1000 });
   const [keepTool, setKeepTool] = useState(false);
 
@@ -70,9 +71,13 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
 
   if ((!selectedLoops || selectedLoops.length === 0) && selectedItemsData.length === 0) return null;
 
-  const planeCount = selectedLoops.filter(l => l.type !== 'circle').length;
+  const planeCount = selectedLoops.filter(l => l.type !== 'circle' && !l.patch_faces).length;
   const circleCount = selectedLoops.filter(l => l.type === 'circle').length;
+  const faceSelectionCount = selectedLoops.filter(l => l.patch_faces && !l.type).length;
+  const hasPatchFaces = selectedLoops.length === 1 && selectedLoops[0].patch_faces;
+  
   let selectionText = [];
+  if (faceSelectionCount > 0) selectionText.push(`${faceSelectionCount} Face${faceSelectionCount > 1 ? 's' : ''}`);
   if (planeCount > 0) selectionText.push(`${planeCount} Wire${planeCount > 1 ? 's' : ''}`);
   if (circleCount > 0) selectionText.push(`${circleCount} Cylinder${circleCount > 1 ? 's' : ''}`);
   
@@ -101,20 +106,47 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
   const isLoopAndSolid = selectedLoops.length === 1 && selectedItemsData.length === 1 && selectedItemsData[0].type === 'solid';
   const hasFaces = selectedItemsData.length > 0 && selectedItemsData.every(i => i.type === 'sheet');
 
+  const isClosedLoop = selectedLoops.length === 1 && selectedLoops[0].points && selectedLoops[0].points.length > 2;
+
   if (selectedLoops.length > 0 && selectedItemsData.length === 0) {
-      buttons.push({ label: extrudeLabel, icon: isCylinderLoop ? <IconCylinderFill /> : <IconExtrude />, angle: -90, action: onExtrude, disabled: selectedLoops.length !== 1, color: 'text-blue-400' });
-      buttons.push({ label: 'Loft', icon: <IconLoft />, angle: 0, action: onLoft, disabled: selectedLoops.length !== 2, color: 'text-blue-400' });
       
-      if (patchAnalysis) {
-          buttons.push({ label: 'Create\nPrimitive', icon: <IconExtrude />, angle: 90, action: onCreatePrimitive, disabled: false, color: 'text-emerald-400' });
-          if (patchAnalysis.type === 'plane' || patchAnalysis.type === 'planar') {
-              buttons.push({ label: 'Create\nBlade', icon: <IconSquare />, angle: 135, action: onCreateBlade, disabled: false, color: 'text-amber-400' });
+      if (selectedLoops.length === 1) {
+          buttons.push({ label: extrudeLabel, icon: isCylinderLoop ? <IconCylinderFill /> : <IconExtrude />, angle: -90, action: onExtrude, disabled: false, color: 'text-blue-400' });
+          
+          if (patchAnalysis) {
+              buttons.push({ label: 'Create\nPrimitive', icon: <IconExtrude />, angle: 0, action: onCreatePrimitive, disabled: false, color: 'text-emerald-400' });
+              if (patchAnalysis.type === 'plane' || patchAnalysis.type === 'planar') {
+                  buttons.push({ label: 'Create\nBlade', icon: <IconSquare />, angle: 45, action: onCreateBlade, disabled: false, color: 'text-amber-400' });
+              }
+          } else {
+              buttons.push({ label: 'Face', icon: <IconSheet />, angle: 90, action: onSheet, disabled: false, color: 'text-green-400' });
           }
-      } else {
-          buttons.push({ label: 'Face', icon: <IconSheet />, angle: 90, action: onSheet, disabled: selectedLoops.length !== 1, color: 'text-green-400' });
+
+          if (hasPatchFaces) {
+              buttons.push({ label: 'Magic\nPatch', icon: <IconMagicWand />, angle: 180, action: onMagicPatch, disabled: false, color: 'text-indigo-400', glow: true });
+          } else {
+              buttons.push({
+                  label: 'Patch\nSplit',
+                  icon: <IconMagicWand />,
+                  angle: 180,
+                  action: onPatchSplit,
+                  disabled: !isClosedLoop,
+                  color: 'text-indigo-400',
+                  glow: true,
+                  tooltip: !isClosedLoop ? 'Curve must be a closed loop to Auto-Patch.' : ''
+              });
+          }
+
+          if (scoutedCount > 0) {
+              buttons.push({ label: 'Extract\nCurve', icon: <IconWave />, angle: -135, action: onExtractCurve, disabled: false, color: 'text-purple-400' });
+          }
       }
 
-      if (selectedLoops.length > 1) {
+      if (selectedLoops.length === 2) {
+          buttons.push({ label: 'Loft', icon: <IconLoft />, angle: 0, action: onLoft, disabled: false, color: 'text-blue-400' });
+      }
+
+      if (selectedLoops.length > 1 && faceSelectionCount === 0) {
           const isFour = selectedLoops.length === 4;
           buttons.push({ 
               label: 'Patch\nWires', 
@@ -125,10 +157,6 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
               color: isFour ? 'text-emerald-300' : 'text-emerald-500',
               glow: isFour 
           });
-      }
-      
-      if (scoutedCount > 0) {
-          buttons.push({ label: 'Extract\nCurve', icon: <IconWave />, angle: 180, action: onExtractCurve, disabled: false, color: 'text-purple-400' });
       }
   } 
 
@@ -239,6 +267,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
           return (
              <button
                key={`outer-${i}`}
+               title={btn.tooltip || btn.label}
                onClick={(e) => { e.stopPropagation(); btn.action(); }}
                disabled={btn.disabled}
                style={{ transform: `translate(${x}px, ${y}px)` }}
@@ -259,6 +288,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
           return (
              <button
                key={`inner-${i}`}
+               title={btn.tooltip || btn.label}
                onClick={(e) => { e.stopPropagation(); btn.action(); }}
                disabled={btn.disabled}
                style={{ transform: `translate(${x}px, ${y}px)` }}
@@ -291,6 +321,7 @@ export default function App() {
   const [angleSnap, setAngleSnap] = useState(0); 
   
   const [transformMode, setTransformMode] = useState(null);
+  const [selectionMode, setSelectionMode] = useState('curve-extract');
   const [menuAnchor, setMenuAnchor] = useState({ x: 0, y: 0 });
   
   const [featuresHistory, setFeaturesHistory] = useState([[]]); 
@@ -512,6 +543,39 @@ export default function App() {
         type: loop.type || 'planar'
     }));
     executeGeometryOperation('create-patch', { loops: payloadLoops, sharpness_angle: sharpnessAngle }, 'sheet', 'Patch');
+  };
+
+  const handleMagicPatch = () => {
+    if (selectedLoops.length < 1 || !selectedLoops[0].patch_faces) return;
+    executeGeometryOperation('magic-patch', { patch_faces: selectedLoops[0].patch_faces }, 'sheet', 'Patch');
+  };
+  
+  const handlePatchSplit = async () => {
+    if (selectedLoops.length !== 1) return;
+    const loop = selectedLoops[0];
+    setBackendStatus("Processing Math...");
+    setIsCommitting(true);
+    try {
+        const geoId = Math.random().toString(36).substr(2, 9);
+        const res = await fetch(`http://localhost:8000/patch-split`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ geo_id: geoId, points: loop.points, sharpness_angle: sharpnessAngle })
+        });
+        if (res.ok) {
+            const geometryData = await res.json();
+            setRebuildHistory(prev => [...prev, { ...geometryData, type: 'sheet', id: geoId, visible: true, name: `AutoPatch_${geoId}` }]);
+            setHiddenCurveIds(prev => [...prev, loop.id]); 
+            setSelectedLoops([]);
+            setBackendStatus("Ready");
+        } else {
+            const err = await res.json();
+            setServerLogs(prev => [...prev, `[Error] ${err.detail}`]);
+        }
+    } catch (e) {
+        setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]);
+    }
+    setIsCommitting(false);
   };
 
   const handleSew = () => {
@@ -870,7 +934,7 @@ export default function App() {
     setIsExporting(false);
   };
 
-  const sheets = rebuildHistory.filter(h => h.type === 'sheet' && !h.deleted);
+  const sheets = rebuildHistory.filter(h => (h.type === 'sheet' || h.type === 'face') && !h.deleted);
   const solids = rebuildHistory.filter(h => (h.type === 'solid' || h.type === 'blade') && !h.deleted);
   const selectedItemsData = selectedItemIds.map(id => rebuildHistory.find(h => h.id === id && !h.deleted)).filter(Boolean);
 
@@ -896,6 +960,8 @@ export default function App() {
         onLoft={handleLoft}
         onSheet={handleSheet}
         onPatch={handleCreatePatch}
+        onMagicPatch={handleMagicPatch}
+        onPatchSplit={handlePatchSplit}
         onSew={handleSew}
         onCut={handleCut}
         onSubtract={handleSubtract}
@@ -1226,6 +1292,8 @@ export default function App() {
             transformMode={transformMode}
             setTransformMode={setTransformMode}
             outlinerExpanded={outlinerExpanded}
+            selectionMode={selectionMode}
+            setSelectionMode={setSelectionMode}
           />
 
           <div 

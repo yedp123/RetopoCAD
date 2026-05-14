@@ -1,11 +1,14 @@
 import React, { Suspense, useEffect, useLayoutEffect, useRef, useMemo, useState } from 'react';
-import { Canvas } from '@react-three/fiber';
+import { Canvas, useFrame } from '@react-three/fiber';
 import { OrbitControls, Bounds, Edges, Grid, GizmoHelper, GizmoViewport, TransformControls, Html } from '@react-three/drei';
 import { useLoader } from '@react-three/fiber';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import * as THREE from 'three';
 
-function HullMesh({ vertices, faces, centerOffset, material }) {
+function HullMesh({ vertices, faces, centerOffset, material, animateOpacity }) {
+  const meshRef = useRef();
+  const hasAnimated = useRef(false);
+
   const geometry = useMemo(() => {
     if (!vertices?.length || !faces?.length) return null;
     try {
@@ -25,8 +28,26 @@ function HullMesh({ vertices, faces, centerOffset, material }) {
     }
   }, [vertices, faces, centerOffset]);
 
+  const uniqueMaterial = useMemo(() => {
+    const mat = material.clone();
+    if (animateOpacity && !hasAnimated.current) {
+        mat.transparent = true;
+        mat.opacity = 0;
+    }
+    return mat;
+  }, [material, animateOpacity]);
+
+  useFrame(() => {
+    if (animateOpacity && !hasAnimated.current && uniqueMaterial.opacity < material.opacity) {
+        uniqueMaterial.opacity = Math.min(material.opacity, uniqueMaterial.opacity + 0.04);
+        if (uniqueMaterial.opacity >= material.opacity) {
+            hasAnimated.current = true;
+        }
+    }
+  });
+
   if (!geometry) return null;
-  return <mesh geometry={geometry} material={material} />;
+  return <mesh ref={meshRef} geometry={geometry} material={uniqueMaterial} userData={{ isSolid: true }} />;
 }
 
 function SplashHighlight({ feature, originalMeshes, centerOffset }) {
@@ -145,7 +166,7 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, originalMeshes, i
   if (centerOffset) pos.sub(centerOffset);
   
   const finalHover = hoveredOverride !== undefined ? hoveredOverride : hovered;
-  const activeColor = isSelected ? "#06b6d4" : "#10b981"; 
+  const activeColor = isSelected ? "#39ff14" : "#10b981"; // Neon Green for Ghost Wire
 
   return (
     <group>
@@ -183,7 +204,7 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, orig
   if (!geometry) return null;
 
   const baseColor = customColor ? customColor : '#10b981';
-  const activeColor = isSelected ? "#06b6d4" : baseColor; 
+  const activeColor = isSelected ? "#39ff14" : baseColor; // Neon Green for Ghost Wire
   const finalHover = hoveredOverride !== undefined ? hoveredOverride : hovered;
 
   return (
@@ -205,7 +226,7 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, orig
   );
 }
 
-function ActiveTransformSolid({ geo, material, centerOffset, transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap, onTransformEnd }) {
+function ActiveTransformSolid({ geo, material, centerOffset, transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap, onTransformEnd, animateOpacity }) {
   const groupRef = useRef();
   const inputRef = useRef(null);
   const isDraggingRef = useRef(false);
@@ -327,7 +348,7 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
 
   return (
     <TransformControls
-      mode={transformMode}
+      mode={transformMode || 'translate'}
       space="world"
       translationSnap={linearSnap > 0 ? linearSnap : null}
       rotationSnap={angleSnap > 0 ? angleSnap * Math.PI / 180 : null}
@@ -336,7 +357,7 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
       onDraggingChanged={handleDraggingChanged}
     >
       <group ref={groupRef} userData={{ isSolidGroup: true, id: geo.id }}>
-        <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={absoluteCenter} material={material} />
+        <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={absoluteCenter} material={material} animateOpacity={animateOpacity} />
         
         <Html center position={[0, 1.5, 0]} zIndexRange={[100, 0]}>
           <div 
@@ -396,7 +417,7 @@ function GhostModel({
   selectedLoops, rebuildHistory, selectedItemIds, cursorScale,
   showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle,
   transformMode, linearSnap, setLinearSnap, angleSnap, setAngleSnap,
-  outlinerExpanded
+  outlinerExpanded, selectionMode
 }) {
   const obj = useLoader(OBJLoader, url);
   const cursorGroupRef = useRef(); 
@@ -450,11 +471,11 @@ function GhostModel({
   }, [obj, cursorScale]);
 
   const solidMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: "#3b82f6", transparent: true, opacity: 0.8, roughness: 0.3, metalness: 0.1, side: THREE.DoubleSide }), []);
-  const sheetMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: "#4ade80", transparent: true, opacity: 0.8, roughness: 0.3, metalness: 0.1, side: THREE.DoubleSide }), []);
+  const sheetMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: "#4ade80", transparent: true, opacity: 0.60, roughness: 0.3, metalness: 0.1, side: THREE.DoubleSide }), []);
   const selectedSolidMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: "#f97316", emissive: "#ea580c", emissiveIntensity: 0.4, transparent: true, opacity: 0.9, roughness: 0.2, metalness: 0.3, side: THREE.DoubleSide }), []);
 
   const handlePointerMove = (e) => {
-    if (transformMode) {
+    if (transformMode || selectionMode !== 'curve-extract') {
       if (scoutLoop) setScoutLoop(null);
       return; 
     }
@@ -508,24 +529,19 @@ function GhostModel({
     if (e.delta > 5) return; 
     
     e.stopPropagation(); 
-    if (!cursorGroupRef.current) return;
-
+    
     const intersections = e.intersections;
     let curveHit = null;
     let solidHit = null;
 
-    // 1. Traverse intersections strictly based on requested priority
     for (let i = 0; i < intersections.length; i++) {
         const object = intersections[i].object;
         if (!object.visible) continue;
         
-        // Priority 1: Curves win instantly
         if (object.userData && object.userData.isCurve) {
             curveHit = intersections[i];
             break; 
         }
-        
-        // Priority 2: Record the first Solid hit but keep checking for curves behind it
         if (!solidHit && object.parent && object.parent.userData && object.parent.userData.isSolidGroup) {
             solidHit = intersections[i];
         }
@@ -534,7 +550,6 @@ function GhostModel({
     const screenX = e.clientX !== undefined ? e.clientX : (e.nativeEvent?.clientX || window.innerWidth / 2);
     const screenY = e.clientY !== undefined ? e.clientY : (e.nativeEvent?.clientY || window.innerHeight / 2);
 
-    // 2. Dispatch the chosen event
     if (curveHit) {
         const feature = curveHit.object.userData.feature;
         const localPoint = cursorGroupRef.current.worldToLocal(curveHit.point.clone());
@@ -545,7 +560,6 @@ function GhostModel({
         const id = solidHit.object.parent.userData.id;
         onSelectSolid(id, { x: screenX, y: screenY }, e);
     } else if (scoutLoop) {
-        // Fallback: If clicked pure empty space but scout is active
         const worldPoint = e.point.clone();
         const localPoint = cursorGroupRef.current.worldToLocal(worldPoint);
         const rawPoint = localPoint.clone().add(centerOffset);
@@ -572,7 +586,11 @@ function GhostModel({
             : <PlanarCurve key={feat.id} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} disabled={!!transformMode} isSelected={isSelected} />
         })}
 
-        {scoutLoop && <PlanarCurve feature={scoutLoop} centerOffset={centerOffset} customColor="#f97316" hoveredOverride={true} originalMeshes={meshes} disabled={true} isSelected={false} />}
+        {scoutLoop && selectionMode === 'curve-extract' && <PlanarCurve feature={scoutLoop} centerOffset={centerOffset} customColor="#f97316" hoveredOverride={true} originalMeshes={meshes} disabled={true} isSelected={false} />}
+        
+        {selectedLoops?.map((feat, idx) => (
+          <PlanarCurve key={`sel-${feat.id}-${idx}`} isSelected={true} feature={feat} centerOffset={centerOffset} hoveredOverride={true} originalMeshes={meshes} disabled={!!transformMode} />
+        ))}
         
         {rebuildHistory?.map((geo, idx) => {
            const isVisible = geo.visible !== false &&
@@ -583,26 +601,27 @@ function GhostModel({
            const isSelected = selectedItemIds?.includes(geo.id);
            const mat = isSelected ? selectedSolidMaterial : (geo.type === 'sheet' ? sheetMaterial : solidMaterial);
            
-           if (isSelected && transformMode && (transformMode === 'translate' || transformMode === 'rotate' || transformMode === 'scale')) {
+           if (isSelected) {
                return (
                   <ActiveTransformSolid 
                      key={`geo-${geo.id || idx}`}
                      geo={geo}
                      material={mat}
                      centerOffset={centerOffset}
-                     transformMode={transformMode}
+                     transformMode={transformMode} // Pass null to allow default fallback locally
                      linearSnap={linearSnap}
                      setLinearSnap={setLinearSnap}
                      angleSnap={angleSnap}
                      setAngleSnap={setAngleSnap}
                      onTransformEnd={onTransformEnd}
+                     animateOpacity={true}
                   />
                );
            }
 
            return (
              <group key={`geo-${geo.id || idx}`} userData={{ isSolidGroup: true, id: geo.id }}>
-               <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={centerOffset} material={mat} />
+               <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={centerOffset} material={mat} animateOpacity={true} />
              </group>
            );
         })}
@@ -631,7 +650,7 @@ function GhostModel({
                if (!isVisible) return null;
                return (
                  <group key={`mirror-geo-${mirrorKey}-${idx}`}>
-                     <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={centerOffset} material={geo.type === 'sheet' ? sheetMaterial : solidMaterial} />
+                     <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={centerOffset} material={geo.type === 'sheet' ? sheetMaterial : solidMaterial} animateOpacity={true} />
                  </group>
                );
             })}
@@ -639,7 +658,7 @@ function GhostModel({
         );
       })}
 
-      {showMesh && !transformMode && (
+      {showMesh && !transformMode && selectionMode === 'curve-extract' && (
         <>
           <mesh ref={cursorRef} visible={false} renderOrder={1}>
             <sphereGeometry args={[cursorRadius, 16, 16]} />
@@ -664,7 +683,7 @@ export default function Viewport(props) {
      selectedLoops, rebuildHistory, selectedItemIds, cursorScale,
      showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle,
      linearSnap, setLinearSnap, angleSnap, setAngleSnap, toggleSymmetry,
-     transformMode, setTransformMode, outlinerExpanded
+     transformMode, setTransformMode, outlinerExpanded, selectionMode, setSelectionMode
   } = props;
 
   const [previewMode, setPreviewMode] = useState('reference');
