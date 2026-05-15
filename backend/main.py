@@ -30,7 +30,7 @@ class AppState:
     mesh = None
     cleaned_mesh = None 
     live_logs = []
-    rebuild_geometry = {} # DICTIONARY FOR STRICT ID LOCKING
+    rebuild_geometry = {} 
 
 state = AppState()
 
@@ -45,43 +45,51 @@ class Point3D(BaseModel):
     y: float
     z: float
     sharpness_angle: float = 30.0
+    edge_smoothing: float = 0.5
 
 class FeatureParams(BaseModel):
     x: float
     y: float
     z: float
     sharpness_angle: float = 30.0
+    edge_smoothing: float = 0.5
 
 class ClassifyParams(BaseModel):
     x: float
     y: float
     z: float
     sharpness_angle: float = 30.0
+    edge_smoothing: float = 0.5
 
 class AutoExtractParams(BaseModel):
     min_size: float
     sharpness_angle: float = 30.0
+    edge_smoothing: float = 0.5
 
 class BatchMagicPatchParams(BaseModel):
     sharpness_angle: float = 30.0
+    edge_smoothing: float = 0.5
 
 class HullParams(BaseModel):
     max_hulls: int
     detail_level: float
     decimation_target: int
     skip_decimation: bool = False
+    edge_smoothing: float = 0.5
 
 class CommitGeometryParams(BaseModel):
     geo_id: str
     operation: str
     loops: list
     extrude_depth: float = 2.0
+    edge_smoothing: float = 0.5
 
 class BooleanCutParams(BaseModel):
     geo_id: str
     loops: list
     extrude_depth: float
     target_id: str
+    edge_smoothing: float = 0.5
 
 class BooleanOpParams(BaseModel):
     geo_id: str
@@ -89,6 +97,7 @@ class BooleanOpParams(BaseModel):
     tool_id: str
     keep_tool: bool = False
     operation: str = 'subtract'
+    edge_smoothing: float = 0.5
 
 class CreatePrimitiveParams(BaseModel):
     geo_id: str
@@ -97,21 +106,25 @@ class CreatePrimitiveParams(BaseModel):
     sharpness_angle: float = 30.0
     symmetry: dict = None
     extrude_depth: float = 0.0
+    edge_smoothing: float = 0.5
 
 class CreatePatchParams(BaseModel):
     geo_id: str
     loops: list
     sharpness_angle: float = 30.0
+    edge_smoothing: float = 0.5
 
 class MagicPatchParams(BaseModel):
     geo_id: str
     patch_faces: list
     sharpness_angle: float = 30.0
+    edge_smoothing: float = 0.5
 
 class PatchSplitParams(BaseModel):
     geo_id: str
     points: list
     sharpness_angle: float = 30.0
+    edge_smoothing: float = 0.5
 
 class TransformParams(BaseModel):
     target_id: str
@@ -135,6 +148,7 @@ class PreprocessParams(BaseModel):
 class SewParams(BaseModel):
     geo_id: str
     target_ids: list
+    edge_smoothing: float = 0.5
 
 class ExportStepParams(BaseModel):
     hulls: list = []
@@ -506,43 +520,58 @@ def extract_segment(pts, start_idx, end_idx):
     else:
         return np.vstack((pts[start_idx:], pts[:end_idx+1]))
 
-def create_strict_edge(pts):
+# === NEW TENSION-BASED EDGE ALGORITHM ===
+def create_tension_edge(pts, force_start, force_end, tension=0.5):
     """
-    Creates an exact boundary edge without resampling. 
-    Forces straight lines on sharp planar segments to stop MakeFilling from wobbling/spilling.
+    Dynamically balances between hugging raw mesh noise (tension 0.0) 
+    and perfectly smooth but stiff spline interpolation (tension 1.0).
     """
     import build123d as b3d
-    clean_pts = [pts[0]]
-    for p in pts[1:]:
-        if np.linalg.norm(p - clean_pts[-1]) > 1e-5:
-            clean_pts.append(p)
-            
-    # Guarantee exact endpoint closure if it drifted slightly
-    if np.linalg.norm(pts[-1] - clean_pts[-1]) > 1e-7 and np.linalg.norm(pts[-1] - clean_pts[0]) > 1e-5:
-        clean_pts.append(pts[-1])
-
-    if len(clean_pts) < 2:
-        return None
+    import numpy as np
+    
+    start_v = b3d.Vector(force_start)
+    end_v = b3d.Vector(force_end)
+    
+    if len(pts) <= 2:
+        return b3d.Edge.make_line(start_v, end_v)
         
-    if len(clean_pts) == 2:
-        return b3d.Edge.make_line(b3d.Vector(clean_pts[0]), b3d.Vector(clean_pts[-1]))
-        
-    start, end = clean_pts[0], clean_pts[-1]
-    line_vec = end - start
+    line_vec = force_end - force_start
     line_len = np.linalg.norm(line_vec)
     
     if line_len < 1e-4:
-        return b3d.Edge.make_spline([b3d.Vector(p) for p in clean_pts])
+        return None
         
     line_dir = line_vec / line_len
-    max_dev = max([np.linalg.norm(np.cross(p - start, line_dir)) for p in clean_pts])
+    deviations = [np.linalg.norm(np.cross(p - force_start, line_dir)) for p in pts]
+    max_dev = max(deviations)
     
-    # Tight 0.05mm tolerance to force a straight geometric line instead of a curving spline
+    # Relaxed linearity tolerance so we don't accidentally wipe out gentle curves
     if max_dev < 0.05: 
-        return b3d.Edge.make_line(b3d.Vector(start), b3d.Vector(end))
+        return b3d.Edge.make_line(start_v, end_v)
         
-    return b3d.Edge.make_spline([b3d.Vector(p) for p in clean_pts])
-
+    # Tension Mapping: 
+    # tension = 0.0 -> max_pts (wobbly, exact mesh match)
+    # tension = 1.0 -> 4 pts (stiff, maximum smooth, shortcuts deep curves)
+    min_pts = 4
+    max_pts = len(pts)
+    
+    target_count = int(max_pts - (max_pts - min_pts) * tension)
+    target_count = max(min_pts, min(target_count, max_pts))
+    
+    indices = np.linspace(0, len(pts) - 1, target_count, dtype=int)
+    
+    clean_pts = [start_v]
+    for idx in indices[1:-1]:
+        v = b3d.Vector(pts[idx])
+        # Prevent zero-length tangent crashes by ensuring point spread
+        if (v - clean_pts[-1]).length > 1e-3 and (v - end_v).length > 1e-3:
+            clean_pts.append(v)
+    clean_pts.append(end_v)
+    
+    try:
+        return b3d.Edge.make_spline(clean_pts)
+    except:
+        return b3d.Edge.make_line(start_v, end_v)
 
 @app.post("/patch-split")
 async def patch_split(params: PatchSplitParams):
@@ -550,14 +579,13 @@ async def patch_split(params: PatchSplitParams):
         import build123d as b3d
         from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
         from OCP.GeomAbs import GeomAbs_C0
-        from OCP.gp import gp_Pnt
     except ImportError:
         raise HTTPException(status_code=500, detail="build123d or OCP missing")
 
     if state.mesh is None:
         raise HTTPException(status_code=400, detail="No mesh loaded.")
 
-    broadcast_log(f"[System] Initiating Auto-Patch Split [{params.geo_id}]...")
+    broadcast_log(f"[System] Initiating Auto-Patch Split [{params.geo_id}] with smoothing {params.edge_smoothing}...")
 
     try:
         raw_pts = np.array(params.points)
@@ -565,21 +593,21 @@ async def patch_split(params: PatchSplitParams):
             raw_pts = raw_pts[:-1]
 
         corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
-        broadcast_log(f"[System] Detected {len(corners)} hard corners for splitting.")
 
+        corner_pts = [raw_pts[c] for c in corners]
         b3d_edges = []
         for i in range(len(corners)):
             start_idx = corners[i]
             end_idx = corners[(i + 1) % len(corners)]
             
             seg_pts = extract_segment(raw_pts, start_idx, end_idx)
-            edge = create_strict_edge(seg_pts)
+            start_pt = corner_pts[i]
+            end_pt = corner_pts[(i + 1) % len(corners)]
+            
+            edge = create_tension_edge(seg_pts, start_pt, end_pt, tension=params.edge_smoothing)
             if edge:
                 b3d_edges.append(edge)
 
-        wire = b3d.Wire(b3d_edges)
-
-        # Attempt exactly mathematical Coons Patch to prevent spilling
         patch_face = None
         if len(b3d_edges) in [2, 3, 4]:
             try:
@@ -588,25 +616,16 @@ async def patch_split(params: PatchSplitParams):
                 pass
 
         if patch_face is None:
+            wire = b3d.Wire(b3d_edges)
             filler = BRepOffsetAPI_MakeFilling()
             for edge in wire.edges():
                 filler.Add(edge.wrapped, GeomAbs_C0)
 
-            if state.mesh is not None:
-                np_pts = np.array(params.points)
-                centroid = np.mean(np_pts, axis=0)
-                distances = np.linalg.norm(state.mesh.vertices - centroid, axis=1)
-                closest_idx = np.argsort(distances)[:50]
-                internal_pts = state.mesh.vertices[closest_idx]
-                for pt in internal_pts:
-                    filler.Add(gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])))
-
             filler.Build()
-            if not filler.IsDone():
-                broadcast_log("[Warning] Complex shrinkwrap failed, falling back to planar wire face.")
-                patch_face = b3d.Face(wire)
-            else:
+            if filler.IsDone():
                 patch_face = b3d.Face(filler.Shape())
+            else:
+                patch_face = b3d.Face(wire)
 
         state.rebuild_geometry[params.geo_id] = patch_face
 
@@ -644,9 +663,8 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
     except ImportError:
         raise HTTPException(status_code=500, detail="Missing libraries.")
 
-    broadcast_log("[System] Initiating Batch Magic Patch...")
+    broadcast_log(f"[System] Initiating Batch Magic Patch with Edge Smoothing: {params.edge_smoothing}...")
     
-    # 1. Identify segmented surface areas
     components = get_patch_components(state.mesh, params.sharpness_angle)
     
     loops_pts = []
@@ -672,9 +690,6 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
     if not loops_pts:
         raise HTTPException(status_code=400, detail="No boundary loops found.")
 
-    broadcast_log(f"[System] Found {len(loops_pts)} boundary loops. Applying Global Snap (0.01mm tolerance)...")
-
-    # 2. Global Snap
     all_pts = np.vstack(loops_pts)
     tree = scipy.spatial.cKDTree(all_pts)
     pairs = tree.query_pairs(r=0.01)
@@ -699,7 +714,6 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
         if root not in merged_positions:
             merged_positions[root] = all_pts[root]
             
-    # Reconstruct snapped loops
     snapped_loops = []
     idx_counter = 0
     for raw_pts in loops_pts:
@@ -710,16 +724,12 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
             idx_counter += 1
         snapped_loops.append(np.array(snapped))
 
-    broadcast_log("[System] Snapping complete. Generating multi-patch shell...")
-
-    # 3. Generate Faces
     b3d_faces = []
     for raw_pts in snapped_loops:
         if len(raw_pts) < 4: continue
         
         corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
         
-        # Enforce exact quads for Coons Patches if there's no defined sharp corners
         if len(corners) < 4:
             diffs = np.linalg.norm(raw_pts - np.roll(raw_pts, 1, axis=0), axis=1)
             cum_dists = np.cumsum(diffs)
@@ -733,19 +743,17 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
             if len(corners) < 4:
                 corners = [0, len(raw_pts)//4, len(raw_pts)//2, 3*len(raw_pts)//4]
             
+        corner_pts = [raw_pts[c] for c in corners]
         b3d_edges = []
         for i in range(len(corners)):
             start_idx = corners[i]
             end_idx = corners[(i + 1) % len(corners)]
             
             seg_pts = extract_segment(raw_pts, start_idx, end_idx)
-            edge = create_strict_edge(seg_pts)
+            edge = create_tension_edge(seg_pts, corner_pts[i], corner_pts[(i+1)%len(corners)], tension=params.edge_smoothing)
             if edge:
                 b3d_edges.append(edge)
             
-        wire = b3d.Wire(b3d_edges)
-        
-        # Attempt exactly mathematical Coons Patch to prevent spilling
         patch_face = None
         if len(b3d_edges) in [2, 3, 4]:
             try:
@@ -754,6 +762,7 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
                 pass
                 
         if patch_face is None:
+            wire = b3d.Wire(b3d_edges)
             filler = BRepOffsetAPI_MakeFilling()
             for edge in wire.edges():
                 filler.Add(edge.wrapped, GeomAbs_C0)
@@ -778,7 +787,7 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
         from build123d.exporters3d import export_stl
         export_stl(compound, path)
         tmesh = trimesh.load(path, file_type='stl')
-        broadcast_log(f"[Success] Batch Magic Patch generated {len(b3d_faces)} strict faces. Ready for Knitting.")
+        broadcast_log(f"[Success] Batch Magic Patch generated {len(b3d_faces)} faces.")
         return {
             "vertices": tmesh.vertices.tolist(),
             "faces": tmesh.faces.tolist(),
@@ -797,14 +806,13 @@ async def magic_patch(params: MagicPatchParams):
         import networkx as nx
         from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
         from OCP.GeomAbs import GeomAbs_C0
-        from OCP.gp import gp_Pnt
     except ImportError:
         raise HTTPException(status_code=500, detail="build123d or OCP missing")
 
     if state.mesh is None:
         raise HTTPException(status_code=400, detail="No mesh loaded.")
         
-    broadcast_log(f"[System] Initiating Magic Patch for {len(params.patch_faces)} faces [{params.geo_id}]...")
+    broadcast_log(f"[System] Initiating Magic Patch for {len(params.patch_faces)} faces with smoothing {params.edge_smoothing}...")
 
     try:
         submesh_faces = state.mesh.faces[params.patch_faces]
@@ -831,21 +839,18 @@ async def magic_patch(params: MagicPatchParams):
             raise ValueError("Boundary loop has too few vertices to patch.")
 
         corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
-        broadcast_log(f"[System] Detected {len(corners)} hard corners for splitting.")
 
+        corner_pts = [raw_pts[c] for c in corners]
         b3d_edges = []
         for i in range(len(corners)):
             start_idx = corners[i]
             end_idx = corners[(i + 1) % len(corners)]
             
             seg_pts = extract_segment(raw_pts, start_idx, end_idx)
-            edge = create_strict_edge(seg_pts)
+            edge = create_tension_edge(seg_pts, corner_pts[i], corner_pts[(i+1)%len(corners)], tension=params.edge_smoothing)
             if edge:
                 b3d_edges.append(edge)
             
-        wire = b3d.Wire(b3d_edges)
-        
-        # Attempt exactly mathematical Coons Patch to prevent spilling
         patch_face = None
         if len(b3d_edges) in [2, 3, 4]:
             try:
@@ -854,22 +859,12 @@ async def magic_patch(params: MagicPatchParams):
                 pass
                 
         if patch_face is None:
-            broadcast_log("[System] Shrinkwrapping NURBS patch to mesh curvature...")
-            
-            internal_nodes = list(set(np.unique(submesh_faces)) - set(ordered_nodes))
-            np.random.shuffle(internal_nodes)
-            sample_size = min(len(internal_nodes), 50)
-            internal_pts = state.mesh.vertices[internal_nodes[:sample_size]]
-
+            wire = b3d.Wire(b3d_edges)
             filler = BRepOffsetAPI_MakeFilling()
             for edge in wire.edges():
                 filler.Add(edge.wrapped, GeomAbs_C0)
                 
-            for pt in internal_pts:
-                filler.Add(gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])))
-                
             filler.Build()
-            
             if not filler.IsDone():
                 broadcast_log("[Warning] Complex shrinkwrap failed, falling back to planar wire face.")
                 patch_face = b3d.Face(wire)
@@ -907,66 +902,55 @@ async def create_patch(params: CreatePatchParams):
     except ImportError:
         raise HTTPException(status_code=500, detail="build123d missing")
 
-    broadcast_log(f"[System] Committing PATCH-FROM-WIRES to Stack [{params.geo_id}]...")
+    broadcast_log(f"[System] Committing PATCH-FROM-WIRES to Stack with smoothing {params.edge_smoothing}...")
     
     if not params.loops:
         raise ValueError("Creating a patch requires at least 1 loop.")
 
     try:
-        patch_face = None
+        loop_arrays = [np.array(l.get('points', [])) for l in params.loops if len(l.get('points', [])) > 1]
+        
+        # Endpoint Fusion: Snap all independent manual selections together if they are within 1 unit
+        for _ in range(2): 
+            for i in range(len(loop_arrays)):
+                for j in range(len(loop_arrays)):
+                    if i == j: continue
+                    for idx_i in [0, -1]:
+                        for idx_j in [0, -1]:
+                            if np.linalg.norm(loop_arrays[i][idx_i] - loop_arrays[j][idx_j]) < 1.0:
+                                avg = (loop_arrays[i][idx_i] + loop_arrays[j][idx_j]) / 2.0
+                                loop_arrays[i][idx_i] = avg
+                                loop_arrays[j][idx_j] = avg
+
         b3d_edges = []
+        for loop_pts in loop_arrays:
+            edge = create_tension_edge(loop_pts, force_start=loop_pts[0], force_end=loop_pts[-1], tension=params.edge_smoothing)
+            if edge: b3d_edges.append(edge)
 
-        # 1. Try to treat each manually selected loop as a distinct edge for a strict Coons Patch
-        for loop in params.loops:
-            raw_pts = np.array(loop.get('points', []))
-            if len(raw_pts) > 1:
-                edge = create_strict_edge(raw_pts)
-                if edge:
-                    b3d_edges.append(edge)
-
-        # 2. If the user selected exactly 2, 3, or 4 edges, try exact mathematical surface (Coons Patch)
+        patch_face = None
         if len(b3d_edges) in [2, 3, 4]:
             try:
                 patch_face = b3d.Face.make_surface_from_curves(b3d_edges)
-                broadcast_log(f"[System] Generated strict exact surface from {len(b3d_edges)} curves.")
             except Exception as e:
-                broadcast_log(f"[Warning] Strict patch failed, falling back to filling: {e}")
+                broadcast_log(f"[Warning] Strict mathematical patch failed, falling back to filling: {e}")
 
-        # 3. Fallback: Combine all points into a single continuous wire and use MakeFilling
         if patch_face is None:
-            processed_loop = []
-            for loop in params.loops:
-                processed_loop.extend(loop.get('points', []))
-            
-            pts = [b3d.Vector(p) for p in processed_loop]
-            
-            if len(pts) > 0 and (pts[0] - pts[-1]).length > 1e-5:
-                pts.append(pts[0])
-                
-            wire = b3d.Wire.make_polygon(pts)
-            
             try:
-                patch_face = b3d.Face.make_from_wires(wire)
-            except Exception:
-                pass
-                
-            if patch_face is None or state.mesh is not None:
-                broadcast_log("[System] Shrinkwrapping face to mesh curvature...")
+                wire = b3d.Wire(b3d_edges)
                 try:
-                    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+                    patch_face = b3d.Face.make_from_wires(wire)
+                except Exception:
                     filler = BRepOffsetAPI_MakeFilling()
-                    
                     for edge in wire.edges():
                         filler.Add(edge.wrapped, GeomAbs_C0)
-                        
                     filler.Build()
                     if filler.IsDone():
                         patch_face = b3d.Face(filler.Shape())
-                except Exception as e:
-                    broadcast_log(f"[Warning] Advanced shrinkwrap filling fallback: {e}")
+            except Exception as e:
+                raise ValueError("Could not generate a valid B-Rep face from the provided wires. Ensure they form a closed loop.")
 
         if patch_face is None:
-            raise ValueError("Could not generate a valid B-Rep face from the provided wires.")
+            raise ValueError("CAD engine rejected the boundary curves.")
 
         state.rebuild_geometry[params.geo_id] = patch_face
 
@@ -991,7 +975,6 @@ async def create_patch(params: CreatePatchParams):
         err_msg = str(e)
         broadcast_log(f"[Error] Failed to build Surface Patch: {err_msg}")
         raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
-
 
 @app.post("/create-primitive")
 async def create_primitive(params: CreatePrimitiveParams):
@@ -1176,21 +1159,6 @@ async def create_primitive(params: CreatePrimitiveParams):
         err_msg = str(e)
         broadcast_log(f"[Error] Failed to build Primitive: {err_msg}")
         raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
-
-def resample_loop(points, target_count=100):
-    pts = np.array(points)
-    if len(pts) < 2: return points
-    diffs = np.diff(pts, axis=0)
-    diffs = np.vstack([diffs, pts[0] - pts[-1]])
-    dists = np.linalg.norm(diffs, axis=1)
-    cum_dists = np.insert(np.cumsum(dists), 0, 0)
-    total_len = cum_dists[-1]
-    if total_len == 0: return points
-    target_dists = np.linspace(0, total_len, target_count, endpoint=False)
-    resampled = np.zeros((target_count, 3))
-    for i in range(3):
-        resampled[:, i] = np.interp(target_dists, cum_dists, np.append(pts[:, i], pts[0, i]))
-    return resampled.tolist()
 
 @app.post("/create-sheet")
 async def create_sheet(params: CommitGeometryParams):
@@ -1924,14 +1892,12 @@ async def export_step(payload: dict):
     merge_hulls = payload.get("merge_hulls", False)
     symmetry = payload.get("symmetry", {"x": False, "y": False, "z": False})
     
-    # 1. Fetch only the exact IDs that React deems currently active
     active_ids = payload.get("active_geo_ids", [])
     for gid in active_ids:
         shape = state.rebuild_geometry.get(gid)
         if shape is not None:
             shapes.append(shape)
         
-    # 2. Process CoACD Hulls
     hulls = payload.get("hulls", [])
     hull_solids = []
     
@@ -1992,7 +1958,6 @@ async def export_step(payload: dict):
     else:
         shapes.extend(hull_solids)
             
-    # 3. Process Extracted Sketched Features
     features = payload.get("features", [])
     if features:
         broadcast_log(f"[System] Compiling {len(features)} CAD sketches...")
@@ -2015,7 +1980,6 @@ async def export_step(payload: dict):
             
     shapes = [s for s in shapes if s is not None and hasattr(s, 'wrapped')]
 
-    # 4. Symmetry Logic across all collected shapes
     if any([symmetry.get('x'), symmetry.get('y'), symmetry.get('z')]):
         broadcast_log("[System] Applying structural symmetry arrays using build123d.mirror()...")
         
@@ -2038,7 +2002,6 @@ async def export_step(payload: dict):
         broadcast_log("[Error] No geometry found to export.")
         raise HTTPException(status_code=400, detail="No geometry found to export.")
         
-    # 5. Native build123d robust export
     broadcast_log("[System] Writing STEP file to disk...")
     fd, path = tempfile.mkstemp(suffix=".step")
     os.close(fd)

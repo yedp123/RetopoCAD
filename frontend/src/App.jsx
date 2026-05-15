@@ -299,6 +299,7 @@ export default function App() {
   const [mergeExportHulls, setMergeExportHulls] = useState(true);
   const [cursorScale, setCursorScale] = useState(0.005); 
   const [sharpnessAngle, setSharpnessAngle] = useState(30);
+  const [edgeSmoothing, setEdgeSmoothing] = useState(50); 
   
   const [decimationTarget, setDecimationTarget] = useState(25000);
   const [sharpeningIters, setSharpeningIters] = useState(3);
@@ -465,7 +466,8 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ 
             x: loop.clickPoint.x, y: loop.clickPoint.y, z: loop.clickPoint.z, 
-            sharpness_angle: sharpnessAngle 
+            sharpness_angle: sharpnessAngle,
+            edge_smoothing: edgeSmoothing / 100.0
           })
         });
         if (res.ok) {
@@ -488,7 +490,7 @@ export default function App() {
     setIsCommitting(true);
     
     const geoId = payload.geo_id || Math.random().toString(36).substr(2, 9);
-    const finalPayload = { ...payload, geo_id: geoId };
+    const finalPayload = { edge_smoothing: edgeSmoothing / 100.0, ...payload, geo_id: geoId };
 
     try {
       const res = await fetch(`http://localhost:8000/${endpoint}`, {
@@ -537,12 +539,15 @@ export default function App() {
 
   const handleBatchMagicPatch = async () => {
     setIsCommitting(true);
-    setServerLogs(prev => [...prev, `[System] Initiating Batch Magic Patch. Snapping boundaries...`]);
+    setServerLogs(prev => [...prev, `[System] Initiating Batch Magic Patch...`]);
     try {
         const res = await fetch('http://localhost:8000/batch-magic-patch', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sharpness_angle: sharpnessAngle })
+            body: JSON.stringify({ 
+              sharpness_angle: sharpnessAngle,
+              edge_smoothing: edgeSmoothing / 100.0
+            })
         });
         if (res.ok) {
             const data = await res.json();
@@ -552,7 +557,7 @@ export default function App() {
                 visible: true,
                 name: `AutoShell_${data.id.substring(0,4)}`,
                 endpoint: 'batch-magic-patch',
-                payload: { sharpness_angle: sharpnessAngle }
+                payload: { sharpness_angle: sharpnessAngle, edge_smoothing: edgeSmoothing / 100.0 }
             }]);
             setServerLogs(prev => [...prev, `[Success] Batch Magic Patch complete. Tag: ${data.tag}`]);
             setOutlinerExpanded(prev => ({...prev, shells: true}));
@@ -576,7 +581,7 @@ export default function App() {
         const res = await fetch(`http://localhost:8000/sew-surfaces`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ geo_id: geoId, target_ids: selectedItemIds })
+            body: JSON.stringify({ geo_id: geoId, target_ids: selectedItemIds, edge_smoothing: edgeSmoothing / 100.0 })
         });
         if (res.ok) {
             const geometryData = await res.json();
@@ -589,7 +594,7 @@ export default function App() {
                     visible: true, 
                     name: `Sewn_${geoId}`, 
                     endpoint: 'sew-surfaces', 
-                    payload: { target_ids: selectedItemIds } 
+                    payload: { target_ids: selectedItemIds, edge_smoothing: edgeSmoothing / 100.0 } 
                 });
                 return newHistory;
             });
@@ -641,7 +646,7 @@ export default function App() {
       const res = await fetch('http://localhost:8000/auto-extract', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ min_size: minFeatureSize, sharpness_angle: sharpnessAngle })
+        body: JSON.stringify({ min_size: minFeatureSize, sharpness_angle: sharpnessAngle, edge_smoothing: edgeSmoothing / 100.0 })
       });
       const data = await res.json();
       if (res.ok) {
@@ -669,7 +674,8 @@ export default function App() {
             x: loopData.clickPoint.x, 
             y: loopData.clickPoint.y, 
             z: loopData.clickPoint.z, 
-            sharpness_angle: sharpnessAngle 
+            sharpness_angle: sharpnessAngle,
+            edge_smoothing: edgeSmoothing / 100.0
           })
         });
         if (res.ok) {
@@ -787,7 +793,8 @@ export default function App() {
                 target_id: targetId, 
                 tool_id: toolId, 
                 keep_tool: keepTool,
-                operation: 'subtract'
+                operation: 'subtract',
+                edge_smoothing: edgeSmoothing / 100.0
             })
         });
         if (res.ok) {
@@ -803,7 +810,7 @@ export default function App() {
                     ...geometryData, 
                     name: newHistory[tIndex].name + ' (Subtracted)',
                     endpoint: 'boolean-op',
-                    payload: { operation: 'subtract', geo_id: targetId, target_id: targetId, tool_id: toolId, keep_tool: keepTool }
+                    payload: { operation: 'subtract', geo_id: targetId, target_id: targetId, tool_id: toolId, keep_tool: keepTool, edge_smoothing: edgeSmoothing / 100.0 }
                 };
                 if (!keepTool && toIndex >= 0) {
                     newHistory[toIndex] = { ...newHistory[toIndex], deleted: true };
@@ -885,7 +892,7 @@ export default function App() {
   const handleSaveProject = () => {
     const projectData = {
       features: currentFeatures, rebuildHistory,
-      settings: { minFeatureSize, symmetry, mergeExportHulls, cursorScale, sharpnessAngle, decimationTarget, sharpeningIters, linearSnap, angleSnap }
+      settings: { minFeatureSize, symmetry, mergeExportHulls, cursorScale, sharpnessAngle, edgeSmoothing, decimationTarget, sharpeningIters, linearSnap, angleSnap }
     };
     const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -912,6 +919,7 @@ export default function App() {
           if (data.settings.mergeExportHulls !== undefined) setMergeExportHulls(data.settings.mergeExportHulls);
           if (data.settings.cursorScale) setCursorScale(data.settings.cursorScale);
           if (data.settings.sharpnessAngle) setSharpnessAngle(data.settings.sharpnessAngle);
+          if (data.settings.edgeSmoothing !== undefined) setEdgeSmoothing(data.settings.edgeSmoothing);
           if (data.settings.decimationTarget) setDecimationTarget(data.settings.decimationTarget);
           if (data.settings.sharpeningIters !== undefined) setSharpeningIters(data.settings.sharpeningIters);
           if (data.settings.linearSnap !== undefined) setLinearSnap(data.settings.linearSnap);
@@ -1076,6 +1084,26 @@ export default function App() {
                         Apply Filters
                       </button>
                     </div>
+                  </div>
+               </div>
+
+               {/* NEW: PATCHING CONTROLS */}
+               <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2 mt-2">
+                  <span className="text-[8px] font-bold uppercase text-zinc-400 tracking-wider mb-1">Patching Controls</span>
+                  <div className="flex flex-col gap-1">
+                      <div className="flex justify-between items-center text-[8px] text-zinc-400 font-mono">
+                          <span>Edge Smoothing</span>
+                          <span className="text-white">{edgeSmoothing}%</span>
+                      </div>
+                      <input
+                          type="range" min="0" max="100"
+                          value={edgeSmoothing}
+                          onChange={(e) => setEdgeSmoothing(parseInt(e.target.value))}
+                          className="w-full accent-indigo-500 h-1 mt-1 mb-1"
+                      />
+                      <span className="text-[7px] text-zinc-500 italic mt-1 leading-tight">
+                          0% strictly follows mesh triangles (can be wobbly). 100% simplifies curves for perfectly smooth CAD edges (can lose detail).
+                      </span>
                   </div>
                </div>
 
@@ -1465,7 +1493,7 @@ export default function App() {
                     {selectedItemsData.map((item, i) => (
                       <div key={`item-${i}`} className="flex justify-between items-center bg-zinc-800/50 px-2 py-1 rounded text-[10px] font-mono text-zinc-300">
                         <span className="truncate w-32">{item.name}</span>
-                        <span className={item.type === 'sheet' || item.type === 'face' ? 'text-green-400' : item.type === 'blade' ? 'text-amber-400' : item.type === 'shell' ? 'text-indigo-400' : 'text-blue-400'}>{item.type.toUpperCase()}</span>
+                        <span className={item.type === 'sheet' || item.type === 'face' ? 'text-green-400' : item.type === 'blade' ? 'text-amber-400' : 'text-blue-400'}>{item.type.toUpperCase()}</span>
                       </div>
                     ))}
                   </>
@@ -1521,7 +1549,7 @@ export default function App() {
             <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-3">
               <div className="flex justify-between items-center border-b border-zinc-800 pb-2">
                 <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Classification</span>
-                <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${selectedItemsData[0].type === 'sheet' || selectedItemsData[0].type === 'face' ? 'bg-green-900/30 text-green-400 border border-green-800' : selectedItemsData[0].type === 'blade' ? 'bg-amber-900/30 text-amber-400 border border-amber-800' : selectedItemsData[0].type === 'shell' ? 'bg-indigo-900/30 text-indigo-400 border border-indigo-800' : 'bg-blue-900/30 text-blue-400 border border-blue-800'}`}>
+                <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${selectedItemsData[0].type === 'sheet' || selectedItemsData[0].type === 'face' ? 'bg-green-900/30 text-green-400 border border-green-800' : selectedItemsData[0].type === 'blade' ? 'bg-amber-900/30 text-amber-400 border border-amber-800' : 'bg-blue-900/30 text-blue-400 border border-blue-800'}`}>
                   {selectedItemsData[0].type}
                 </span>
               </div>
