@@ -455,21 +455,6 @@ def apply_pca_firewall(points):
         proj_pts.append(p - dist * normal)
     return proj_pts
 
-def resample_loop(points, target_count=100):
-    pts = np.array(points)
-    if len(pts) < 2: return points
-    diffs = np.diff(pts, axis=0)
-    diffs = np.vstack([diffs, pts[0] - pts[-1]])
-    dists = np.linalg.norm(diffs, axis=1)
-    cum_dists = np.insert(np.cumsum(dists), 0, 0)
-    total_len = cum_dists[-1]
-    if total_len == 0: return points
-    target_dists = np.linspace(0, total_len, target_count, endpoint=False)
-    resampled = np.zeros((target_count, 3))
-    for i in range(3):
-        resampled[:, i] = np.interp(target_dists, cum_dists, np.append(pts[:, i], pts[0, i]))
-    return resampled.tolist()
-
 def find_dynamic_corners(pts, threshold_deg=30.0):
     n = len(pts)
     if n < 3: return list(range(n))
@@ -521,18 +506,42 @@ def extract_segment(pts, start_idx, end_idx):
     else:
         return np.vstack((pts[start_idx:], pts[:end_idx+1]))
 
-def resample_segment(seg_pts, target_count=25):
-    if len(seg_pts) < 2: return seg_pts.tolist()
-    diffs = np.diff(seg_pts, axis=0)
-    dists = np.linalg.norm(diffs, axis=1)
-    cum_dists = np.insert(np.cumsum(dists), 0, 0)
-    total_len = cum_dists[-1]
-    if total_len == 0: return seg_pts.tolist()
-    target_dists = np.linspace(0, total_len, target_count)
-    resampled = np.zeros((target_count, 3))
-    for i in range(3):
-        resampled[:, i] = np.interp(target_dists, cum_dists, seg_pts[:, i])
-    return resampled.tolist()
+def create_strict_edge(pts):
+    """
+    Creates an exact boundary edge without resampling. 
+    Forces straight lines on sharp planar segments to stop MakeFilling from wobbling/spilling.
+    """
+    import build123d as b3d
+    clean_pts = [pts[0]]
+    for p in pts[1:]:
+        if np.linalg.norm(p - clean_pts[-1]) > 1e-5:
+            clean_pts.append(p)
+            
+    # Guarantee exact endpoint closure if it drifted slightly
+    if np.linalg.norm(pts[-1] - clean_pts[-1]) > 1e-7 and np.linalg.norm(pts[-1] - clean_pts[0]) > 1e-5:
+        clean_pts.append(pts[-1])
+
+    if len(clean_pts) < 2:
+        return None
+        
+    if len(clean_pts) == 2:
+        return b3d.Edge.make_line(b3d.Vector(clean_pts[0]), b3d.Vector(clean_pts[-1]))
+        
+    start, end = clean_pts[0], clean_pts[-1]
+    line_vec = end - start
+    line_len = np.linalg.norm(line_vec)
+    
+    if line_len < 1e-4:
+        return b3d.Edge.make_spline([b3d.Vector(p) for p in clean_pts])
+        
+    line_dir = line_vec / line_len
+    max_dev = max([np.linalg.norm(np.cross(p - start, line_dir)) for p in clean_pts])
+    
+    # Tight 0.05mm tolerance to force a straight geometric line instead of a curving spline
+    if max_dev < 0.05: 
+        return b3d.Edge.make_line(b3d.Vector(start), b3d.Vector(end))
+        
+    return b3d.Edge.make_spline([b3d.Vector(p) for p in clean_pts])
 
 
 @app.post("/patch-split")
@@ -558,37 +567,46 @@ async def patch_split(params: PatchSplitParams):
         corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
         broadcast_log(f"[System] Detected {len(corners)} hard corners for splitting.")
 
-        edges = []
+        b3d_edges = []
         for i in range(len(corners)):
             start_idx = corners[i]
             end_idx = corners[(i + 1) % len(corners)]
             
-            pts_count = max(10, 100 // len(corners)) 
-            seg_pts = resample_segment(extract_segment(raw_pts, start_idx, end_idx), pts_count)
-            edges.append(b3d.Edge.make_spline([b3d.Vector(p) for p in seg_pts]))
+            seg_pts = extract_segment(raw_pts, start_idx, end_idx)
+            edge = create_strict_edge(seg_pts)
+            if edge:
+                b3d_edges.append(edge)
 
-        wire = b3d.Wire(edges)
+        wire = b3d.Wire(b3d_edges)
 
-        filler = BRepOffsetAPI_MakeFilling()
-        for edge in wire.edges():
-            filler.Add(edge.wrapped, GeomAbs_C0)
+        # Attempt exactly mathematical Coons Patch to prevent spilling
+        patch_face = None
+        if len(b3d_edges) in [2, 3, 4]:
+            try:
+                patch_face = b3d.Face.make_surface_from_curves(b3d_edges)
+            except Exception:
+                pass
 
-        if state.mesh is not None:
-            np_pts = np.array(params.points)
-            centroid = np.mean(np_pts, axis=0)
-            distances = np.linalg.norm(state.mesh.vertices - centroid, axis=1)
-            closest_idx = np.argsort(distances)[:50]
-            internal_pts = state.mesh.vertices[closest_idx]
-            for pt in internal_pts:
-                filler.Add(gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])))
+        if patch_face is None:
+            filler = BRepOffsetAPI_MakeFilling()
+            for edge in wire.edges():
+                filler.Add(edge.wrapped, GeomAbs_C0)
 
-        filler.Build()
-        
-        if not filler.IsDone():
-            broadcast_log("[Warning] Complex shrinkwrap failed, falling back to planar wire face.")
-            patch_face = b3d.Face(wire)
-        else:
-            patch_face = b3d.Face(filler.Shape())
+            if state.mesh is not None:
+                np_pts = np.array(params.points)
+                centroid = np.mean(np_pts, axis=0)
+                distances = np.linalg.norm(state.mesh.vertices - centroid, axis=1)
+                closest_idx = np.argsort(distances)[:50]
+                internal_pts = state.mesh.vertices[closest_idx]
+                for pt in internal_pts:
+                    filler.Add(gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])))
+
+            filler.Build()
+            if not filler.IsDone():
+                broadcast_log("[Warning] Complex shrinkwrap failed, falling back to planar wire face.")
+                patch_face = b3d.Face(wire)
+            else:
+                patch_face = b3d.Face(filler.Shape())
 
         state.rebuild_geometry[params.geo_id] = patch_face
 
@@ -699,40 +717,53 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
     for raw_pts in snapped_loops:
         if len(raw_pts) < 4: continue
         
-        # Split strictly into 4 segments to ensure Topogun-like patching constraints
-        diffs = np.linalg.norm(raw_pts - np.roll(raw_pts, 1, axis=0), axis=1)
-        cum_dists = np.cumsum(diffs)
-        total_len = cum_dists[-1]
-        targets = [0, total_len * 0.25, total_len * 0.5, total_len * 0.75]
-        corners = []
-        for t in targets:
-            idx = np.searchsorted(cum_dists, t)
-            corners.append(min(idx, len(raw_pts) - 1))
+        corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
         
-        corners = sorted(list(set(corners)))
+        # Enforce exact quads for Coons Patches if there's no defined sharp corners
         if len(corners) < 4:
-            corners = [0, len(raw_pts)//4, len(raw_pts)//2, 3*len(raw_pts)//4]
+            diffs = np.linalg.norm(raw_pts - np.roll(raw_pts, 1, axis=0), axis=1)
+            cum_dists = np.cumsum(diffs)
+            total_len = cum_dists[-1]
+            targets = [0, total_len * 0.25, total_len * 0.5, total_len * 0.75]
+            corners = []
+            for t in targets:
+                idx = np.searchsorted(cum_dists, t)
+                corners.append(min(idx, len(raw_pts) - 1))
+            corners = sorted(list(set(corners)))
+            if len(corners) < 4:
+                corners = [0, len(raw_pts)//4, len(raw_pts)//2, 3*len(raw_pts)//4]
             
         b3d_edges = []
         for i in range(len(corners)):
             start_idx = corners[i]
             end_idx = corners[(i + 1) % len(corners)]
             
-            pts_count = max(10, 100 // len(corners))
-            seg_pts = resample_segment(extract_segment(raw_pts, start_idx, end_idx), pts_count)
-            b3d_edges.append(b3d.Edge.make_spline([b3d.Vector(p) for p in seg_pts]))
+            seg_pts = extract_segment(raw_pts, start_idx, end_idx)
+            edge = create_strict_edge(seg_pts)
+            if edge:
+                b3d_edges.append(edge)
             
         wire = b3d.Wire(b3d_edges)
         
-        filler = BRepOffsetAPI_MakeFilling()
-        for edge in wire.edges():
-            filler.Add(edge.wrapped, GeomAbs_C0)
-        
-        filler.Build()
-        if filler.IsDone():
-            b3d_faces.append(b3d.Face(filler.Shape()))
-        else:
-            b3d_faces.append(b3d.Face(wire))
+        # Attempt exactly mathematical Coons Patch to prevent spilling
+        patch_face = None
+        if len(b3d_edges) in [2, 3, 4]:
+            try:
+                patch_face = b3d.Face.make_surface_from_curves(b3d_edges)
+            except Exception:
+                pass
+                
+        if patch_face is None:
+            filler = BRepOffsetAPI_MakeFilling()
+            for edge in wire.edges():
+                filler.Add(edge.wrapped, GeomAbs_C0)
+            filler.Build()
+            if filler.IsDone():
+                patch_face = b3d.Face(filler.Shape())
+            else:
+                patch_face = b3d.Face(wire)
+                
+        b3d_faces.append(patch_face)
             
     if not b3d_faces:
          raise ValueError("Could not build any faces.")
@@ -747,7 +778,7 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
         from build123d.exporters3d import export_stl
         export_stl(compound, path)
         tmesh = trimesh.load(path, file_type='stl')
-        broadcast_log(f"[Success] Batch Magic Patch generated {len(b3d_faces)} faces. Ready for Knitting.")
+        broadcast_log(f"[Success] Batch Magic Patch generated {len(b3d_faces)} strict faces. Ready for Knitting.")
         return {
             "vertices": tmesh.vertices.tolist(),
             "faces": tmesh.faces.tolist(),
@@ -807,33 +838,43 @@ async def magic_patch(params: MagicPatchParams):
             start_idx = corners[i]
             end_idx = corners[(i + 1) % len(corners)]
             
-            pts_count = max(10, 100 // len(corners))
-            seg_pts = resample_segment(extract_segment(raw_pts, start_idx, end_idx), pts_count)
-            b3d_edges.append(b3d.Edge.make_spline([b3d.Vector(p) for p in seg_pts]))
+            seg_pts = extract_segment(raw_pts, start_idx, end_idx)
+            edge = create_strict_edge(seg_pts)
+            if edge:
+                b3d_edges.append(edge)
             
         wire = b3d.Wire(b3d_edges)
         
-        broadcast_log("[System] Shrinkwrapping NURBS patch to mesh curvature...")
-        
-        internal_nodes = list(set(np.unique(submesh_faces)) - set(ordered_nodes))
-        np.random.shuffle(internal_nodes)
-        sample_size = min(len(internal_nodes), 50)
-        internal_pts = state.mesh.vertices[internal_nodes[:sample_size]]
+        # Attempt exactly mathematical Coons Patch to prevent spilling
+        patch_face = None
+        if len(b3d_edges) in [2, 3, 4]:
+            try:
+                patch_face = b3d.Face.make_surface_from_curves(b3d_edges)
+            except Exception:
+                pass
+                
+        if patch_face is None:
+            broadcast_log("[System] Shrinkwrapping NURBS patch to mesh curvature...")
+            
+            internal_nodes = list(set(np.unique(submesh_faces)) - set(ordered_nodes))
+            np.random.shuffle(internal_nodes)
+            sample_size = min(len(internal_nodes), 50)
+            internal_pts = state.mesh.vertices[internal_nodes[:sample_size]]
 
-        filler = BRepOffsetAPI_MakeFilling()
-        for edge in wire.edges():
-            filler.Add(edge.wrapped, GeomAbs_C0)
+            filler = BRepOffsetAPI_MakeFilling()
+            for edge in wire.edges():
+                filler.Add(edge.wrapped, GeomAbs_C0)
+                
+            for pt in internal_pts:
+                filler.Add(gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])))
+                
+            filler.Build()
             
-        for pt in internal_pts:
-            filler.Add(gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])))
-            
-        filler.Build()
-        
-        if not filler.IsDone():
-            broadcast_log("[Warning] Complex shrinkwrap failed, falling back to planar wire face.")
-            patch_face = b3d.Face(wire)
-        else:
-            patch_face = b3d.Face(filler.Shape())
+            if not filler.IsDone():
+                broadcast_log("[Warning] Complex shrinkwrap failed, falling back to planar wire face.")
+                patch_face = b3d.Face(wire)
+            else:
+                patch_face = b3d.Face(filler.Shape())
 
         state.rebuild_geometry[params.geo_id] = patch_face
 
@@ -872,37 +913,57 @@ async def create_patch(params: CreatePatchParams):
         raise ValueError("Creating a patch requires at least 1 loop.")
 
     try:
-        processed_loop = []
-        for loop in params.loops:
-            processed_loop.extend(loop.get('points', []))
-        
-        pts = [b3d.Vector(p) for p in processed_loop]
-        
-        if len(pts) > 0 and (pts[0] - pts[-1]).length > 1e-5:
-            pts.append(pts[0])
-            
-        wire = b3d.Wire.make_polygon(pts)
         patch_face = None
-        
-        try:
-            patch_face = b3d.Face.make_from_wires(wire)
-        except Exception:
-            pass
-            
-        if patch_face is None or state.mesh is not None:
-            broadcast_log("[System] Shrinkwrapping face to mesh curvature...")
+        b3d_edges = []
+
+        # 1. Try to treat each manually selected loop as a distinct edge for a strict Coons Patch
+        for loop in params.loops:
+            raw_pts = np.array(loop.get('points', []))
+            if len(raw_pts) > 1:
+                edge = create_strict_edge(raw_pts)
+                if edge:
+                    b3d_edges.append(edge)
+
+        # 2. If the user selected exactly 2, 3, or 4 edges, try exact mathematical surface (Coons Patch)
+        if len(b3d_edges) in [2, 3, 4]:
             try:
-                from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
-                filler = BRepOffsetAPI_MakeFilling()
-                
-                for edge in wire.edges():
-                    filler.Add(edge.wrapped, GeomAbs_C0)
-                    
-                filler.Build()
-                if filler.IsDone():
-                    patch_face = b3d.Face(filler.Shape())
+                patch_face = b3d.Face.make_surface_from_curves(b3d_edges)
+                broadcast_log(f"[System] Generated strict exact surface from {len(b3d_edges)} curves.")
             except Exception as e:
-                broadcast_log(f"[Warning] Advanced shrinkwrap filling fallback: {e}")
+                broadcast_log(f"[Warning] Strict patch failed, falling back to filling: {e}")
+
+        # 3. Fallback: Combine all points into a single continuous wire and use MakeFilling
+        if patch_face is None:
+            processed_loop = []
+            for loop in params.loops:
+                processed_loop.extend(loop.get('points', []))
+            
+            pts = [b3d.Vector(p) for p in processed_loop]
+            
+            if len(pts) > 0 and (pts[0] - pts[-1]).length > 1e-5:
+                pts.append(pts[0])
+                
+            wire = b3d.Wire.make_polygon(pts)
+            
+            try:
+                patch_face = b3d.Face.make_from_wires(wire)
+            except Exception:
+                pass
+                
+            if patch_face is None or state.mesh is not None:
+                broadcast_log("[System] Shrinkwrapping face to mesh curvature...")
+                try:
+                    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+                    filler = BRepOffsetAPI_MakeFilling()
+                    
+                    for edge in wire.edges():
+                        filler.Add(edge.wrapped, GeomAbs_C0)
+                        
+                    filler.Build()
+                    if filler.IsDone():
+                        patch_face = b3d.Face(filler.Shape())
+                except Exception as e:
+                    broadcast_log(f"[Warning] Advanced shrinkwrap filling fallback: {e}")
 
         if patch_face is None:
             raise ValueError("Could not generate a valid B-Rep face from the provided wires.")
@@ -930,6 +991,7 @@ async def create_patch(params: CreatePatchParams):
         err_msg = str(e)
         broadcast_log(f"[Error] Failed to build Surface Patch: {err_msg}")
         raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
+
 
 @app.post("/create-primitive")
 async def create_primitive(params: CreatePrimitiveParams):
@@ -1114,6 +1176,21 @@ async def create_primitive(params: CreatePrimitiveParams):
         err_msg = str(e)
         broadcast_log(f"[Error] Failed to build Primitive: {err_msg}")
         raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
+
+def resample_loop(points, target_count=100):
+    pts = np.array(points)
+    if len(pts) < 2: return points
+    diffs = np.diff(pts, axis=0)
+    diffs = np.vstack([diffs, pts[0] - pts[-1]])
+    dists = np.linalg.norm(diffs, axis=1)
+    cum_dists = np.insert(np.cumsum(dists), 0, 0)
+    total_len = cum_dists[-1]
+    if total_len == 0: return points
+    target_dists = np.linspace(0, total_len, target_count, endpoint=False)
+    resampled = np.zeros((target_count, 3))
+    for i in range(3):
+        resampled[:, i] = np.interp(target_dists, cum_dists, np.append(pts[:, i], pts[0, i]))
+    return resampled.tolist()
 
 @app.post("/create-sheet")
 async def create_sheet(params: CommitGeometryParams):
