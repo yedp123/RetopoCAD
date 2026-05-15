@@ -520,12 +520,7 @@ def extract_segment(pts, start_idx, end_idx):
     else:
         return np.vstack((pts[start_idx:], pts[:end_idx+1]))
 
-# === NEW TENSION-BASED EDGE ALGORITHM ===
 def create_tension_edge(pts, force_start, force_end, tension=0.5):
-    """
-    Dynamically balances between hugging raw mesh noise (tension 0.0) 
-    and perfectly smooth but stiff spline interpolation (tension 1.0).
-    """
     import build123d as b3d
     import numpy as np
     
@@ -545,13 +540,9 @@ def create_tension_edge(pts, force_start, force_end, tension=0.5):
     deviations = [np.linalg.norm(np.cross(p - force_start, line_dir)) for p in pts]
     max_dev = max(deviations)
     
-    # Relaxed linearity tolerance so we don't accidentally wipe out gentle curves
     if max_dev < 0.05: 
         return b3d.Edge.make_line(start_v, end_v)
         
-    # Tension Mapping: 
-    # tension = 0.0 -> max_pts (wobbly, exact mesh match)
-    # tension = 1.0 -> 4 pts (stiff, maximum smooth, shortcuts deep curves)
     min_pts = 4
     max_pts = len(pts)
     
@@ -563,7 +554,6 @@ def create_tension_edge(pts, force_start, force_end, tension=0.5):
     clean_pts = [start_v]
     for idx in indices[1:-1]:
         v = b3d.Vector(pts[idx])
-        # Prevent zero-length tangent crashes by ensuring point spread
         if (v - clean_pts[-1]).length > 1e-3 and (v - end_v).length > 1e-3:
             clean_pts.append(v)
     clean_pts.append(end_v)
@@ -625,7 +615,13 @@ async def patch_split(params: PatchSplitParams):
             if filler.IsDone():
                 patch_face = b3d.Face(filler.Shape())
             else:
-                patch_face = b3d.Face(wire)
+                try:
+                    patch_face = b3d.Face(wire)
+                except Exception as e:
+                    raise ValueError(f"Failed to generate face from wire: {e}")
+
+        if patch_face is None:
+            raise ValueError("Engine failed to generate a surface patch.")
 
         state.rebuild_geometry[params.geo_id] = patch_face
 
@@ -659,6 +655,7 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
         import networkx as nx
         import scipy.spatial
         from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
         from OCP.GeomAbs import GeomAbs_C0
     except ImportError:
         raise HTTPException(status_code=500, detail="Missing libraries.")
@@ -770,29 +767,110 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
             if filler.IsDone():
                 patch_face = b3d.Face(filler.Shape())
             else:
-                patch_face = b3d.Face(wire)
-                
-        b3d_faces.append(patch_face)
+                try:
+                    patch_face = b3d.Face(wire)
+                except:
+                    continue # Skip this face if we cannot build it
+
+        if patch_face is not None:
+            b3d_faces.append(patch_face)
             
     if not b3d_faces:
-         raise ValueError("Could not build any faces.")
+         raise HTTPException(status_code=400, detail="Could not build any valid faces from patches.")
          
-    compound = b3d.Compound(children=b3d_faces)
-    geo_id = f"batch_shell_{uuid.uuid4().hex[:8]}"
-    state.rebuild_geometry[geo_id] = compound
+    # === NEW SEWING LOGIC WITH CRASH PREVENTION ===
+    sewer = BRepBuilderAPI_Sewing()
+    sewer.SetTolerance(1e-2)
+    
+    valid_faces = [f for f in b3d_faces if f is not None and hasattr(f, 'wrapped')]
+    for face in valid_faces:
+        sewer.Add(face.wrapped)
+
+    sewer.Perform()
+    sewed_shape = sewer.SewedShape()
+    
+    sewed_b3d = None
+    try:
+        # Cast can return None if the underlying topo shape is null
+        if not sewed_shape.IsNull():
+            sewed_b3d = b3d.Shape.cast(sewed_shape)
+    except Exception as e:
+        broadcast_log(f"[Warning] Failed to cast sewed shape: {e}")
+        sewed_b3d = None
+
+    is_solid = False
+    final_geo = None
+
+    if sewed_b3d is not None:
+        if isinstance(sewed_b3d, b3d.Solid):
+            final_geo = sewed_b3d
+            is_solid = True
+        elif isinstance(sewed_b3d, b3d.Shell):
+            if sewed_b3d.is_closed:
+                try:
+                    final_geo = b3d.Solid.make_solid(sewed_b3d)
+                    is_solid = True
+                except:
+                    final_geo = sewed_b3d
+            else:
+                final_geo = sewed_b3d
+        elif isinstance(sewed_b3d, b3d.Compound):
+            shells = sewed_b3d.shells()
+            if shells and shells[0].is_closed:
+                try:
+                    final_geo = b3d.Solid.make_solid(shells[0])
+                    is_solid = True
+                except:
+                    final_geo = shells[0]
+            elif shells:
+                final_geo = shells[0]
+            else:
+                final_geo = sewed_b3d
+        else:
+            final_geo = sewed_b3d
+
+    # Strict fallback check to prevent NoneType crash in export_stl
+    if final_geo is None:
+        if valid_faces:
+            broadcast_log("[Warning] Sewing algorithm returned a null geometry. Falling back to a standard Compound.")
+            final_geo = b3d.Compound(children=valid_faces)
+            is_solid = False
+        else:
+            raise HTTPException(status_code=400, detail="No valid faces available to sew.")
+
+    geo_id = f"batch_{'solid' if is_solid else 'shell'}_{uuid.uuid4().hex[:8]}"
+    state.rebuild_geometry[geo_id] = final_geo
     
     fd, path = tempfile.mkstemp(suffix=".stl")
     os.close(fd)
     try:
         from build123d.exporters3d import export_stl
-        export_stl(compound, path)
+        export_stl(final_geo, path)
         tmesh = trimesh.load(path, file_type='stl')
-        broadcast_log(f"[Success] Batch Magic Patch generated {len(b3d_faces)} faces.")
+        
+        naked_edges = []
+        if not is_solid:
+            edges = trimesh.geometry.faces_to_edges(tmesh.faces)
+            edges_sorted = np.sort(edges, axis=1)
+            unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
+            boundary_edges = unique_edges[counts == 1]
+            for edge in boundary_edges:
+                p1 = tmesh.vertices[edge[0]].tolist()
+                p2 = tmesh.vertices[edge[1]].tolist()
+                naked_edges.append([p1, p2])
+
+        if is_solid:
+            broadcast_log(f"[Success] Batch Magic Patch generated {len(b3d_faces)} faces. Result is a Water-tight Solid!")
+        else:
+            broadcast_log(f"[Warning] Batch Magic Patch generated {len(b3d_faces)} faces. Result is an Open Shell.")
+
         return {
             "vertices": tmesh.vertices.tolist(),
             "faces": tmesh.faces.tolist(),
             "id": geo_id,
-            "tag": "Ready for Knitting"
+            "tag": "Ready for Knitting",
+            "is_solid": is_solid,
+            "naked_edges": naked_edges
         }
     finally:
         try: os.remove(path)
@@ -867,9 +945,15 @@ async def magic_patch(params: MagicPatchParams):
             filler.Build()
             if not filler.IsDone():
                 broadcast_log("[Warning] Complex shrinkwrap failed, falling back to planar wire face.")
-                patch_face = b3d.Face(wire)
+                try:
+                    patch_face = b3d.Face(wire)
+                except Exception as e:
+                    raise ValueError(f"Engine failed to generate fallback surface: {e}")
             else:
                 patch_face = b3d.Face(filler.Shape())
+
+        if patch_face is None:
+            raise ValueError("Engine failed to generate a surface patch.")
 
         state.rebuild_geometry[params.geo_id] = patch_face
 
@@ -940,6 +1024,7 @@ async def create_patch(params: CreatePatchParams):
                 try:
                     patch_face = b3d.Face.make_from_wires(wire)
                 except Exception:
+                    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
                     filler = BRepOffsetAPI_MakeFilling()
                     for edge in wire.edges():
                         filler.Add(edge.wrapped, GeomAbs_C0)
@@ -1141,6 +1226,9 @@ async def create_primitive(params: CreatePrimitiveParams):
         else:
             raise ValueError(f"Unknown primitive type: {params.primitive_type}")
 
+        if solid is None:
+            raise ValueError("Engine returned null geometry.")
+
         state.rebuild_geometry[params.geo_id] = solid
 
         fd, path = tempfile.mkstemp(suffix=".stl")
@@ -1185,6 +1273,9 @@ async def create_sheet(params: CommitGeometryParams):
             
         wire = b3d.Wire.make_polygon(pts)
         sheet_face = b3d.Face(wire)
+
+        if sheet_face is None:
+             raise ValueError("Engine failed to output sheet.")
 
         state.rebuild_geometry[params.geo_id] = sheet_face
 
@@ -1232,8 +1323,8 @@ async def commit_geometry(params: CommitGeometryParams):
                 processed_loops.append(loop_data.get('points', []))
 
         if params.operation == 'loft' and len(processed_loops) == 2:
-            pts1 = resample_loop(processed_loops[0], 100)
-            pts2 = resample_loop(processed_loops[1], 100)
+            pts1 = processed_loops[0]
+            pts2 = processed_loops[1]
             
             p0 = np.array(pts1[0])
             dists = [np.linalg.norm(np.array(p) - p0) for p in pts2]
@@ -1268,6 +1359,9 @@ async def commit_geometry(params: CommitGeometryParams):
             if "not done" in err_str.lower() or "brep_api" in err_str.lower():
                 raise ValueError("Loft failed: The resulting geometry would self-intersect. Try simplifying your loops.")
             raise b3d_err
+
+        if solid is None:
+            raise ValueError("Boolean engine returned a null Solid.")
 
         state.rebuild_geometry[params.geo_id] = solid
 
@@ -1310,7 +1404,7 @@ async def sew_surfaces(params: SewParams):
         shapes = []
         for tid in params.target_ids:
             s = state.rebuild_geometry.get(tid)
-            if s is not None:
+            if s is not None and hasattr(s, 'wrapped'):
                 shapes.append(s)
         
         if len(shapes) < 2:
@@ -1330,31 +1424,48 @@ async def sew_surfaces(params: SewParams):
 
         sewer.Perform()
         sewed_shape = sewer.SewedShape()
-        sewed_b3d = b3d.Shape.cast(sewed_shape)
         
+        sewed_b3d = None
+        try:
+            if not sewed_shape.IsNull():
+                sewed_b3d = b3d.Shape.cast(sewed_shape)
+        except Exception:
+            sewed_b3d = None
+            
         is_solid = False
         final_solid = None
 
-        if isinstance(sewed_b3d, b3d.Shell):
-            if sewed_b3d.is_closed:
-                final_solid = b3d.Solid.make_solid(sewed_b3d)
-                is_solid = True
-            else:
-                final_solid = sewed_b3d
-        elif isinstance(sewed_b3d, b3d.Compound):
-            solids = sewed_b3d.solids()
-            if solids:
-                final_solid = solids[0]
-                is_solid = True
-            else:
-                shells = sewed_b3d.shells()
-                if shells and shells[0].is_closed:
-                    final_solid = b3d.Solid.make_solid(shells[0])
-                    is_solid = True
+        if sewed_b3d is not None:
+            if isinstance(sewed_b3d, b3d.Shell):
+                if sewed_b3d.is_closed:
+                    try:
+                        final_solid = b3d.Solid.make_solid(sewed_b3d)
+                        is_solid = True
+                    except:
+                        final_solid = sewed_b3d
                 else:
                     final_solid = sewed_b3d
-        else:
-            final_solid = sewed_b3d
+            elif isinstance(sewed_b3d, b3d.Compound):
+                solids = sewed_b3d.solids()
+                if solids:
+                    final_solid = solids[0]
+                    is_solid = True
+                else:
+                    shells = sewed_b3d.shells()
+                    if shells and shells[0].is_closed:
+                        try:
+                            final_solid = b3d.Solid.make_solid(shells[0])
+                            is_solid = True
+                        except:
+                            final_solid = sewed_b3d
+                    else:
+                        final_solid = sewed_b3d
+            else:
+                final_solid = sewed_b3d
+
+        if final_solid is None:
+            broadcast_log("[Warning] Sewing algorithm failed to bond properly. Grouping as Compound.")
+            final_solid = b3d.Compound(children=shapes)
 
         if is_solid:
             broadcast_log("[Success] Surfaces sewed into a Watertight Solid!")
@@ -1449,10 +1560,16 @@ async def boolean_op(params: BooleanOpParams):
                 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
                 cut_algo = BRepAlgoAPI_Cut(target_solid.wrapped, tool_solid.wrapped)
                 cut_algo.Build()
-                result_solid = b3d.Shape.cast(cut_algo.Shape())
+                try:
+                    result_solid = b3d.Shape.cast(cut_algo.Shape())
+                except:
+                    result_solid = None
         else:
             raise ValueError("Unsupported boolean operation.")
         
+        if result_solid is None:
+            raise ValueError("Boolean operation engine returned null geometry.")
+
         state.rebuild_geometry[params.geo_id] = result_solid
 
         fd, path = tempfile.mkstemp(suffix=".stl")
@@ -1510,8 +1627,14 @@ async def boolean_cut(params: BooleanCutParams):
             from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
             cut_algo = BRepAlgoAPI_Cut(target_solid.wrapped, tool_extrusion.wrapped)
             cut_algo.Build()
-            result_solid = b3d.Shape.cast(cut_algo.Shape())
+            try:
+                result_solid = b3d.Shape.cast(cut_algo.Shape())
+            except:
+                result_solid = None
         
+        if result_solid is None:
+            raise ValueError("Boolean operation failed to output solid geometry.")
+
         state.rebuild_geometry[params.geo_id] = result_solid
 
         fd, path = tempfile.mkstemp(suffix=".stl")
@@ -1543,7 +1666,6 @@ async def extract_feature(params: FeatureParams):
 
     target_pt = np.array([[params.x, params.y, params.z]])
     
-    # 1. Visuals
     ref_mesh = state.mesh
     _, _, ref_face_ids = ref_mesh.nearest.on_surface(target_pt)
     if len(ref_face_ids) == 0:
@@ -1554,7 +1676,6 @@ async def extract_feature(params: FeatureParams):
     
     wire_id = f"wire_{uuid.uuid4().hex[:8]}"
 
-    # 2. Math
     math_mesh = state.cleaned_mesh if state.cleaned_mesh is not None else state.mesh
     _, _, math_face_ids = math_mesh.nearest.on_surface(target_pt)
     start_math_face = math_face_ids[0]
@@ -1895,7 +2016,7 @@ async def export_step(payload: dict):
     active_ids = payload.get("active_geo_ids", [])
     for gid in active_ids:
         shape = state.rebuild_geometry.get(gid)
-        if shape is not None:
+        if shape is not None and hasattr(shape, 'wrapped'):
             shapes.append(shape)
         
     hulls = payload.get("hulls", [])
@@ -1922,7 +2043,10 @@ async def export_step(payload: dict):
                     sewer.Add(face.wrapped)
                 sewer.Perform()
                 sewed_shape = sewer.SewedShape()
-                sewed_b3d = b3d.Shape(sewed_shape)
+                if not sewed_shape.IsNull():
+                    sewed_b3d = b3d.Shape.cast(sewed_shape)
+                else:
+                    sewed_b3d = b3d.Shell.make_shell(faces)
             except Exception:
                 sewed_b3d = b3d.Shell.make_shell(faces)
             

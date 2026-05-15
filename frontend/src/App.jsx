@@ -539,7 +539,6 @@ export default function App() {
 
   const handleBatchMagicPatch = async () => {
     setIsCommitting(true);
-    setServerLogs(prev => [...prev, `[System] Initiating Batch Magic Patch...`]);
     try {
         const res = await fetch('http://localhost:8000/batch-magic-patch', {
             method: 'POST',
@@ -551,16 +550,18 @@ export default function App() {
         });
         if (res.ok) {
             const data = await res.json();
+            const geoType = data.is_solid ? 'solid' : 'shell';
             setRebuildHistory(prev => [...prev, {
                 ...data,
-                type: 'shell',
+                type: geoType,
                 visible: true,
-                name: `AutoShell_${data.id.substring(0,4)}`,
+                name: `Auto${data.is_solid ? 'Solid' : 'Shell'}_${data.id.substring(0,4)}`,
                 endpoint: 'batch-magic-patch',
-                payload: { sharpness_angle: sharpnessAngle, edge_smoothing: edgeSmoothing / 100.0 }
+                payload: { sharpness_angle: sharpnessAngle, edge_smoothing: edgeSmoothing / 100.0 },
+                naked_edges: data.naked_edges || []
             }]);
-            setServerLogs(prev => [...prev, `[Success] Batch Magic Patch complete. Tag: ${data.tag}`]);
-            setOutlinerExpanded(prev => ({...prev, shells: true}));
+            
+            setOutlinerExpanded(prev => ({...prev, shells: true, solids: true}));
             setSelectedItemIds([data.id]);
         } else {
             const err = await res.json();
@@ -1043,8 +1044,8 @@ export default function App() {
                
                <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
                   <div>
-                    <span className="text-[8px] font-bold uppercase text-zinc-400 tracking-wider">Pre-Processing</span>
-                    <div className="flex flex-col gap-1 mt-2">
+                    <span className="text-[8px] font-bold uppercase text-zinc-400 tracking-wider mb-1 block">Pre-Processing</span>
+                    <div className="flex flex-col gap-1 mt-1">
                       <div className="flex justify-between items-center text-[8px] text-zinc-400 font-mono">
                         <span>Sharpness (Dihedral)</span>
                         <span className="text-white">{sharpnessAngle}°</span>
@@ -1088,7 +1089,7 @@ export default function App() {
                </div>
 
                {/* NEW: PATCHING CONTROLS */}
-               <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2 mt-2">
+               <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
                   <span className="text-[8px] font-bold uppercase text-zinc-400 tracking-wider mb-1">Patching Controls</span>
                   <div className="flex flex-col gap-1">
                       <div className="flex justify-between items-center text-[8px] text-zinc-400 font-mono">

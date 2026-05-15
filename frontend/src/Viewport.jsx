@@ -1,6 +1,6 @@
 import React, { Suspense, useEffect, useLayoutEffect, useRef, useMemo, useState } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
-import { OrbitControls, Bounds, Edges, Grid, GizmoHelper, GizmoViewport, TransformControls, Html } from '@react-three/drei';
+import { OrbitControls, Bounds, Edges, Grid, TransformControls, Html } from '@react-three/drei';
 import { useLoader } from '@react-three/fiber';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import * as THREE from 'three';
@@ -48,6 +48,32 @@ function HullMesh({ vertices, faces, centerOffset, material, animateOpacity }) {
 
   if (!geometry) return null;
   return <mesh ref={meshRef} geometry={geometry} material={uniqueMaterial} userData={{ isSolid: true }} />;
+}
+
+// === NEW: NAKED EDGES COMPONENT ===
+function NakedEdges({ edges, centerOffset }) {
+  const lines = useMemo(() => {
+    if (!edges || edges.length === 0) return [];
+    return edges.map(edge => {
+      const p1 = new THREE.Vector3(edge[0][0], edge[0][1], edge[0][2]);
+      const p2 = new THREE.Vector3(edge[1][0], edge[1][1], edge[1][2]);
+      if (centerOffset) {
+        p1.sub(centerOffset);
+        p2.sub(centerOffset);
+      }
+      return new THREE.BufferGeometry().setFromPoints([p1, p2]);
+    });
+  }, [edges, centerOffset]);
+
+  return (
+    <group>
+      {lines.map((geo, idx) => (
+        <line key={idx} geometry={geo}>
+          <lineBasicMaterial color="#ef4444" linewidth={4} depthTest={false} transparent opacity={0.8} />
+        </line>
+      ))}
+    </group>
+  );
 }
 
 function SplashHighlight({ feature, originalMeshes, centerOffset }) {
@@ -128,7 +154,6 @@ function SplashHighlight({ feature, originalMeshes, centerOffset }) {
 
   if (!result || !result.geo) return null;
 
-  // IMPORTANT: raycast={() => null} prevents the highlight from blocking pointer events!
   if (result.meshParams) {
       return <mesh raycast={() => null} geometry={result.geo} material={material} position={result.meshParams.position} rotation={result.meshParams.rotation} scale={result.meshParams.scale} />;
   }
@@ -362,6 +387,7 @@ function ActiveTransformSolid({ geo, material, centerOffset, transformMode, line
     >
       <group ref={groupRef} userData={{ isSolidGroup: true, id: geo.id }}>
         <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={absoluteCenter} material={material} animateOpacity={animateOpacity} />
+        {geo.naked_edges && <NakedEdges edges={geo.naked_edges} centerOffset={absoluteCenter} />}
         
         {showTransformUI && (
           <Html center position={[0, 1.5, 0]} zIndexRange={[100, 0]}>
@@ -603,109 +629,72 @@ function GhostModel({
         {rebuildHistory?.map((geo, idx) => {
            const isVisible = geo.visible !== false &&
              !(geo.type === 'sheet' && !showSheetsFolder) &&
-             !(['solid','blade'].includes(geo.type) && !showSolidsFolder);
+             !(['solid','blade','shell'].includes(geo.type) && !showSolidsFolder); // updated to include shell
            if (!isVisible) return null;
 
            const isSelected = selectedItemIds?.includes(geo.id);
            const isPrimarySelection = isSelected && selectedItemIds[0] === geo.id;
-           const mat = isSelected ? selectedSolidMaterial : (geo.type === 'sheet' ? sheetMaterial : solidMaterial);
-           
-           if (isSelected) {
-               return (
-                  <ActiveTransformSolid 
-                     key={`geo-${geo.id || idx}`}
-                     geo={geo}
-                     material={mat}
-                     centerOffset={centerOffset}
-                     transformMode={transformMode}
-                     linearSnap={linearSnap}
-                     setLinearSnap={setLinearSnap}
-                     angleSnap={angleSnap}
-                     setAngleSnap={setAngleSnap}
-                     onTransformEnd={onTransformEnd}
-                     animateOpacity={true}
-                     showTransformUI={isPrimarySelection}
-                  />
-               );
+           const mat = isSelected ? selectedSolidMaterial : (geo.type === 'sheet' || geo.type === 'face' ? sheetMaterial : solidMaterial);
+
+           if (isPrimarySelection && transformMode) {
+             return <ActiveTransformSolid 
+                key={`hist-${geo.id}`} 
+                geo={geo} 
+                material={mat} 
+                centerOffset={centerOffset} 
+                transformMode={transformMode}
+                linearSnap={linearSnap}
+                setLinearSnap={setLinearSnap}
+                angleSnap={angleSnap}
+                setAngleSnap={setAngleSnap}
+                onTransformEnd={onTransformEnd}
+                animateOpacity={false}
+                showTransformUI={true}
+             />
            }
 
            return (
-             <group key={`geo-${geo.id || idx}`} userData={{ isSolidGroup: true, id: geo.id }}>
-               <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={centerOffset} material={mat} animateOpacity={true} />
+             <group key={`hist-${geo.id}`} userData={{ isSolidGroup: true, id: geo.id }}>
+                <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={centerOffset} material={mat} animateOpacity={true} />
+                {geo.naked_edges && <NakedEdges edges={geo.naked_edges} centerOffset={centerOffset} />}
              </group>
            );
         })}
       </group>
 
-      {activeScales?.map((scale, groupIndex) => {
-        const mirrorKey = scale.join(',');
-        return (
-          <group key={`mirror-group-${mirrorKey}`} scale={scale}>
-            {meshes?.map((mesh, index) => (
-              <mesh key={`mirror-${mirrorKey}-${index}`} geometry={mesh.geometry} position={mesh.position} rotation={mesh.rotation} scale={mesh.scale} visible={showMesh}>
-                <meshStandardMaterial color="#cccccc" transparent opacity={meshOpacity} roughness={0.6} metalness={0.2} side={THREE.DoubleSide} depthWrite={true} />
-                <Edges raycast={() => null} threshold={15} color="#18181b" visible={showWireframe} />
-              </mesh>
-            ))}
-            {showCurvesFolder && extractedFeatures?.map((feat) => {
-               if (hiddenCurveIds?.includes(feat.id)) return null;
-               return feat.type === 'circle' 
-                ? <CircleCurve key={`mirror-circ-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} disabled={true} isSelected={false} />
-                : <PlanarCurve key={`mirror-plan-${mirrorKey}-${feat.id}`} feature={feat} centerOffset={centerOffset} originalMeshes={meshes} disabled={true} isSelected={false} />
-            })}
-            {rebuildHistory?.map((geo, idx) => {
-               const isVisible = geo.visible !== false &&
-                 !(geo.type === 'sheet' && !showSheetsFolder) &&
-                 !(['solid','blade'].includes(geo.type) && !showSolidsFolder);
-               if (!isVisible) return null;
-               return (
-                 <group key={`mirror-geo-${mirrorKey}-${idx}`}>
-                     <HullMesh vertices={geo.vertices} faces={geo.faces} centerOffset={centerOffset} material={geo.type === 'sheet' ? sheetMaterial : solidMaterial} animateOpacity={true} />
-                 </group>
-               );
-            })}
-          </group>
-        );
-      })}
-
-      {showMesh && !transformMode && selectionMode === 'curve-extract' && (
-        <>
-          {/* IMPORTANT: raycast={() => null} prevents the cursor from blocking your mouse */}
-          <mesh ref={cursorRef} visible={false} renderOrder={1} raycast={() => null}>
-            <sphereGeometry args={[cursorRadius, 16, 16]} />
-            <meshBasicMaterial color="#3b82f6" depthTest={false} /> 
-          </mesh>
-          {activeScales?.map((scale, i) => (
-            <mesh key={`cursor-${scale.join(',')}`} ref={(el) => { if(el) mirroredCursorRefs.current[i] = el; }} visible={false} renderOrder={1} raycast={() => null}>
-              <sphereGeometry args={[cursorRadius, 16, 16]} />
-              <meshBasicMaterial color="#ef4444" depthTest={false} />
-            </mesh>
-          ))}
-        </>
-      )}
+      <mesh ref={cursorRef} visible={false} raycast={() => null}>
+        <sphereGeometry args={[cursorRadius, 16, 16]} />
+        <meshBasicMaterial color="#ef4444" transparent opacity={0.6} />
+      </mesh>
+      
+      {activeScales.map((scale, index) => (
+        <mesh 
+          key={`mirror-cursor-${index}`} 
+          ref={(el) => (mirroredCursorRefs.current[index] = el)} 
+          visible={false} 
+          raycast={() => null}
+        >
+          <sphereGeometry args={[cursorRadius, 16, 16]} />
+          <meshBasicMaterial color="#3b82f6" transparent opacity={0.4} />
+        </mesh>
+      ))}
     </group>
   );
 }
 
 export default function Viewport(props) {
-  const { 
-     objUrl, cleanedObjUrl, symmetry, onSelectLoop, onSelectSolid, onTransformEnd,
-     extractedFeatures, showMesh, showWireframe, meshOpacity,
-     selectedLoops, rebuildHistory, selectedItemIds, cursorScale,
-     showSheetsFolder, showSolidsFolder, showCurvesFolder, hiddenCurveIds, sharpnessAngle,
-     linearSnap, setLinearSnap, angleSnap, setAngleSnap, toggleSymmetry,
-     transformMode, setTransformMode, outlinerExpanded, selectionMode, setSelectionMode
-  } = props;
-
-  const [previewMode, setPreviewMode] = useState('reference');
+  const { objUrl, cleanedObjUrl, previewMode, symmetry, transformMode } = props;
 
   return (
-    <div className="relative w-full h-full">
-      <Canvas camera={{ position: [5, 5, 5], fov: 45 }} gl={{ antialias: true }} raycaster={{ params: { Line: { threshold: 0.5 } } }}>
+    <div className="w-full h-full bg-[#18181b]">
+      <Canvas camera={{ position: [20, 20, 20], fov: 45 }}>
         <color attach="background" args={['#18181b']} />
-        <ambientLight intensity={0.4} />
-        <hemisphereLight skyColor="#ffffff" groundColor="#444444" intensity={0.6} />
-        <directionalLight position={[10, 10, 10]} castShadow />
+        
+        <ambientLight intensity={0.6} />
+        <directionalLight position={[10, 10, 5]} intensity={1.5} castShadow />
+        <directionalLight position={[-10, -10, -5]} intensity={0.5} />
+        <pointLight position={[0, 10, 0]} intensity={0.8} />
+
         <Grid infiniteGrid fadeDistance={50} sectionColor="#3f3f46" cellColor="#27272a" position={[0, -0.01, 0]} />
 
         <Suspense fallback={null}>
@@ -725,11 +714,7 @@ export default function Viewport(props) {
           )}
         </Suspense>
 
-        <OrbitControls makeDefault enablePan={true} />
-
-        <GizmoHelper alignment="bottom-right" margin={[60, 60]}>
-          <GizmoViewport axisColors={['#ef4444', '#22c55e', '#3b82f6']} labelColor="white" />
-        </GizmoHelper>
+        <OrbitControls makeDefault enableDamping dampingFactor={0.05} enabled={!transformMode} />
       </Canvas>
     </div>
   );
