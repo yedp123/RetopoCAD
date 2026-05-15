@@ -62,6 +62,9 @@ class AutoExtractParams(BaseModel):
     min_size: float
     sharpness_angle: float = 30.0
 
+class BatchMagicPatchParams(BaseModel):
+    sharpness_angle: float = 30.0
+
 class HullParams(BaseModel):
     max_hulls: int
     detail_level: float
@@ -467,7 +470,6 @@ def resample_loop(points, target_count=100):
         resampled[:, i] = np.interp(target_dists, cum_dists, np.append(pts[:, i], pts[0, i]))
     return resampled.tolist()
 
-# === DYNAMIC CORNER DETECTION ALGORITHM ===
 def find_dynamic_corners(pts, threshold_deg=30.0):
     n = len(pts)
     if n < 3: return list(range(n))
@@ -609,6 +611,152 @@ async def patch_split(params: PatchSplitParams):
         err_msg = str(e)
         broadcast_log(f"[Error] Failed to execute Patch Split: {err_msg}")
         raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
+
+@app.post("/batch-magic-patch")
+async def batch_magic_patch(params: BatchMagicPatchParams):
+    if state.mesh is None:
+        raise HTTPException(status_code=400, detail="No mesh loaded.")
+        
+    try:
+        import build123d as b3d
+        import networkx as nx
+        import scipy.spatial
+        from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+        from OCP.GeomAbs import GeomAbs_C0
+    except ImportError:
+        raise HTTPException(status_code=500, detail="Missing libraries.")
+
+    broadcast_log("[System] Initiating Batch Magic Patch...")
+    
+    # 1. Identify segmented surface areas
+    components = get_patch_components(state.mesh, params.sharpness_angle)
+    
+    loops_pts = []
+    for comp in components:
+        if len(comp) < 3: continue
+        faces = state.mesh.faces[comp]
+        edges = trimesh.geometry.faces_to_edges(faces)
+        edges_sorted = np.sort(edges, axis=1)
+        unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
+        boundary_edges = unique_edges[counts == 1]
+        if len(boundary_edges) == 0: continue
+        
+        G = nx.Graph()
+        G.add_edges_from(boundary_edges)
+        try:
+            cycle = nx.find_cycle(G)
+            ordered_nodes = [u for u, v in cycle]
+        except:
+            ordered_nodes = list(nx.dfs_preorder_nodes(G))
+            
+        loops_pts.append(state.mesh.vertices[ordered_nodes])
+
+    if not loops_pts:
+        raise HTTPException(status_code=400, detail="No boundary loops found.")
+
+    broadcast_log(f"[System] Found {len(loops_pts)} boundary loops. Applying Global Snap (0.01mm tolerance)...")
+
+    # 2. Global Snap
+    all_pts = np.vstack(loops_pts)
+    tree = scipy.spatial.cKDTree(all_pts)
+    pairs = tree.query_pairs(r=0.01)
+    
+    parent = {i: i for i in range(len(all_pts))}
+    def find(i):
+        if parent[i] == i: return i
+        parent[i] = find(parent[i])
+        return parent[i]
+    def union(i, j):
+        root_i = find(i)
+        root_j = find(j)
+        if root_i != root_j:
+            parent[root_i] = root_j
+    
+    for i, j in pairs:
+        union(i, j)
+        
+    merged_positions = {}
+    for i in range(len(all_pts)):
+        root = find(i)
+        if root not in merged_positions:
+            merged_positions[root] = all_pts[root]
+            
+    # Reconstruct snapped loops
+    snapped_loops = []
+    idx_counter = 0
+    for raw_pts in loops_pts:
+        snapped = []
+        for _ in range(len(raw_pts)):
+            root = find(idx_counter)
+            snapped.append(merged_positions[root])
+            idx_counter += 1
+        snapped_loops.append(np.array(snapped))
+
+    broadcast_log("[System] Snapping complete. Generating multi-patch shell...")
+
+    # 3. Generate Faces
+    b3d_faces = []
+    for raw_pts in snapped_loops:
+        if len(raw_pts) < 4: continue
+        
+        # Split strictly into 4 segments to ensure Topogun-like patching constraints
+        diffs = np.linalg.norm(raw_pts - np.roll(raw_pts, 1, axis=0), axis=1)
+        cum_dists = np.cumsum(diffs)
+        total_len = cum_dists[-1]
+        targets = [0, total_len * 0.25, total_len * 0.5, total_len * 0.75]
+        corners = []
+        for t in targets:
+            idx = np.searchsorted(cum_dists, t)
+            corners.append(min(idx, len(raw_pts) - 1))
+        
+        corners = sorted(list(set(corners)))
+        if len(corners) < 4:
+            corners = [0, len(raw_pts)//4, len(raw_pts)//2, 3*len(raw_pts)//4]
+            
+        b3d_edges = []
+        for i in range(len(corners)):
+            start_idx = corners[i]
+            end_idx = corners[(i + 1) % len(corners)]
+            
+            pts_count = max(10, 100 // len(corners))
+            seg_pts = resample_segment(extract_segment(raw_pts, start_idx, end_idx), pts_count)
+            b3d_edges.append(b3d.Edge.make_spline([b3d.Vector(p) for p in seg_pts]))
+            
+        wire = b3d.Wire(b3d_edges)
+        
+        filler = BRepOffsetAPI_MakeFilling()
+        for edge in wire.edges():
+            filler.Add(edge.wrapped, GeomAbs_C0)
+        
+        filler.Build()
+        if filler.IsDone():
+            b3d_faces.append(b3d.Face(filler.Shape()))
+        else:
+            b3d_faces.append(b3d.Face(wire))
+            
+    if not b3d_faces:
+         raise ValueError("Could not build any faces.")
+         
+    compound = b3d.Compound(children=b3d_faces)
+    geo_id = f"batch_shell_{uuid.uuid4().hex[:8]}"
+    state.rebuild_geometry[geo_id] = compound
+    
+    fd, path = tempfile.mkstemp(suffix=".stl")
+    os.close(fd)
+    try:
+        from build123d.exporters3d import export_stl
+        export_stl(compound, path)
+        tmesh = trimesh.load(path, file_type='stl')
+        broadcast_log(f"[Success] Batch Magic Patch generated {len(b3d_faces)} faces. Ready for Knitting.")
+        return {
+            "vertices": tmesh.vertices.tolist(),
+            "faces": tmesh.faces.tolist(),
+            "id": geo_id,
+            "tag": "Ready for Knitting"
+        }
+    finally:
+        try: os.remove(path)
+        except: pass
 
 
 @app.post("/magic-patch")

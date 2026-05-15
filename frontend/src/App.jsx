@@ -328,7 +328,7 @@ export default function App() {
   const [showWireframe, setShowWireframe] = useState(true);
   const [meshOpacity, setMeshOpacity] = useState(0.4);
   
-  const [outlinerExpanded, setOutlinerExpanded] = useState({ mesh: true, curves: true, sheets: true, solids: true });
+  const [outlinerExpanded, setOutlinerExpanded] = useState({ mesh: true, curves: true, sheets: true, solids: true, shells: true });
   const toggleOutliner = (key) => setOutlinerExpanded(prev => ({ ...prev, [key]: !prev[key] }));
   const [hiddenCurveIds, setHiddenCurveIds] = useState([]);
   
@@ -533,6 +533,38 @@ export default function App() {
   const handleMagicPatch = () => {
     if (selectedLoops.length < 1 || !selectedLoops[0].patch_faces) return;
     executeGeometryOperation('magic-patch', { patch_faces: selectedLoops[0].patch_faces, sharpness_angle: sharpnessAngle }, 'sheet', 'Patch');
+  };
+
+  const handleBatchMagicPatch = async () => {
+    setIsCommitting(true);
+    setServerLogs(prev => [...prev, `[System] Initiating Batch Magic Patch. Snapping boundaries...`]);
+    try {
+        const res = await fetch('http://localhost:8000/batch-magic-patch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sharpness_angle: sharpnessAngle })
+        });
+        if (res.ok) {
+            const data = await res.json();
+            setRebuildHistory(prev => [...prev, {
+                ...data,
+                type: 'shell',
+                visible: true,
+                name: `AutoShell_${data.id.substring(0,4)}`,
+                endpoint: 'batch-magic-patch',
+                payload: { sharpness_angle: sharpnessAngle }
+            }]);
+            setServerLogs(prev => [...prev, `[Success] Batch Magic Patch complete. Tag: ${data.tag}`]);
+            setOutlinerExpanded(prev => ({...prev, shells: true}));
+            setSelectedItemIds([data.id]);
+        } else {
+            const err = await res.json();
+            setServerLogs(prev => [...prev, `[Error] Batch Patch failed: ${err.detail}`]);
+        }
+    } catch (err) {
+        setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]);
+    }
+    setIsCommitting(false);
   };
 
   const handleSew = async () => {
@@ -1166,6 +1198,45 @@ export default function App() {
             </div>
 
             <div className="flex flex-col gap-0.5">
+               <button onClick={() => toggleOutliner('shells')} className="flex items-center justify-between px-2 py-1.5 hover:bg-zinc-800/50 rounded transition-colors group">
+                  <div className="flex items-center gap-1.5">
+                     <span className="text-indigo-500/80 scale-75"><IconMagicWand /></span>
+                     <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 group-hover:text-zinc-200">Shell Construction</span>
+                  </div>
+                  <span className="text-zinc-600 text-[7px]">{outlinerExpanded.shells ? '▼' : '▶'}</span>
+               </button>
+               {outlinerExpanded.shells && (
+                 <div className="flex flex-col gap-0.5 pl-3 pr-1 mt-0.5">
+                    {rebuildHistory.filter(h => h.type === 'shell' && !h.deleted).length === 0 ? <span className="px-2 text-[8px] text-zinc-600 italic">Empty</span> : rebuildHistory.filter(h => h.type === 'shell' && !h.deleted).map((geo) => (
+                      <div 
+                        key={geo.id} 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedItemIds(prev => {
+                              if (e.shiftKey || e.ctrlKey || e.metaKey) {
+                                  return prev.includes(geo.id) ? prev.filter(x => x !== geo.id) : [...prev, geo.id];
+                              }
+                              return [geo.id];
+                          });
+                        }} 
+                        className={`flex items-center justify-between px-2 py-1 rounded border cursor-pointer transition-colors ${selectedItemIds.includes(geo.id) ? 'bg-zinc-800 border-indigo-500/50' : 'bg-zinc-900 border-zinc-800 hover:border-zinc-600'}`}
+                      >
+                        <span className="text-[9px] text-zinc-300 font-mono truncate w-20">{geo.name || `Shell_${geo.id}`}</span>
+                        <div className="flex gap-1">
+                          <button onClick={(e) => { e.stopPropagation(); toggleItemVisibility(geo.id); }} className="text-zinc-500 hover:text-zinc-300 shrink-0 scale-75">
+                            {geo.visible !== false ? <IconEye /> : <IconEyeOff />}
+                          </button>
+                          <button onClick={(e) => { e.stopPropagation(); handleDeleteGeometry(geo.id); }} className="text-zinc-500 hover:text-red-400 shrink-0 scale-75">
+                            <IconTrash />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                 </div>
+               )}
+            </div>
+
+            <div className="flex flex-col gap-0.5">
                <button onClick={() => toggleOutliner('sheets')} className="flex items-center justify-between px-2 py-1.5 hover:bg-zinc-800/50 rounded transition-colors group">
                   <div className="flex items-center gap-1.5">
                      <span className="text-green-500/80 scale-75"><IconSquare /></span>
@@ -1326,6 +1397,18 @@ export default function App() {
             
             <div className="w-full h-px bg-zinc-700/50 my-1"></div>
             
+            {/* NEW BATCH MAGIC PATCH BUTTON */}
+            <button 
+              title="Batch Magic Patch" 
+              onClick={handleBatchMagicPatch} 
+              disabled={isCommitting}
+              className={`p-2 rounded transition-all flex justify-center items-center ${isCommitting ? 'bg-indigo-900 text-indigo-400 opacity-50' : 'bg-indigo-600/20 text-indigo-400 border border-indigo-500/50 hover:bg-indigo-600 hover:text-white hover:border-indigo-400 shadow-[0_0_10px_rgba(79,70,229,0.3)]'}`}
+            >
+              <IconMagicWand />
+            </button>
+
+            <div className="w-full h-px bg-zinc-700/50 my-1"></div>
+
             <button title="Undo Solid/Curve (Ctrl+Z)" onClick={handleGlobalUndo} disabled={historyIndex === 0 && rebuildHistory.length === 0} className="p-2 rounded text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:opacity-20 disabled:cursor-not-allowed transition-all">
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" /></svg>
             </button>
@@ -1382,7 +1465,7 @@ export default function App() {
                     {selectedItemsData.map((item, i) => (
                       <div key={`item-${i}`} className="flex justify-between items-center bg-zinc-800/50 px-2 py-1 rounded text-[10px] font-mono text-zinc-300">
                         <span className="truncate w-32">{item.name}</span>
-                        <span className={item.type === 'sheet' || item.type === 'face' ? 'text-green-400' : item.type === 'blade' ? 'text-amber-400' : 'text-blue-400'}>{item.type.toUpperCase()}</span>
+                        <span className={item.type === 'sheet' || item.type === 'face' ? 'text-green-400' : item.type === 'blade' ? 'text-amber-400' : item.type === 'shell' ? 'text-indigo-400' : 'text-blue-400'}>{item.type.toUpperCase()}</span>
                       </div>
                     ))}
                   </>
@@ -1438,7 +1521,7 @@ export default function App() {
             <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-3">
               <div className="flex justify-between items-center border-b border-zinc-800 pb-2">
                 <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">Classification</span>
-                <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${selectedItemsData[0].type === 'sheet' || selectedItemsData[0].type === 'face' ? 'bg-green-900/30 text-green-400 border border-green-800' : selectedItemsData[0].type === 'blade' ? 'bg-amber-900/30 text-amber-400 border border-amber-800' : 'bg-blue-900/30 text-blue-400 border border-blue-800'}`}>
+                <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${selectedItemsData[0].type === 'sheet' || selectedItemsData[0].type === 'face' ? 'bg-green-900/30 text-green-400 border border-green-800' : selectedItemsData[0].type === 'blade' ? 'bg-amber-900/30 text-amber-400 border border-amber-800' : selectedItemsData[0].type === 'shell' ? 'bg-indigo-900/30 text-indigo-400 border border-indigo-800' : 'bg-blue-900/30 text-blue-400 border border-blue-800'}`}>
                   {selectedItemsData[0].type}
                 </span>
               </div>
