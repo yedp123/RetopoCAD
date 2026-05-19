@@ -261,34 +261,52 @@ def find_dynamic_corners(pts, threshold_deg=30.0):
     n = len(pts)
     if n < 3: return list(range(n))
 
-    v_in = pts - np.roll(pts, 1, axis=0)
-    v_out = np.roll(pts, -1, axis=0) - pts
+    corners = set()
+    # Multi-pass lookahead to catch both single-vertex sharps and slightly rounded/dense corners
+    for step in [1, 3, max(5, n // 20)]:
+        if step >= n // 2: continue
+        
+        v_in = pts - np.roll(pts, step, axis=0)
+        v_out = np.roll(pts, -step, axis=0) - pts
+        
+        v_in_norm = np.linalg.norm(v_in, axis=1, keepdims=True) + 1e-9
+        v_out_norm = np.linalg.norm(v_out, axis=1, keepdims=True) + 1e-9
+        
+        v_in_unit = v_in / v_in_norm
+        v_out_unit = v_out / v_out_norm
+        
+        dot = np.sum(v_in_unit * v_out_unit, axis=1)
+        angles_deg = np.degrees(np.arccos(np.clip(dot, -1.0, 1.0)))
+        
+        window = step * 2
+        for i in range(n):
+            if angles_deg[i] >= threshold_deg:
+                # Check if it's the sharpest point in its local neighborhood
+                is_max = True
+                for j in range(-window, window + 1):
+                    if j == 0: continue
+                    idx = (i + j) % n
+                    if angles_deg[idx] > angles_deg[i]:
+                        is_max = False
+                        break
+                if is_max:
+                    corners.add(i)
+
+    corners = sorted(list(corners))
     
-    v_in_norm = np.linalg.norm(v_in, axis=1, keepdims=True) + 1e-9
-    v_out_norm = np.linalg.norm(v_out, axis=1, keepdims=True) + 1e-9
-    
-    v_in_unit = v_in / v_in_norm
-    v_out_unit = v_out / v_out_norm
-    
-    dot = np.sum(v_in_unit * v_out_unit, axis=1)
-    angles = np.arccos(np.clip(dot, -1.0, 1.0))
-    angles_deg = np.degrees(angles)
-    
-    window = max(2, n // 20)
-    is_peak = np.ones(n, dtype=bool)
-    for i in range(n):
-        if angles_deg[i] < threshold_deg:
-            is_peak[i] = False
-            continue
-            
-        for j in range(-window, window + 1):
-            if j == 0: continue
-            if angles[i] < angles[(i + j) % n]:
-                is_peak[i] = False
-                break
-                
-    corners = np.where(is_peak)[0].tolist()
-    
+    # Distance-based merging so we don't get clustered points on a single curve
+    if len(corners) > 1:
+        merged = [corners[0]]
+        min_dist = max(3, n // 50)
+        for c in corners[1:]:
+            if c - merged[-1] >= min_dist:
+                merged.append(c)
+        # Wrap-around check
+        if len(merged) > 1 and (n - merged[-1] + merged[0]) < min_dist:
+            merged.pop()
+        corners = merged
+
+    # Invincible fallback: cut into 4 quadrants if we somehow found 0 corners
     if len(corners) < 3:
         diffs = np.linalg.norm(pts - np.roll(pts, 1, axis=0), axis=1)
         cum_dists = np.cumsum(diffs)
@@ -299,8 +317,9 @@ def find_dynamic_corners(pts, threshold_deg=30.0):
         for t in targets:
             idx = np.searchsorted(cum_dists, t)
             corners.append(min(idx, n - 1))
-            
-    return sorted(corners)
+        corners = sorted(list(set(corners)))
+        
+    return corners
 
 def extract_segment(pts, start_idx, end_idx):
     if start_idx < end_idx:
@@ -343,6 +362,124 @@ def create_tension_edge(pts, force_start, force_end, tension=0.5):
             return b3d.Edge.make_line(start_v, end_v)
     except:
         return b3d.Edge.make_line(start_v, end_v)
+
+@app.post("/magic-patch")
+async def magic_patch(params: MagicPatchParams):
+    if state.mesh is None:
+        raise HTTPException(status_code=400, detail="No mesh loaded.")
+        
+    import build123d as b3d
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+    from OCP.GeomAbs import GeomAbs_C0
+    from scipy.spatial import ConvexHull
+    
+    broadcast_log(f"[System] Committing MAGIC PATCH to Stack...")
+    
+    # 1. Get exact faces and boundary
+    faces = state.mesh.faces[params.patch_faces]
+    edges = trimesh.geometry.faces_to_edges(faces)
+    edges_sorted = np.sort(edges, axis=1)
+    unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
+    boundary_edges = unique_edges[counts == 1]
+    
+    if len(boundary_edges) == 0:
+        raise ValueError("No open boundaries found in selected patch.")
+        
+    import networkx as nx
+    G = nx.Graph()
+    G.add_edges_from(boundary_edges)
+    largest_cc = max(nx.connected_components(G), key=len)
+    subgraph = G.subgraph(largest_cc)
+    try:
+        cycle = nx.find_cycle(subgraph)
+        ordered_nodes = [u for u, v in cycle]
+    except:
+        ordered_nodes = list(nx.dfs_preorder_nodes(subgraph))
+        
+    raw_pts = state.mesh.vertices[ordered_nodes]
+    
+    # 2. Find Corners
+    corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
+    if len(corners) < 3:
+        diffs = np.linalg.norm(raw_pts - np.roll(raw_pts, 1, axis=0), axis=1)
+        cum_dists = np.cumsum(diffs)
+        total_len = cum_dists[-1]
+        targets = [0, total_len * 0.25, total_len * 0.5, total_len * 0.75]
+        corners = []
+        for t in targets:
+            idx = np.searchsorted(cum_dists, t)
+            corners.append(min(idx, len(raw_pts) - 1))
+        corners = sorted(list(set(corners)))
+        if len(corners) < 3:
+            corners = [0, len(raw_pts)//3, 2*len(raw_pts)//3]
+            
+    corner_pts = [raw_pts[c] for c in corners]
+    cycle_edges = []
+    clamped_tension = max(0.01, params.edge_smoothing / 100.0 if params.edge_smoothing > 1 else params.edge_smoothing)
+
+    for i in range(len(corners)):
+        start_idx = corners[i]
+        end_idx = corners[(i + 1) % len(corners)]
+        seg_pts = extract_segment(raw_pts, start_idx, end_idx)
+        pA = corner_pts[i]
+        pB = corner_pts[(i+1)%len(corners)]
+        new_edge = create_tension_edge(seg_pts, pA, pB, tension=clamped_tension)
+        if new_edge:
+            cycle_edges.append(new_edge)
+            
+    # 3. Generate Face
+    face = None
+    
+    if len(cycle_edges) in [2, 3, 4]:
+        try: 
+            f = b3d.Face.make_surface_from_curves(cycle_edges)
+            if f.is_valid: face = f
+        except: pass
+        
+    if face is None:
+        try:
+            filler = BRepOffsetAPI_MakeFilling()
+            for edge in cycle_edges: filler.Add(edge.wrapped, GeomAbs_C0)
+            filler.Build()
+            if filler.IsDone(): 
+                f = b3d.Face(filler.Shape())
+                if f.is_valid: face = f
+        except: pass
+        
+    if face is None:
+        try:
+            flat_pts = np.array(apply_pca_firewall(corner_pts))
+            centroid_flat = np.mean(flat_pts, axis=0)
+            flat_pts += np.random.normal(0, 1e-6, flat_pts.shape)
+            _, _, vh = np.linalg.svd(flat_pts - centroid_flat)
+            u_vec = vh[0, :]
+            v_vec = vh[1, :]
+            p2d = np.column_stack((np.dot(flat_pts - centroid_flat, u_vec), np.dot(flat_pts - centroid_flat, v_vec)))
+            hull = ConvexHull(p2d)
+            hull_pts_3d = [centroid_flat + p2d[idx][0] * u_vec + p2d[idx][1] * v_vec for idx in hull.vertices]
+            poly_pts = [b3d.Vector(p) for p in hull_pts_3d]
+            if (poly_pts[0] - poly_pts[-1]).length > 1e-4:
+                poly_pts.append(poly_pts[0])
+            f = b3d.Face(b3d.Wire.make_polygon(poly_pts))
+            if f.is_valid: face = f
+        except: pass
+        
+    if face is None:
+        raise ValueError("CAD engine rejected the boundary curves. Try reducing edge smoothing.")
+        
+    state.rebuild_geometry[params.geo_id] = face
+    
+    fd, path = tempfile.mkstemp(suffix=".stl")
+    os.close(fd)
+    try:
+        from build123d.exporters3d import export_stl
+        export_stl(face, path)
+        tmesh = trimesh.load(path, file_type='stl')
+        broadcast_log(f"[Success] Magic Patch created. Returning {len(tmesh.faces)} faces.")
+        return {"vertices": tmesh.vertices.tolist(), "faces": tmesh.faces.tolist()}
+    finally:
+        try: os.remove(path)
+        except: pass
 
 @app.post("/batch-magic-patch")
 async def batch_magic_patch(params: BatchMagicPatchParams):
@@ -1279,9 +1416,38 @@ async def create_patch(params: CreatePatchParams):
                                 loop_arrays[j][idx_j] = avg
 
         b3d_edges = []
+        clamped_tension = max(0.01, params.edge_smoothing / 100.0 if params.edge_smoothing > 1 else params.edge_smoothing)
+
         for loop_pts in loop_arrays:
-            edge = create_tension_edge(loop_pts, force_start=loop_pts[0], force_end=loop_pts[-1], tension=params.edge_smoothing)
-            if edge: b3d_edges.append(edge)
+            # Check if it's an open or closed loop
+            is_closed = np.linalg.norm(loop_pts[0] - loop_pts[-1]) < 1e-3
+            
+            # Find the sharp corners!
+            corners = find_dynamic_corners(loop_pts, params.sharpness_angle)
+            
+            if len(corners) < 2:
+                # If it's a smooth circle or straight line, treat as one curve
+                edge = create_tension_edge(loop_pts, force_start=loop_pts[0], force_end=loop_pts[-1], tension=clamped_tension)
+                if edge: b3d_edges.append(edge)
+            else:
+                # --- THE FIX: Slice the loop into multiple separate Splines at the corners ---
+                for i in range(len(corners)):
+                    start_idx = corners[i]
+                    end_idx = corners[(i + 1) % len(corners)]
+                    
+                    if not is_closed and i == len(corners) - 1:
+                        # For open curves, draw the final segment to the very last point
+                        end_idx = len(loop_pts) - 1
+                        if start_idx >= end_idx: continue
+                        seg_pts = loop_pts[start_idx:end_idx+1]
+                        edge = create_tension_edge(seg_pts, force_start=loop_pts[start_idx], force_end=loop_pts[end_idx], tension=clamped_tension)
+                        if edge: b3d_edges.append(edge)
+                        break
+                        
+                    seg_pts = extract_segment(loop_pts, start_idx, end_idx)
+                    edge = create_tension_edge(seg_pts, force_start=loop_pts[start_idx], force_end=loop_pts[end_idx], tension=clamped_tension)
+                    if edge: b3d_edges.append(edge)
+                # -----------------------------------------------------------------------------
 
         patch_face = None
         if len(b3d_edges) in [2, 3, 4]:
@@ -1595,21 +1761,47 @@ async def commit_geometry(params: CommitGeometryParams):
                 processed_loops.append(loop_data.get('points', []))
 
         if params.operation == 'loft' and len(processed_loops) == 2:
-            def resample_loop(loop, count=100):
-                if len(loop) <= 2: return loop
-                clean_loop = []
-                for p in loop:
-                    if not clean_loop or np.linalg.norm(np.array(p) - np.array(clean_loop[-1])) > 1e-4:
-                        clean_loop.append(p)
-                return clean_loop 
+            def resample_loop(points, target_count=100):
+                pts = np.array(points)
+                if len(pts) < 2: return points
+                diffs = np.diff(pts, axis=0)
+                diffs = np.vstack([diffs, pts[0] - pts[-1]])
+                dists = np.linalg.norm(diffs, axis=1)
+                cum_dists = np.insert(np.cumsum(dists), 0, 0)
+                total_len = cum_dists[-1]
+                if total_len == 0: return points
                 
+                # Force exactly target_count points via linear interpolation
+                target_dists = np.linspace(0, total_len, target_count, endpoint=False)
+                resampled = np.zeros((target_count, 3))
+                for i in range(3):
+                    resampled[:, i] = np.interp(target_dists, cum_dists, np.append(pts[:, i], pts[0, i]))
+                return resampled.tolist()
+
             pts1 = resample_loop(processed_loops[0], 100)
             pts2 = resample_loop(processed_loops[1], 100)
+        
             
-            p0 = np.array(pts1[0])
-            dists = [np.linalg.norm(np.array(p) - p0) for p in pts2]
-            best_idx = np.argmin(dists)
-            pts2 = pts2[best_idx:] + pts2[:best_idx]
+            # --- THE FIX: Handle Open vs Closed Curves Properly ---
+            is_closed_1 = np.linalg.norm(np.array(pts1[0]) - np.array(pts1[-1])) < 1e-3
+            is_closed_2 = np.linalg.norm(np.array(pts2[0]) - np.array(pts2[-1])) < 1e-3
+
+            if is_closed_1 and is_closed_2:
+                # If they are closed loops, align the start points so it doesn't twist
+                p0 = np.array(pts1[0])
+                dists = [np.linalg.norm(np.array(p) - p0) for p in pts2]
+                best_idx = np.argmin(dists)
+                pts2 = pts2[best_idx:] + pts2[:best_idx]
+            
+            # Align winding direction (prevents bowties for both open and closed)
+            if len(pts1) > 1 and len(pts2) > 1:
+                vec1 = np.array(pts1[1]) - np.array(pts1[0])
+                vec2_forward = np.array(pts2[1]) - np.array(pts2[0])
+                vec2_reverse = np.array(pts2[-1]) - np.array(pts2[0])
+                
+                if np.dot(vec1, vec2_reverse) > np.dot(vec1, vec2_forward):
+                    pts2 = list(reversed(pts2)) # Just flip the array!
+            # -----------------------------------------------------
             
             processed_loops = [pts1, pts2]
 
