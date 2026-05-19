@@ -31,8 +31,18 @@ class AppState:
     cleaned_mesh = None 
     live_logs = []
     rebuild_geometry = {} 
+    master_skeleton = None
+    patch_loops = []
 
 state = AppState()
+
+class BuildSkeletonParams(BaseModel):
+    sharpness_angle: float = 30.0
+    edge_smoothing: float = 0.5
+
+class RefineSkeletonParams(BaseModel):
+    circle_tolerance: float = 0.05
+    line_tolerance: float = 0.05
 
 def broadcast_log(msg: str):
     print(msg)
@@ -236,228 +246,6 @@ def get_patch_components(mesh, sharpness_angle_deg):
     smooth_edges = adjacency[angles < threshold_rad]
     return list(trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces))))
 
-def perform_fitting_race(target_pt, sharpness_angle):
-    import scipy.optimize
-    
-    ref_mesh = state.mesh
-    _, _, ref_face_ids = ref_mesh.nearest.on_surface(target_pt)
-    if len(ref_face_ids) == 0:
-        raise HTTPException(status_code=404)
-    start_ref_face = ref_face_ids[0]
-    ref_components = get_patch_components(ref_mesh, sharpness_angle)
-    ref_target_region = next((comp for comp in ref_components if start_ref_face in comp), [start_ref_face])
-    patch_id = f"patch_{min(ref_target_region)}"
-
-    math_mesh = state.cleaned_mesh if state.cleaned_mesh is not None else state.mesh
-    _, _, math_face_ids = math_mesh.nearest.on_surface(target_pt)
-    start_math_face = math_face_ids[0]
-    math_components = get_patch_components(math_mesh, sharpness_angle)
-    math_target_region = next((comp for comp in math_components if start_math_face in comp), [start_math_face])
-    
-    patch_verts_idx = np.unique(math_mesh.faces[math_target_region])
-    pts = math_mesh.vertices[patch_verts_idx]
-    
-    if len(pts) < 4:
-        return {"best_match": "plane", "errors": {"plane": 0, "cylinder": 999, "sphere": 999, "cone": 999, "torus": 999}, "radius": 0.0, "face_count": len(ref_target_region), "patch_faces": ref_target_region.tolist(), "id": patch_id}
-        
-    centroid = np.mean(pts, axis=0)
-    
-    _, _, vh = np.linalg.svd(pts - centroid)
-    normal = vh[2, :]
-    plane_mse = float(np.mean((np.dot(pts - centroid, normal))**2))
-    
-    def sphere_obj(c):
-        return np.linalg.norm(pts - c, axis=1) - np.mean(np.linalg.norm(pts - c, axis=1))
-    try:
-        res_sph = scipy.optimize.least_squares(sphere_obj, centroid)
-        sph_r = np.linalg.norm(pts - res_sph.x, axis=1)
-        sphere_mse = float(np.mean((sph_r - np.mean(sph_r))**2))
-        r_sph = float(np.mean(sph_r))
-        if r_sph > 10000: sphere_mse = float('inf')
-    except:
-        sphere_mse = float('inf')
-        r_sph = 0.0
-        
-    u = vh[0, :]
-    v = vh[1, :]
-    p2d = np.column_stack((np.dot(pts - centroid, u), np.dot(pts - centroid, v)))
-    def calc_R(c): return np.sqrt((p2d[:, 0] - c[0])**2 + (p2d[:, 1] - c[1])**2)
-    def cyl_obj(c): return calc_R(c) - np.mean(calc_R(c))
-    
-    try:
-        c2d_guess = np.mean(p2d, axis=0)
-        res_cyl = scipy.optimize.least_squares(cyl_obj, c2d_guess)
-        radii = calc_R(res_cyl.x)
-        cyl_mse = float(np.mean((radii - np.mean(radii))**2))
-        r_cyl = np.mean(radii)
-        if r_cyl > max(100.0, np.ptp(pts)*10) or r_cyl < 1e-4: cyl_mse = float('inf')
-    except:
-        cyl_mse = float('inf')
-        r_cyl = 0.0
-
-    def cone_obj(c):
-        apex, axis, theta = c[0:3], c[3:6], c[6]
-        axis_norm = np.linalg.norm(axis)
-        if axis_norm < 1e-5: return np.ones(len(pts))*999
-        axis = axis / axis_norm
-        vec = pts - apex
-        h = np.dot(vec, axis)
-        r_vec = np.linalg.norm(np.cross(vec, axis), axis=1)
-        return r_vec * np.cos(theta) - h * np.sin(theta)
-        
-    try:
-        apex_guess = centroid + normal * np.ptp(pts)
-        res_cone = scipy.optimize.least_squares(cone_obj, [*apex_guess, *normal, np.pi/4])
-        cone_mse = float(np.mean((cone_obj(res_cone.x))**2))
-    except:
-        cone_mse = float('inf')
-
-    def torus_obj(c):
-        center, axis, R, r_min = c[0:3], c[3:6], c[6], c[7]
-        axis_norm = np.linalg.norm(axis)
-        if axis_norm < 1e-5: return np.ones(len(pts))*999
-        axis = axis / axis_norm
-        vec = pts - center
-        z = np.dot(vec, axis)
-        d_xy = np.linalg.norm(vec - np.outer(z, axis), axis=1)
-        return np.sqrt((d_xy - R)**2 + z**2) - r_min
-
-    try:
-        res_torus = scipy.optimize.least_squares(torus_obj, [*centroid, *normal, np.ptp(pts)/2, np.ptp(pts)/10])
-        torus_mse = float(np.mean((torus_obj(res_torus.x))**2))
-    except:
-        torus_mse = float('inf')
-        
-    errors = {
-        "plane": plane_mse,
-        "cylinder": cyl_mse,
-        "sphere": sphere_mse,
-        "cone": cone_mse,
-        "torus": torus_mse
-    }
-
-    try:
-        calc_radius = max(np.ptp(pts, axis=0).max() * 0.15, 1e-3)
-        gaussian_curv = trimesh.curvature.discrete_gaussian_curvature_measure(math_mesh, pts, calc_radius)
-        mean_curv = trimesh.curvature.discrete_mean_curvature_measure(math_mesh, pts, calc_radius)
-
-        avg_gauss = float(np.mean(np.abs(gaussian_curv)))
-        avg_mean = float(np.mean(np.abs(mean_curv)))
-
-        gauss_zero_tol, mean_high_tol = 0.05, 0.05
-
-        if avg_gauss < gauss_zero_tol and avg_mean < mean_high_tol:
-            best_match = "plane"
-        elif avg_gauss < gauss_zero_tol and avg_mean >= mean_high_tol:
-            best_match = "cylinder" if cyl_mse < cone_mse else "cone"
-        elif avg_gauss >= gauss_zero_tol:
-            best_match = "sphere" if sphere_mse < torus_mse else "torus"
-        else:
-            best_match = min(errors, key=errors.get)
-    except:
-        best_match = min(errors, key=errors.get)
-
-    strict_best = min(errors, key=errors.get)
-    if errors[best_match] > errors[strict_best] * 3.0:
-        best_match = strict_best
-
-    if min(errors.values()) > 0.5: 
-        best_match = 'B-Spline'
-
-    return {
-        "best_match": best_match,
-        "errors": errors,
-        "radius": float(r_cyl) if best_match == 'cylinder' else float(r_sph) if best_match == 'sphere' else 0.0,
-        "face_count": len(ref_target_region),
-        "patch_faces": ref_target_region.tolist(),
-        "id": patch_id
-    }
-
-@app.post("/classify-patch")
-async def classify_patch(params: ClassifyParams):
-    if state.mesh is None:
-        raise HTTPException(status_code=400, detail="No mesh loaded.")
-    target_pt = np.array([[params.x, params.y, params.z]])
-    return perform_fitting_race(target_pt, params.sharpness_angle)
-
-@app.post("/analyze-surface")
-async def analyze_surface(params: Point3D):
-    if state.mesh is None:
-        raise HTTPException(status_code=400, detail="No mesh loaded.")
-    target_pt = np.array([[params.x, params.y, params.z]])
-    return perform_fitting_race(target_pt, params.sharpness_angle)
-
-@app.post("/scout-loop")
-async def scout_loop(params: Point3D):
-    if state.mesh is None:
-        raise HTTPException(status_code=400)
-        
-    try:
-        import networkx as nx
-        target_pt = np.array([[params.x, params.y, params.z]])
-        
-        ref_mesh = state.mesh
-        _, _, ref_face_ids = ref_mesh.nearest.on_surface(target_pt)
-        if len(ref_face_ids) == 0: raise HTTPException(status_code=404)
-        start_ref_face = ref_face_ids[0]
-        ref_components = get_patch_components(ref_mesh, params.sharpness_angle)
-        ref_target_region = next((comp for comp in ref_components if start_ref_face in comp), [start_ref_face])
-        
-        patch_id = f"scout_{min(ref_target_region)}"
-
-        math_mesh = state.cleaned_mesh if state.cleaned_mesh is not None else state.mesh
-        _, _, math_face_ids = math_mesh.nearest.on_surface(target_pt)
-        if len(math_face_ids) == 0: raise HTTPException(status_code=404)
-        start_math_face = math_face_ids[0]
-        math_components = get_patch_components(math_mesh, params.sharpness_angle)
-        math_target_region = next((comp for comp in math_components if start_math_face in comp), [start_math_face])
-        
-        faces = math_mesh.faces[math_target_region]
-        edges = trimesh.geometry.faces_to_edges(faces)
-        edges_sorted = np.sort(edges, axis=1)
-        unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
-        boundary_edges = unique_edges[counts == 1]
-        
-        if len(boundary_edges) == 0: raise HTTPException(status_code=400)
-
-        G = nx.Graph()
-        G.add_edges_from(boundary_edges)
-        loops = list(nx.connected_components(G))
-        
-        min_dist = float('inf')
-        best_loop = None
-        best_subgraph = None
-        
-        for loop in loops:
-            loop_verts = math_mesh.vertices[list(loop)]
-            dist = np.min(np.linalg.norm(loop_verts - target_pt, axis=1))
-            if dist < min_dist:
-                min_dist = dist
-                best_loop = list(loop)
-                best_subgraph = G.subgraph(loop)
-
-        try:
-            cycle = nx.find_cycle(best_subgraph)
-            ordered_nodes = [u for u, v in cycle]
-        except:
-            ordered_nodes = list(nx.dfs_preorder_nodes(best_subgraph))
-            
-        ordered_points = math_mesh.vertices[ordered_nodes]
-        
-        return {
-            "id": patch_id,
-            "type": "planar",
-            "points": ordered_points.tolist(),
-            "patch_faces": ref_target_region.tolist() 
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500)
-
-@app.post("/undo-geometry")
-async def undo_geometry():
-    broadcast_log("[System] Undo synchronized with React State.")
-    return {"success": True}
-
 def apply_pca_firewall(points):
     pts = np.array(points)
     centroid = np.mean(pts, axis=0)
@@ -536,135 +324,53 @@ def create_tension_edge(pts, force_start, force_end, tension=0.5):
     if line_len < 1e-4:
         return None
         
-    line_dir = line_vec / line_len
-    deviations = [np.linalg.norm(np.cross(p - force_start, line_dir)) for p in pts]
-    max_dev = max(deviations)
-    
-    if max_dev < 0.05: 
-        return b3d.Edge.make_line(start_v, end_v)
-        
-    min_pts = 4
-    max_pts = len(pts)
-    
-    target_count = int(max_pts - (max_pts - min_pts) * tension)
-    target_count = max(min_pts, min(target_count, max_pts))
+    target_count = int(len(pts) * (1.0 - tension))
+    target_count = max(4, min(target_count, len(pts)))
     
     indices = np.linspace(0, len(pts) - 1, target_count, dtype=int)
     
     clean_pts = [start_v]
     for idx in indices[1:-1]:
         v = b3d.Vector(pts[idx])
-        if (v - clean_pts[-1]).length > 1e-3 and (v - end_v).length > 1e-3:
+        if (v - clean_pts[-1]).length > 1e-2 and (v - end_v).length > 1e-2:
             clean_pts.append(v)
     clean_pts.append(end_v)
     
     try:
-        return b3d.Edge.make_spline(clean_pts)
+        if len(clean_pts) > 2:
+            return b3d.Edge.make_spline(clean_pts)
+        else:
+            return b3d.Edge.make_line(start_v, end_v)
     except:
         return b3d.Edge.make_line(start_v, end_v)
-
-@app.post("/patch-split")
-async def patch_split(params: PatchSplitParams):
-    try:
-        import build123d as b3d
-        from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
-        from OCP.GeomAbs import GeomAbs_C0
-    except ImportError:
-        raise HTTPException(status_code=500, detail="build123d or OCP missing")
-
-    if state.mesh is None:
-        raise HTTPException(status_code=400, detail="No mesh loaded.")
-
-    broadcast_log(f"[System] Initiating Auto-Patch Split [{params.geo_id}] with smoothing {params.edge_smoothing}...")
-
-    try:
-        raw_pts = np.array(params.points)
-        if len(raw_pts) > 0 and np.linalg.norm(raw_pts[0] - raw_pts[-1]) < 1e-5:
-            raw_pts = raw_pts[:-1]
-
-        corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
-
-        corner_pts = [raw_pts[c] for c in corners]
-        b3d_edges = []
-        for i in range(len(corners)):
-            start_idx = corners[i]
-            end_idx = corners[(i + 1) % len(corners)]
-            
-            seg_pts = extract_segment(raw_pts, start_idx, end_idx)
-            start_pt = corner_pts[i]
-            end_pt = corner_pts[(i + 1) % len(corners)]
-            
-            edge = create_tension_edge(seg_pts, start_pt, end_pt, tension=params.edge_smoothing)
-            if edge:
-                b3d_edges.append(edge)
-
-        patch_face = None
-        if len(b3d_edges) in [2, 3, 4]:
-            try:
-                patch_face = b3d.Face.make_surface_from_curves(b3d_edges)
-            except Exception:
-                pass
-
-        if patch_face is None:
-            wire = b3d.Wire(b3d_edges)
-            filler = BRepOffsetAPI_MakeFilling()
-            for edge in wire.edges():
-                filler.Add(edge.wrapped, GeomAbs_C0)
-
-            filler.Build()
-            if filler.IsDone():
-                patch_face = b3d.Face(filler.Shape())
-            else:
-                try:
-                    patch_face = b3d.Face(wire)
-                except Exception as e:
-                    raise ValueError(f"Failed to generate face from wire: {e}")
-
-        if patch_face is None:
-            raise ValueError("Engine failed to generate a surface patch.")
-
-        state.rebuild_geometry[params.geo_id] = patch_face
-
-        fd, path = tempfile.mkstemp(suffix=".stl")
-        os.close(fd)
-        
-        try:
-            from build123d.exporters3d import export_stl
-            export_stl(patch_face, path)
-            tmesh = trimesh.load(path, file_type='stl')
-            vertices = tmesh.vertices.tolist()
-            faces_out = tmesh.faces.tolist()
-            broadcast_log(f"[Success] Patch Split created. Returning {len(faces_out)} faces.")
-            return {"vertices": vertices, "faces": faces_out}
-        finally:
-            try: os.remove(path)
-            except: pass
-
-    except Exception as e:
-        err_msg = str(e)
-        broadcast_log(f"[Error] Failed to execute Patch Split: {err_msg}")
-        raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
 
 @app.post("/batch-magic-patch")
 async def batch_magic_patch(params: BatchMagicPatchParams):
     if state.mesh is None:
-        raise HTTPException(status_code=400, detail="No mesh loaded.")
+        msg = "No mesh loaded."
+        broadcast_log(f"[Error] {msg}")
+        raise HTTPException(status_code=400, detail=msg)
+    
+    # ORGANIC WATERTIGHT CHECK
+    if not getattr(state.mesh, 'is_watertight', False):
+        broadcast_log("[Warning] Mesh is not watertight! This may cause issues with automated topological searches.")
         
-    try:
-        import build123d as b3d
-        import networkx as nx
-        import scipy.spatial
-        from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
-        from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
-        from OCP.GeomAbs import GeomAbs_C0
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Missing libraries.")
+    import build123d as b3d
+    import scipy.optimize
+    import scipy.spatial
+    import networkx as nx
+    from OCP.GeomAbs import GeomAbs_C0
+    from OCP.Geom import Geom_Plane, Geom_CylindricalSurface
+    from OCP.gp import gp_Pln, gp_Pnt, gp_Dir, gp_Ax3
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+    
+    broadcast_log(f"[System] Initiating Organic Surface Extraction...")
 
-    broadcast_log(f"[System] Initiating Batch Magic Patch with Edge Smoothing: {params.edge_smoothing}...")
-    
+    # 1. Component Extraction
     components = get_patch_components(state.mesh, params.sharpness_angle)
-    
     loops_pts = []
+    comp_verts = []
+    
     for comp in components:
         if len(comp) < 3: continue
         faces = state.mesh.faces[comp]
@@ -683,10 +389,14 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
             ordered_nodes = list(nx.dfs_preorder_nodes(G))
             
         loops_pts.append(state.mesh.vertices[ordered_nodes])
+        comp_verts.append(state.mesh.vertices[np.unique(faces)])
 
     if not loops_pts:
-        raise HTTPException(status_code=400, detail="No boundary loops found.")
+        msg = "No boundary loops found. Try adjusting the sharpness angle."
+        broadcast_log(f"[Error] {msg}")
+        raise HTTPException(status_code=400, detail=msg)
 
+    # 2. Point Welding & Skeleton Construction
     all_pts = np.vstack(loops_pts)
     tree = scipy.spatial.cKDTree(all_pts)
     pairs = tree.query_pairs(r=0.01)
@@ -702,7 +412,358 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
         if root_i != root_j:
             parent[root_i] = root_j
     
-    for i, j in pairs:
+    for i, j in pairs: union(i, j)
+        
+    merged_positions = {}
+    for i in range(len(all_pts)):
+        root = find(i)
+        if root not in merged_positions:
+            merged_positions[root] = all_pts[root]
+            
+    snapped_loops = []
+    idx_counter = 0
+    for raw_pts in loops_pts:
+        snapped = []
+        for _ in range(len(raw_pts)):
+            root = find(idx_counter)
+            snapped.append(merged_positions[root])
+            idx_counter += 1
+        snapped_loops.append(np.array(snapped))
+
+    # 3. Edge Registry & Analytic Surface Generation
+    edge_registry = {}
+    b3d_faces = []
+    
+    clamped_tension = max(0.01, params.edge_smoothing / 100.0 if params.edge_smoothing > 1 else params.edge_smoothing)
+
+    for loop_idx, raw_pts in enumerate(snapped_loops):
+        if len(raw_pts) < 4: continue
+        
+        corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
+        if len(corners) < 3:
+            diffs = np.linalg.norm(raw_pts - np.roll(raw_pts, 1, axis=0), axis=1)
+            cum_dists = np.cumsum(diffs)
+            total_len = cum_dists[-1]
+            targets = [0, total_len * 0.25, total_len * 0.5, total_len * 0.75]
+            corners = []
+            for t in targets:
+                idx = np.searchsorted(cum_dists, t)
+                corners.append(min(idx, len(raw_pts) - 1))
+            corners = sorted(list(set(corners)))
+            if len(corners) < 3:
+                corners = [0, len(raw_pts)//3, 2*len(raw_pts)//3]
+        
+        corner_pts = [raw_pts[c] for c in corners]
+        cycle_edges = []
+
+        for i in range(len(corners)):
+            start_idx = corners[i]
+            end_idx = corners[(i + 1) % len(corners)]
+            
+            seg_pts = extract_segment(raw_pts, start_idx, end_idx)
+            pA = corner_pts[i]
+            pB = corner_pts[(i+1)%len(corners)]
+            
+            keyA = tuple(np.round(pA, 4))
+            keyB = tuple(np.round(pB, 4))
+            edge_key = tuple(sorted([keyA, keyB]))
+            
+            if edge_key not in edge_registry:
+                new_edge = create_tension_edge(seg_pts, pA, pB, tension=clamped_tension)
+                if new_edge:
+                    edge_registry[edge_key] = new_edge
+            
+            if edge_key in edge_registry:
+                cycle_edges.append(edge_registry[edge_key])
+
+        if len(cycle_edges) >= 3:
+            geom_surf = None
+            internal_pts = comp_verts[loop_idx]
+            
+            # --- EVALUATE ANALYTIC BASE ---
+            if len(internal_pts) >= 15:
+                pts = np.array(internal_pts)
+                centroid = np.mean(pts, axis=0)
+                _, _, vh = np.linalg.svd(pts - centroid)
+                plane_normal = vh[2, :]
+                plane_mse = float(np.mean((np.dot(pts - centroid, plane_normal))**2))
+                
+                cyl_mse = float('inf')
+                radius = 0.0
+                try:
+                    axis = vh[0, :]
+                    u_vec = vh[1, :]
+                    v_vec = vh[2, :]
+                    p2d = np.column_stack((np.dot(pts - centroid, u_vec), np.dot(pts - centroid, v_vec)))
+                    def calc_R(c): return np.sqrt((p2d[:, 0] - c[0])**2 + (p2d[:, 1] - c[1])**2)
+                    def cyl_obj(c): return calc_R(c) - np.mean(calc_R(c))
+                    
+                    res_cyl = scipy.optimize.least_squares(cyl_obj, np.mean(p2d, axis=0))
+                    radii = calc_R(res_cyl.x)
+                    cyl_mse = float(np.mean((radii - np.mean(radii))**2))
+                    radius = float(np.mean(radii))
+                    center_2d = res_cyl.x
+                    center_3d = centroid + center_2d[0]*u_vec + center_2d[1]*v_vec
+                    axis_3d, u_3d = axis, u_vec
+                except: pass
+
+                best_match = 'unknown'
+                if plane_mse < 0.05: best_match = 'plane'
+                elif cyl_mse < plane_mse * 0.5 and radius > 0.1: best_match = 'cylinder'
+                elif plane_mse < 0.5: best_match = 'plane'
+
+                try:
+                    if best_match == 'plane':
+                        pln = gp_Pln(gp_Pnt(float(centroid[0]), float(centroid[1]), float(centroid[2])), 
+                                     gp_Dir(float(plane_normal[0]), float(plane_normal[1]), float(plane_normal[2])))
+                        geom_surf = Geom_Plane(pln)
+                    elif best_match == 'cylinder':
+                        ax3 = gp_Ax3(gp_Pnt(float(center_3d[0]), float(center_3d[1]), float(center_3d[2])), 
+                                     gp_Dir(float(axis_3d[0]), float(axis_3d[1]), float(axis_3d[2])),
+                                     gp_Dir(float(u_3d[0]), float(u_3d[1]), float(u_3d[2])))
+                        geom_surf = Geom_CylindricalSurface(ax3, float(radius))
+                except: pass
+
+            # --- THE INVINCIBLE FALLBACK HIERARCHY ---
+            face = None
+
+            if geom_surf is not None:
+                try:
+                    filler = BRepOffsetAPI_MakeFilling()
+                    for edge in cycle_edges: filler.Add(edge.wrapped, GeomAbs_C0)
+                    filler.LoadInitSurface(geom_surf)
+                    filler.Build()
+                    if filler.IsDone(): 
+                        f = b3d.Face(filler.Shape())
+                        if f.is_valid: face = f
+                except: pass
+
+            if face is None and len(cycle_edges) in [2, 3, 4]:
+                try: 
+                    f = b3d.Face.make_surface_from_curves(cycle_edges)
+                    if f.is_valid: face = f
+                except: pass
+
+            if face is None:
+                try:
+                    filler = BRepOffsetAPI_MakeFilling()
+                    for edge in cycle_edges: filler.Add(edge.wrapped, GeomAbs_C0)
+                    filler.Build()
+                    if filler.IsDone(): 
+                        f = b3d.Face(filler.Shape())
+                        if f.is_valid: face = f
+                except: pass
+
+            if face is None:
+                try:
+                    from scipy.spatial import ConvexHull
+                    flat_pts = np.array(apply_pca_firewall(corner_pts))
+                    centroid_flat = np.mean(flat_pts, axis=0)
+                    flat_pts += np.random.normal(0, 1e-6, flat_pts.shape)
+                    
+                    _, _, vh = np.linalg.svd(flat_pts - centroid_flat)
+                    u_vec = vh[0, :]
+                    v_vec = vh[1, :]
+                    
+                    p2d = np.column_stack((np.dot(flat_pts - centroid_flat, u_vec), np.dot(flat_pts - centroid_flat, v_vec)))
+                    hull = ConvexHull(p2d)
+                    
+                    hull_pts_3d = [centroid_flat + p2d[idx][0] * u_vec + p2d[idx][1] * v_vec for idx in hull.vertices]
+                    
+                    poly_pts = [b3d.Vector(p) for p in hull_pts_3d]
+                    if (poly_pts[0] - poly_pts[-1]).length > 1e-4:
+                        poly_pts.append(poly_pts[0])
+                        
+                    f = b3d.Face(b3d.Wire.make_polygon(poly_pts))
+                    if f.is_valid: 
+                        face = f
+                except Exception as e:
+                    pass
+
+            if face is not None:
+                b3d_faces.append(face)
+
+    if not b3d_faces:
+         msg = "Engine failed to generate valid faces. All fallbacks exhausted."
+         broadcast_log(f"[Error] {msg}")
+         raise HTTPException(status_code=400, detail=msg)
+
+    # 4. Robust Progressive Sewing & Healing
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
+    from OCP.ShapeFix import ShapeFix_Shape, ShapeFix_Solid
+    
+    is_solid = False
+    final_geo = None
+    
+    tolerances_to_try = [1e-3, 1e-2, 0.05, 0.1] 
+    
+    for tol in tolerances_to_try:
+        sewer = BRepBuilderAPI_Sewing()
+        sewer.SetTolerance(tol)
+        
+        for face in b3d_faces:
+            if face.is_valid: 
+                sewer.Add(face.wrapped)
+
+        sewer.Perform()
+        temp_sewed = sewer.SewedShape()
+        
+        if temp_sewed.IsNull():
+            continue
+            
+        healer = ShapeFix_Shape(temp_sewed)
+        healer.SetPrecision(tol)
+        healer.SetMinTolerance(tol)
+        healer.SetMaxTolerance(tol * 5)
+        healer.Perform()
+        healed_shape = healer.Shape()
+        
+        if healed_shape.IsNull():
+            continue
+
+        try:
+            temp_b3d = b3d.Shape.cast(healed_shape)
+        except Exception:
+            continue
+
+        if isinstance(temp_b3d, b3d.Solid):
+            final_geo = temp_b3d
+            is_solid = True
+            broadcast_log(f"[System] Zipped into a watertight Solid at tolerance {tol}")
+            break
+            
+        elif isinstance(temp_b3d, b3d.Shell):
+            if temp_b3d.is_closed:
+                try:
+                    final_geo = b3d.Solid.make_solid(temp_b3d)
+                    is_solid = True
+                    broadcast_log(f"[System] Shell successfully sealed into a Solid at tolerance {tol}")
+                    break
+                except Exception:
+                    pass
+            final_geo = temp_b3d 
+
+        elif isinstance(temp_b3d, b3d.Compound):
+            shells = temp_b3d.shells()
+            if shells and shells[0].is_closed:
+                try:
+                    final_geo = b3d.Solid.make_solid(shells[0])
+                    is_solid = True
+                    broadcast_log(f"[System] Compound shell sealed into a Solid at tolerance {tol}")
+                    break
+                except Exception:
+                    pass
+            final_geo = temp_b3d
+
+    if final_geo is None:
+        final_geo = b3d.Compound(children=b3d_faces)
+        broadcast_log("[Warning] All sewing attempts failed. Outputting loose faces as a Compound.")
+    elif not is_solid:
+        broadcast_log("[Warning] Could not achieve a watertight seal. Outputting as an Open Shell.")
+        
+    geo_id = f"batch_{'solid' if is_solid else 'shell'}_{uuid.uuid4().hex[:8]}"
+    state.rebuild_geometry[geo_id] = final_geo
+    
+    fd, path = tempfile.mkstemp(suffix=".stl")
+    os.close(fd)
+    try:
+        from build123d.exporters3d import export_stl
+        export_stl(final_geo, path)
+        tmesh = trimesh.load(path, file_type='stl')
+        
+        naked_edges = []
+        if not is_solid and len(tmesh.faces) > 0:
+            edges = trimesh.geometry.faces_to_edges(tmesh.faces)
+            edges_sorted = np.sort(edges, axis=1)
+            unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
+            boundary_edges = unique_edges[counts == 1]
+            for edge in boundary_edges:
+                p1 = tmesh.vertices[edge[0]].tolist()
+                p2 = tmesh.vertices[edge[1]].tolist()
+                naked_edges.append([p1, p2])
+
+        broadcast_log(f"[Success] Validation Guardrails saved the geometry. Exported {len(tmesh.faces)} faces. Solid: {is_solid}")
+        
+        return {
+            "geometries": [
+                {
+                    "vertices": tmesh.vertices.tolist(),
+                    "faces": tmesh.faces.tolist(),
+                    "id": geo_id,
+                    "tag": "Safe Shell",
+                    "is_solid": is_solid,
+                    "naked_edges": naked_edges,
+                    "type": "solid" if is_solid else "shell", 
+                    "name": f"Batch_Patch_{geo_id[:4]}"
+                }
+            ]
+        }
+    finally:
+        try: os.remove(path)
+        except: pass
+
+@app.post("/build-skeleton")
+async def build_skeleton(params: BuildSkeletonParams):
+    if state.mesh is None:
+        raise HTTPException(status_code=400, detail="No mesh loaded.")
+        
+    # STRUCTURED WATERTIGHT CHECK
+    if not getattr(state.mesh, 'is_watertight', False):
+        msg = "The Structured CAD Pipeline requires a perfectly Watertight/Manifold mesh to prevent algorithmic explosions. Please close all holes in your mesh before using this method."
+        broadcast_log(f"[Error] {msg}")
+        raise HTTPException(status_code=400, detail=msg)
+        
+    import build123d as b3d
+    import networkx as nx
+    import scipy.spatial
+
+    broadcast_log(f"[System] Initiating Master Skeleton Extraction (Angle: {params.sharpness_angle}°)...")
+
+    components = get_patch_components(state.mesh, params.sharpness_angle)
+    
+    loops_pts = []
+    valid_comps = []
+    
+    for comp in components:
+        if len(comp) < 3: continue
+        faces = state.mesh.faces[comp]
+        edges = trimesh.geometry.faces_to_edges(faces)
+        edges_sorted = np.sort(edges, axis=1)
+        unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
+        boundary_edges = unique_edges[counts == 1]
+        
+        if len(boundary_edges) == 0: continue
+        
+        G_temp = nx.Graph()
+        G_temp.add_edges_from(boundary_edges)
+        try:
+            cycle = nx.find_cycle(G_temp)
+            ordered_nodes = [u for u, v in cycle]
+        except:
+            ordered_nodes = list(nx.dfs_preorder_nodes(G_temp))
+            
+        loops_pts.append(state.mesh.vertices[ordered_nodes])
+        valid_comps.append(comp)
+
+    if not loops_pts:
+        raise HTTPException(status_code=400, detail="No boundaries detected.")
+
+    all_pts = np.vstack(loops_pts)
+    tree = scipy.spatial.cKDTree(all_pts)
+    pairs = tree.query_pairs(r=0.01) 
+    
+    parent = {i: i for i in range(len(all_pts))}
+    def find(i):
+        if parent[i] == i: return i
+        parent[i] = find(parent[i])
+        return parent[i]
+    def union(i, j):
+        root_i = find(i)
+        root_j = find(j)
+        if root_i != root_j:
+            parent[root_i] = root_j
+            
+    for i, j in pairs: 
         union(i, j)
         
     merged_positions = {}
@@ -721,13 +782,17 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
             idx_counter += 1
         snapped_loops.append(np.array(snapped))
 
-    b3d_faces = []
-    for raw_pts in snapped_loops:
+    state.master_skeleton = nx.Graph()
+    state.patch_loops = []
+    edge_count = 0
+    clamped_tension = max(0.01, params.edge_smoothing / 100.0 if params.edge_smoothing > 1 else params.edge_smoothing)
+
+    for raw_pts, comp in zip(snapped_loops, valid_comps):
         if len(raw_pts) < 4: continue
         
         corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
         
-        if len(corners) < 4:
+        if len(corners) < 3:
             diffs = np.linalg.norm(raw_pts - np.roll(raw_pts, 1, axis=0), axis=1)
             cum_dists = np.cumsum(diffs)
             total_len = cum_dists[-1]
@@ -737,66 +802,302 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
                 idx = np.searchsorted(cum_dists, t)
                 corners.append(min(idx, len(raw_pts) - 1))
             corners = sorted(list(set(corners)))
-            if len(corners) < 4:
-                corners = [0, len(raw_pts)//4, len(raw_pts)//2, 3*len(raw_pts)//4]
-            
+            if len(corners) < 3:
+                corners = [0, len(raw_pts)//3, 2*len(raw_pts)//3]
+        
         corner_pts = [raw_pts[c] for c in corners]
-        b3d_edges = []
+
+        loop_keys = []
+        for pA in corner_pts:
+            keyA = tuple(np.round(pA, 4))
+            loop_keys.append(keyA)
+            
+        clean_keys = []
+        for k in loop_keys:
+            if not clean_keys or clean_keys[-1] != k:
+                clean_keys.append(k)
+        if len(clean_keys) > 1 and clean_keys[0] == clean_keys[-1]:
+            clean_keys.pop()
+            
+        if len(clean_keys) >= 3:
+            verts = state.mesh.vertices[np.unique(state.mesh.faces[comp])].tolist()
+            state.patch_loops.append({
+                "keys": clean_keys,
+                "points": verts
+            })
+
         for i in range(len(corners)):
             start_idx = corners[i]
             end_idx = corners[(i + 1) % len(corners)]
             
             seg_pts = extract_segment(raw_pts, start_idx, end_idx)
-            edge = create_tension_edge(seg_pts, corner_pts[i], corner_pts[(i+1)%len(corners)], tension=params.edge_smoothing)
-            if edge:
-                b3d_edges.append(edge)
+            pA = corner_pts[i]
+            pB = corner_pts[(i+1)%len(corners)]
             
-        patch_face = None
-        if len(b3d_edges) in [2, 3, 4]:
+            keyA = tuple(np.round(pA, 4))
+            keyB = tuple(np.round(pB, 4))
+            
+            if keyA == keyB: continue
+            
+            if not state.master_skeleton.has_node(keyA):
+                state.master_skeleton.add_node(keyA, pos=pA)
+            if not state.master_skeleton.has_node(keyB):
+                state.master_skeleton.add_node(keyB, pos=pB)
+            
+            if not state.master_skeleton.has_edge(keyA, keyB):
+                new_edge = create_tension_edge(seg_pts, pA, pB, tension=clamped_tension)
+                if new_edge:
+                    state.master_skeleton.add_edge(keyA, keyB, b3d_edge=new_edge)
+                    edge_count += 1
+                    
+    broadcast_log(f"[Success] Master Skeleton built with {state.master_skeleton.number_of_nodes()} points and {edge_count} shared curves.")
+    
+    return {
+        "status": "success",
+        "nodes": state.master_skeleton.number_of_nodes(),
+        "edges": state.master_skeleton.number_of_edges()
+    }
+
+@app.post("/refine-skeleton")
+async def refine_skeleton(params: RefineSkeletonParams):
+    if state.master_skeleton is None or state.master_skeleton.number_of_nodes() == 0:
+        raise HTTPException(status_code=400, detail="Master skeleton is empty or not built.")
+        
+    import networkx as nx
+    import build123d as b3d
+    import scipy.optimize
+    import numpy as np
+
+    broadcast_log("[System] Initiating Andrew's 3-Pass Wire Classification...")
+    
+    G = state.master_skeleton
+    new_G = nx.Graph()
+    chains = []
+    visited_edges = set()
+
+    def update_patch_loops(chain):
+        if len(chain) <= 2: return
+        intermediate = set(chain[1:-1])
+        for i, patch in enumerate(state.patch_loops):
+            loop = patch["keys"]
+            if not intermediate.intersection(loop): continue
+            new_loop = [n for n in loop if n not in intermediate]
+            clean_loop = []
+            for n in new_loop:
+                if not clean_loop or clean_loop[-1] != n: clean_loop.append(n)
+            if len(clean_loop) > 1 and clean_loop[0] == clean_loop[-1]:
+                clean_loop.pop()
+            state.patch_loops[i]["keys"] = clean_loop
+    
+    for comp in list(nx.connected_components(G)):
+        if all(G.degree(n) == 2 for n in comp):
             try:
-                patch_face = b3d.Face.make_surface_from_curves(b3d_edges)
+                cycle = nx.find_cycle(G.subgraph(comp))
+                nodes = [u for u, v in cycle]
+                nodes.append(nodes[0]) 
+                edges = [tuple(sorted(e)) for e in cycle]
+                if not any(e in visited_edges for e in edges):
+                    chains.append(nodes)
+                    visited_edges.update(edges)
+            except: pass
+
+    branch_nodes = [n for n in G.nodes() if G.degree(n) != 2]
+    for start_node in branch_nodes:
+        for neighbor in G.neighbors(start_node):
+            edge = tuple(sorted((start_node, neighbor)))
+            if edge in visited_edges: continue
+            
+            current, prev = neighbor, start_node
+            path = [start_node, current]
+            visited_edges.add(edge)
+            
+            while G.degree(current) == 2 and current != start_node:
+                next_nodes = [n for n in G.neighbors(current) if n != prev]
+                if not next_nodes: break
+                next_node = next_nodes[0]
+                path.append(next_node)
+                visited_edges.add(tuple(sorted((current, next_node))))
+                prev, current = current, next_node
+            
+            chains.append(path)
+
+    counts = {"circle": 0, "line": 0, "spline": 0, "fallback": 0}
+
+    for chain in chains:
+        update_patch_loops(chain) 
+        
+        start_node = chain[0]
+        end_node = chain[-1]
+        is_closed = (start_node == end_node)
+        pts = np.array([G.nodes[n]['pos'] for n in chain])
+        
+        b3d_edge, edge_type = None, "unknown"
+
+        if is_closed and len(pts) >= 4:
+            pts_unique = pts[:-1]
+            centroid = np.mean(pts_unique, axis=0)
+            cov = np.cov(pts_unique.T)
+            evals, evecs = np.linalg.eigh(cov)
+            normal = evecs[:, 0]
+            u, v = evecs[:, 1], evecs[:, 2]
+            
+            p2d = np.column_stack((np.dot(pts_unique - centroid, u), np.dot(pts_unique - centroid, v)))
+            def calc_R(c): return np.sqrt((p2d[:, 0] - c[0])**2 + (p2d[:, 1] - c[1])**2)
+            def f_2(c): Ri = calc_R(c); return Ri - Ri.mean()
+            
+            try:
+                c2d_guess = np.mean(p2d, axis=0)
+                res = scipy.optimize.least_squares(f_2, c2d_guess)
+                radius = float(calc_R(res.x).mean())
+                if np.std(calc_R(res.x)) / radius < params.circle_tolerance:
+                    center_3d = centroid + res.x[0]*u + res.x[1]*v
+                    p = b3d.Plane(origin=b3d.Vector(center_3d), z_dir=b3d.Vector(normal))
+                    b3d_edge = b3d.Edge.make_circle(radius=radius, plane=p)
+                    edge_type = "circle"
+            except: pass
+
+        if b3d_edge is None and not is_closed and len(pts) >= 2:
+            pA, pB = pts[0], pts[-1]
+            line_vec = pB - pA
+            line_len = np.linalg.norm(line_vec)
+            if line_len > 1e-5:
+                line_dir = line_vec / line_len
+                if max([np.linalg.norm(np.cross(p - pA, line_dir)) for p in pts]) < params.line_tolerance:
+                    b3d_edge = b3d.Edge.make_line(b3d.Vector(pA), b3d.Vector(pB))
+                    edge_type = "line"
+
+        if b3d_edge is None:
+            clean_pts = []
+            for p in pts:
+                v_p = b3d.Vector(p)
+                if not clean_pts or (v_p - clean_pts[-1]).length > 1e-4:
+                    clean_pts.append(v_p)
+            
+            if is_closed and (clean_pts[0] - clean_pts[-1]).length > 1e-4:
+                clean_pts.append(clean_pts[0])
+                
+            if len(clean_pts) > 2:
+                try:
+                    b3d_edge = b3d.Edge.make_spline(clean_pts)
+                    edge_type = "spline"
+                except Exception as e:
+                    broadcast_log(f"[Warning] Spline generation failed, falling back to line. Reason: {e}")
+            
+            if b3d_edge is None and len(clean_pts) >= 2:
+                b3d_edge = b3d.Edge.make_line(clean_pts[0], clean_pts[-1])
+                edge_type = "fallback"
+
+        if b3d_edge is not None:
+            counts[edge_type] += 1
+            if not new_G.has_node(start_node): new_G.add_node(start_node, pos=G.nodes[start_node]['pos'])
+            if not new_G.has_node(end_node): new_G.add_node(end_node, pos=G.nodes[end_node]['pos'])
+            new_G.add_edge(start_node, end_node, b3d_edge=b3d_edge, type=edge_type)
+
+    state.master_skeleton = new_G
+    broadcast_log(f"[Success] Andrew's Classification Complete: {counts['circle']} Circles, {counts['line']} Lines, {counts['spline']} Splines.")
+    
+    return {
+        "status": "success",
+        "nodes": new_G.number_of_nodes(),
+        "edges": new_G.number_of_edges(),
+        "metrics": counts
+    }
+
+@app.post("/generate-shell")
+async def generate_shell():
+    if state.master_skeleton is None or state.master_skeleton.number_of_edges() == 0:
+        raise HTTPException(status_code=400, detail="Master skeleton not built or empty.")
+        
+    import build123d as b3d
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
+    from OCP.ShapeFix import ShapeFix_Shape
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+    from OCP.GeomAbs import GeomAbs_C0
+    from OCP.gp import gp_Pnt
+
+    broadcast_log("[System] Extracting specific patch cycles for face injection with Internal Constraints...")
+    
+    G = state.master_skeleton
+    cycles = state.patch_loops
+    
+    if not cycles:
+        raise HTTPException(status_code=400, detail="No topological loops found in skeleton.")
+        
+    b3d_faces = []
+    
+    for patch in cycles:
+        cycle_keys = patch["keys"]
+        internal_pts = patch.get("points", [])
+        cycle_edges = []
+        valid_cycle = True
+        
+        if len(cycle_keys) == 1:
+            u = cycle_keys[0]
+            if G.has_edge(u, u):
+                edge_data = G.get_edge_data(u, u)
+                if 'b3d_edge' in edge_data:
+                    cycle_edges.append(edge_data['b3d_edge'])
+                else:
+                    valid_cycle = False
+            else:
+                valid_cycle = False
+        else:
+            for i in range(len(cycle_keys)):
+                u = cycle_keys[i]
+                v = cycle_keys[(i + 1) % len(cycle_keys)]
+                
+                if G.has_edge(u, v):
+                    edge_data = G.get_edge_data(u, v)
+                    if 'b3d_edge' in edge_data:
+                        cycle_edges.append(edge_data['b3d_edge'])
+                    else:
+                        valid_cycle = False; break
+                else:
+                    valid_cycle = False; break
+                
+        if valid_cycle and len(cycle_edges) > 0:
+            try:
+                filler = BRepOffsetAPI_MakeFilling()
+                for edge in cycle_edges:
+                    filler.Add(edge.wrapped, GeomAbs_C0)
+                    
+                # if len(internal_pts) > 0:
+                #     step = max(1, len(internal_pts) // 10) 
+                #     for pt in internal_pts[::step][:10]:
+                #         filler.Add(gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])))
+                        
+                filler.Build()
+                if filler.IsDone():
+                    b3d_faces.append(b3d.Face(filler.Shape()))
+                else:
+                    wire = b3d.Wire(cycle_edges)
+                    b3d_faces.append(b3d.Face.make_from_wires(wire))
             except Exception:
                 pass
-                
-        if patch_face is None:
-            wire = b3d.Wire(b3d_edges)
-            filler = BRepOffsetAPI_MakeFilling()
-            for edge in wire.edges():
-                filler.Add(edge.wrapped, GeomAbs_C0)
-            filler.Build()
-            if filler.IsDone():
-                patch_face = b3d.Face(filler.Shape())
-            else:
-                try:
-                    patch_face = b3d.Face(wire)
-                except:
-                    continue # Skip this face if we cannot build it
-
-        if patch_face is not None:
-            b3d_faces.append(patch_face)
-            
+                    
     if not b3d_faces:
-         raise HTTPException(status_code=400, detail="Could not build any valid faces from patches.")
-         
-    # === NEW SEWING LOGIC WITH CRASH PREVENTION ===
+         raise HTTPException(status_code=400, detail="Engine failed to inject faces into the skeleton cycles.")
+
     sewer = BRepBuilderAPI_Sewing()
     sewer.SetTolerance(1e-2)
     
-    valid_faces = [f for f in b3d_faces if f is not None and hasattr(f, 'wrapped')]
-    for face in valid_faces:
+    for face in b3d_faces:
         sewer.Add(face.wrapped)
 
     sewer.Perform()
     sewed_shape = sewer.SewedShape()
     
+    if not sewed_shape.IsNull():
+        healer = ShapeFix_Shape(sewed_shape)
+        healer.SetPrecision(0.1)
+        healer.Perform()
+        sewed_shape = healer.Shape()
+
     sewed_b3d = None
-    try:
-        # Cast can return None if the underlying topo shape is null
-        if not sewed_shape.IsNull():
+    if not sewed_shape.IsNull():
+        try:
             sewed_b3d = b3d.Shape.cast(sewed_shape)
-    except Exception as e:
-        broadcast_log(f"[Warning] Failed to cast sewed shape: {e}")
-        sewed_b3d = None
+        except: pass
 
     is_solid = False
     final_geo = None
@@ -822,23 +1123,11 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
                     is_solid = True
                 except:
                     final_geo = shells[0]
-            elif shells:
-                final_geo = shells[0]
-            else:
-                final_geo = sewed_b3d
-        else:
-            final_geo = sewed_b3d
 
-    # Strict fallback check to prevent NoneType crash in export_stl
     if final_geo is None:
-        if valid_faces:
-            broadcast_log("[Warning] Sewing algorithm returned a null geometry. Falling back to a standard Compound.")
-            final_geo = b3d.Compound(children=valid_faces)
-            is_solid = False
-        else:
-            raise HTTPException(status_code=400, detail="No valid faces available to sew.")
-
-    geo_id = f"batch_{'solid' if is_solid else 'shell'}_{uuid.uuid4().hex[:8]}"
+        final_geo = b3d.Compound(children=b3d_faces)
+        
+    geo_id = f"master_shell_{uuid.uuid4().hex[:8]}"
     state.rebuild_geometry[geo_id] = final_geo
     
     fd, path = tempfile.mkstemp(suffix=".stl")
@@ -859,16 +1148,11 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
                 p2 = tmesh.vertices[edge[1]].tolist()
                 naked_edges.append([p1, p2])
 
-        if is_solid:
-            broadcast_log(f"[Success] Batch Magic Patch generated {len(b3d_faces)} faces. Result is a Water-tight Solid!")
-        else:
-            broadcast_log(f"[Warning] Batch Magic Patch generated {len(b3d_faces)} faces. Result is an Open Shell.")
-
         return {
             "vertices": tmesh.vertices.tolist(),
             "faces": tmesh.faces.tolist(),
             "id": geo_id,
-            "tag": "Ready for Knitting",
+            "tag": "Master Skeleton Shell",
             "is_solid": is_solid,
             "naked_edges": naked_edges
         }
@@ -876,107 +1160,96 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
         try: os.remove(path)
         except: pass
 
-
-@app.post("/magic-patch")
-async def magic_patch(params: MagicPatchParams):
-    try:
-        import build123d as b3d
-        import networkx as nx
-        from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
-        from OCP.GeomAbs import GeomAbs_C0
-    except ImportError:
-        raise HTTPException(status_code=500, detail="build123d or OCP missing")
-
+@app.post("/classify-patch")
+async def classify_patch(params: ClassifyParams):
     if state.mesh is None:
         raise HTTPException(status_code=400, detail="No mesh loaded.")
-        
-    broadcast_log(f"[System] Initiating Magic Patch for {len(params.patch_faces)} faces with smoothing {params.edge_smoothing}...")
+    target_pt = np.array([[params.x, params.y, params.z]])
+    
+    # Simple placeholder logic to avoid errors on your frontend while analyzing patches
+    return {
+        "best_match": "unknown",
+        "errors": {"plane": 0, "cylinder": 0, "sphere": 0, "cone": 0, "torus": 0},
+        "radius": 0,
+        "face_count": 0
+    }
 
+@app.post("/analyze-surface")
+async def analyze_surface(params: Point3D):
+    if state.mesh is None:
+        raise HTTPException(status_code=400, detail="No mesh loaded.")
+    return {"status": "success"}
+
+@app.post("/scout-loop")
+async def scout_loop(params: Point3D):
+    if state.mesh is None:
+        raise HTTPException(status_code=400)
+        
     try:
-        submesh_faces = state.mesh.faces[params.patch_faces]
-        edges = trimesh.geometry.faces_to_edges(submesh_faces)
+        import networkx as nx
+        target_pt = np.array([[params.x, params.y, params.z]])
+        
+        ref_mesh = state.mesh
+        _, _, ref_face_ids = ref_mesh.nearest.on_surface(target_pt)
+        if len(ref_face_ids) == 0: raise HTTPException(status_code=404)
+        start_ref_face = ref_face_ids[0]
+        ref_components = get_patch_components(ref_mesh, params.sharpness_angle)
+        ref_target_region = next((comp for comp in ref_components if start_ref_face in comp), [start_ref_face])
+        
+        patch_id = f"scout_{min(ref_target_region)}"
+
+        math_mesh = state.cleaned_mesh if state.cleaned_mesh is not None else state.mesh
+        _, _, math_face_ids = math_mesh.nearest.on_surface(target_pt)
+        if len(math_face_ids) == 0: raise HTTPException(status_code=404)
+        start_math_face = math_face_ids[0]
+        math_components = get_patch_components(math_mesh, params.sharpness_angle)
+        math_target_region = next((comp for comp in math_components if start_math_face in comp), [start_math_face])
+        
+        faces = math_mesh.faces[math_target_region]
+        edges = trimesh.geometry.faces_to_edges(faces)
         edges_sorted = np.sort(edges, axis=1)
         unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
         boundary_edges = unique_edges[counts == 1]
-
-        if len(boundary_edges) == 0:
-            raise ValueError("No valid boundary found in selection.")
+        
+        if len(boundary_edges) == 0: raise HTTPException(status_code=400)
 
         G = nx.Graph()
         G.add_edges_from(boundary_edges)
+        loops = list(nx.connected_components(G))
         
+        min_dist = float('inf')
+        best_loop = None
+        best_subgraph = None
+        
+        for loop in loops:
+            loop_verts = math_mesh.vertices[list(loop)]
+            dist = np.min(np.linalg.norm(loop_verts - target_pt, axis=1))
+            if dist < min_dist:
+                min_dist = dist
+                best_loop = list(loop)
+                best_subgraph = G.subgraph(loop)
+
         try:
-            cycle = nx.find_cycle(G)
+            cycle = nx.find_cycle(best_subgraph)
             ordered_nodes = [u for u, v in cycle]
         except:
-            ordered_nodes = list(nx.dfs_preorder_nodes(G))
-
-        raw_pts = state.mesh.vertices[ordered_nodes]
-        
-        if len(raw_pts) < 3:
-            raise ValueError("Boundary loop has too few vertices to patch.")
-
-        corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
-
-        corner_pts = [raw_pts[c] for c in corners]
-        b3d_edges = []
-        for i in range(len(corners)):
-            start_idx = corners[i]
-            end_idx = corners[(i + 1) % len(corners)]
+            ordered_nodes = list(nx.dfs_preorder_nodes(best_subgraph))
             
-            seg_pts = extract_segment(raw_pts, start_idx, end_idx)
-            edge = create_tension_edge(seg_pts, corner_pts[i], corner_pts[(i+1)%len(corners)], tension=params.edge_smoothing)
-            if edge:
-                b3d_edges.append(edge)
-            
-        patch_face = None
-        if len(b3d_edges) in [2, 3, 4]:
-            try:
-                patch_face = b3d.Face.make_surface_from_curves(b3d_edges)
-            except Exception:
-                pass
-                
-        if patch_face is None:
-            wire = b3d.Wire(b3d_edges)
-            filler = BRepOffsetAPI_MakeFilling()
-            for edge in wire.edges():
-                filler.Add(edge.wrapped, GeomAbs_C0)
-                
-            filler.Build()
-            if not filler.IsDone():
-                broadcast_log("[Warning] Complex shrinkwrap failed, falling back to planar wire face.")
-                try:
-                    patch_face = b3d.Face(wire)
-                except Exception as e:
-                    raise ValueError(f"Engine failed to generate fallback surface: {e}")
-            else:
-                patch_face = b3d.Face(filler.Shape())
-
-        if patch_face is None:
-            raise ValueError("Engine failed to generate a surface patch.")
-
-        state.rebuild_geometry[params.geo_id] = patch_face
-
-        fd, path = tempfile.mkstemp(suffix=".stl")
-        os.close(fd)
+        ordered_points = math_mesh.vertices[ordered_nodes]
         
-        try:
-            from build123d.exporters3d import export_stl
-            export_stl(patch_face, path)
-            tmesh = trimesh.load(path, file_type='stl')
-            vertices = tmesh.vertices.tolist()
-            faces_out = tmesh.faces.tolist()
-            broadcast_log(f"[Success] Magic Patch created. Returning {len(faces_out)} faces.")
-            return {"vertices": vertices, "faces": faces_out}
-        finally:
-            try: os.remove(path)
-            except: pass
-
+        return {
+            "id": patch_id,
+            "type": "planar",
+            "points": ordered_points.tolist(),
+            "patch_faces": ref_target_region.tolist() 
+        }
     except Exception as e:
-        err_msg = str(e)
-        broadcast_log(f"[Error] Failed to execute Magic Patch: {err_msg}")
-        raise HTTPException(status_code=400, detail=f"Geometry Error: {err_msg}")
+        raise HTTPException(status_code=500)
 
+@app.post("/undo-geometry")
+async def undo_geometry():
+    broadcast_log("[System] Undo synchronized with React State.")
+    return {"success": True}
 
 @app.post("/create-patch")
 async def create_patch(params: CreatePatchParams):
@@ -994,7 +1267,6 @@ async def create_patch(params: CreatePatchParams):
     try:
         loop_arrays = [np.array(l.get('points', [])) for l in params.loops if len(l.get('points', [])) > 1]
         
-        # Endpoint Fusion: Snap all independent manual selections together if they are within 1 unit
         for _ in range(2): 
             for i in range(len(loop_arrays)):
                 for j in range(len(loop_arrays)):
@@ -1323,8 +1595,16 @@ async def commit_geometry(params: CommitGeometryParams):
                 processed_loops.append(loop_data.get('points', []))
 
         if params.operation == 'loft' and len(processed_loops) == 2:
-            pts1 = processed_loops[0]
-            pts2 = processed_loops[1]
+            def resample_loop(loop, count=100):
+                if len(loop) <= 2: return loop
+                clean_loop = []
+                for p in loop:
+                    if not clean_loop or np.linalg.norm(np.array(p) - np.array(clean_loop[-1])) > 1e-4:
+                        clean_loop.append(p)
+                return clean_loop 
+                
+            pts1 = resample_loop(processed_loops[0], 100)
+            pts2 = resample_loop(processed_loops[1], 100)
             
             p0 = np.array(pts1[0])
             dists = [np.linalg.norm(np.array(p) - p0) for p in pts2]
@@ -1881,275 +2161,86 @@ def auto_extract(params: AutoExtractParams):
     broadcast_log(f"[Success] Auto-Extract complete. Found {len(extracted_features)} valid features.")
     return {"features": extracted_features}
 
-@app.post("/generate-hulls")
-def generate_hulls(params: HullParams):
-    if state.mesh is None:
-        raise HTTPException(status_code=400, detail="No mesh loaded.")
-    
-    try:
-        import coacd
-    except ImportError:
-        broadcast_log("[Error] Missing coacd library. Run: pip install coacd")
-        raise HTTPException(status_code=500, detail="coacd module not found.")
-
-    try:
-        math_mesh = state.mesh
-        coacd_threshold = 0.008 + ((100.0 - params.detail_level) / 100.0) * 0.15
-        prep_res = int(30 + (params.detail_level / 100.0) * 50)
-
-        if not params.skip_decimation and len(math_mesh.faces) > params.decimation_target:
-            broadcast_log(f"[System] Decimating mesh down to {params.decimation_target:,} faces...")
-            try:
-                import fast_simplification
-                result = fast_simplification.simplify(
-                    math_mesh.vertices, math_mesh.faces, target_count=params.decimation_target
-                )
-                math_mesh = trimesh.Trimesh(vertices=result[0], faces=result[1])
-                broadcast_log(f"[Success] Decimation complete. (Actual: {len(math_mesh.faces):,} faces)")
-            except Exception as e:
-                broadcast_log(f"[Warning] Decimation skipped: {e}")
-
-        broadcast_log("[System] Launching CoACD Subprocess to capture C++ logs...")
-        
-        fd_in, in_path = tempfile.mkstemp(suffix=".pkl")
-        os.close(fd_in)
-        with open(in_path, 'wb') as f:
-            pickle.dump({
-                'vertices': np.ascontiguousarray(math_mesh.vertices, dtype=np.float64), 
-                'faces': np.ascontiguousarray(math_mesh.faces, dtype=np.int32)
-            }, f)
-        
-        fd_out, out_path = tempfile.mkstemp(suffix=".pkl")
-        os.close(fd_out)
-        
-        safe_in_path = in_path.replace('\\', '/')
-        safe_out_path = out_path.replace('\\', '/')
-        
-        worker_script = f"""
-import coacd
-import pickle
-import numpy as np
-
-if __name__ == '__main__':
-    with open('{safe_in_path}', 'rb') as f:
-        data = pickle.load(f)
-        
-    coacd.set_log_level('info')
-    
-    v = np.ascontiguousarray(data['vertices'], dtype=np.float64)
-    f = np.ascontiguousarray(data['faces'], dtype=np.int32)
-    
-    c_mesh = coacd.Mesh(v, f)
-    parts = coacd.run_coacd(
-        c_mesh, 
-        max_convex_hull={params.max_hulls}, 
-        threshold={coacd_threshold},
-        preprocess_resolution={prep_res},
-        mcts_iterations=100
-    )
-    
-    with open('{safe_out_path}', 'wb') as f:
-        pickle.dump(parts, f)
-"""
-        fd_script, script_path = tempfile.mkstemp(suffix=".py")
-        with open(script_path, 'w') as f:
-            f.write(worker_script)
-        os.close(fd_script)
-        
-        process = subprocess.Popen(
-            [sys.executable, script_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
-        
-        for line in process.stdout:
-            msg = line.strip()
-            if msg:
-                if "[CoACD] [info]" in msg:
-                    msg = msg.split("[CoACD] [info]")[-1].strip()
-                broadcast_log(f"[CoACD] {msg}")
-                
-        process.wait()
-        
-        if process.returncode != 0:
-            raise Exception(f"CoACD Subprocess crashed with code {process.returncode}")
-            
-        with open(out_path, 'rb') as f:
-            parts = pickle.load(f)
-            
-        try:
-            os.remove(in_path)
-            os.remove(out_path)
-            os.remove(script_path)
-        except Exception:
-            pass
-        
-        serialized_hulls = []
-        for vertices, faces in parts:
-            serialized_hulls.append({
-                "vertices": np.array(vertices).tolist(),
-                "faces": np.array(faces).tolist()
-            })
-            
-        broadcast_log(f"[Success] C++ Kernel Finished! Generated {len(serialized_hulls)} clean blocks.")
-        return {"hulls": serialized_hulls}
-        
-    except Exception as e:
-        broadcast_log(f"[Error] CoACD failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"CoACD failed: {str(e)}")
-
-
 @app.post("/export-step")
-async def export_step(payload: dict):
+async def export_step(params: ExportStepParams, background_tasks: BackgroundTasks):
     try:
         import build123d as b3d
-        from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
-    except ImportError as e:
-        raise HTTPException(status_code=500, detail=f"Import Error: {str(e)}. Try deleting your .venv folder and recreating it.")
-        
-    shapes = []
-    merge_hulls = payload.get("merge_hulls", False)
-    symmetry = payload.get("symmetry", {"x": False, "y": False, "z": False})
+        from build123d.exporters3d import export_step as b3d_export_step
+    except ImportError:
+        raise HTTPException(status_code=500, detail="build123d missing")
+
+    broadcast_log(f"[System] Exporting {len(params.active_geo_ids)} active geometries and {len(params.features)} curves to STEP...")
     
-    active_ids = payload.get("active_geo_ids", [])
-    for gid in active_ids:
-        shape = state.rebuild_geometry.get(gid)
-        if shape is not None and hasattr(shape, 'wrapped'):
-            shapes.append(shape)
-        
-    hulls = payload.get("hulls", [])
-    hull_solids = []
+    shapes_to_export = []
     
-    if hulls:
-        broadcast_log(f"[System] Stitching {len(hulls)} triangulated hulls into Solid Bodies...")
-        
-    for idx, hull in enumerate(hulls):
+    for geo_id in params.active_geo_ids:
+        shape = state.rebuild_geometry.get(geo_id)
+        if shape is not None:
+            shapes_to_export.append(shape)
+            
+    for feat in params.features:
         try:
-            pts = [b3d.Vector(v) for v in hull["vertices"]]
-            faces = []
-            for f in hull["faces"]:
-                poly_pts = [pts[i] for i in f]
-                if len(poly_pts) >= 3:
-                    poly_pts.append(poly_pts[0]) 
-                    wire = b3d.Wire.make_polygon(poly_pts)
-                    faces.append(b3d.Face(wire))
+            f_type = feat.get('type')
+            if f_type == 'circle':
+                c = feat.get('center')
+                n = feat.get('normal')
+                r = feat.get('radius')
+                if c and n and r:
+                    plane = b3d.Plane(origin=b3d.Vector(c), z_dir=b3d.Vector(n))
+                    shapes_to_export.append(b3d.Edge.make_circle(radius=r, plane=plane))
             
-            try:
-                sewer = BRepBuilderAPI_Sewing()
-                sewer.SetTolerance(1e-2)
-                for face in faces:
-                    sewer.Add(face.wrapped)
-                sewer.Perform()
-                sewed_shape = sewer.SewedShape()
-                if not sewed_shape.IsNull():
-                    sewed_b3d = b3d.Shape.cast(sewed_shape)
-                else:
-                    sewed_b3d = b3d.Shell.make_shell(faces)
-            except Exception:
-                sewed_b3d = b3d.Shell.make_shell(faces)
+            elif f_type in ['planar', 'plane', 'curve']:
+                pts = feat.get('points', [])
+                if len(pts) >= 2:
+                    vecs = [b3d.Vector(p) for p in pts]
+                    if (vecs[0] - vecs[-1]).length > 1e-4:
+                        vecs.append(vecs[0])
+                    shapes_to_export.append(b3d.Wire.make_polygon(vecs))
+        except Exception as e:
+            broadcast_log(f"[Warning] Skipped a curve during export reconstruction: {e}")
+
+    if not shapes_to_export:
+        broadcast_log("[Error] No active geometry or curves to export.")
+        raise HTTPException(status_code=400, detail="No active geometry to export.")
+
+    final_shape = None
+    if params.merge_hulls and len(shapes_to_export) > 1:
+        try:
+            solids = [s for s in shapes_to_export if isinstance(s, b3d.Solid)]
+            others = [s for s in shapes_to_export if not isinstance(s, b3d.Solid)]
             
-            if isinstance(sewed_b3d, b3d.Shell):
-                try:
-                    hull_solids.append(b3d.Solid.make_solid(sewed_b3d))
-                except:
-                    hull_solids.append(sewed_b3d)
-            elif isinstance(sewed_b3d, b3d.Compound):
-                for shell in sewed_b3d.shells():
-                    try:
-                        hull_solids.append(b3d.Solid.make_solid(shell))
-                    except:
-                        hull_solids.append(shell)
+            if solids:
+                merged_solid = solids[0]
+                for s in solids[1:]:
+                    merged_solid = merged_solid + s
+                final_shape = b3d.Compound(children=[merged_solid] + others)
             else:
-                hull_solids.append(sewed_b3d)
-
-        except Exception as e:
-            broadcast_log(f"[Warning] Failed to process hull #{idx}: {e}")
-            
-    if merge_hulls and len(hull_solids) > 1:
-        broadcast_log("[System] Melting intersecting solids via Boolean Union...")
-        try:
-            fused_shape = hull_solids[0]
-            for next_shape in hull_solids[1:]:
-                fused_shape = fused_shape.fuse(next_shape)
+                final_shape = b3d.Compound(children=shapes_to_export)
                 
-            shapes.append(fused_shape)
-            broadcast_log("[Success] Solids cleanly merged!")
+            broadcast_log("[System] Merged solid geometry for export.")
         except Exception as e:
-            broadcast_log(f"[Warning] Boolean Union hit a zero-thickness error. Falling back to separate blocks.")
-            shapes.extend(hull_solids) 
+            broadcast_log(f"[Warning] Boolean merge failed during export, grouping instead: {e}")
+            final_shape = b3d.Compound(children=shapes_to_export)
     else:
-        shapes.extend(hull_solids)
-            
-    features = payload.get("features", [])
-    if features:
-        broadcast_log(f"[System] Compiling {len(features)} CAD sketches...")
-        
-    for feat in features:
-        try:
-            if feat["type"] == "circle":
-                c = b3d.Vector(feat["center"])
-                n = b3d.Vector(feat["normal"])
-                p = b3d.Plane(origin=c, z_dir=n)
-                shapes.append(b3d.Edge.make_circle(radius=feat["radius"], plane=p))
-                
-            elif feat["type"] == "planar":
-                pts = [b3d.Vector(p) for p in feat["points"]]
-                if (pts[0] - pts[-1]).length > 1e-5:
-                    pts.append(pts[0])
-                shapes.append(b3d.Wire.make_polygon(pts))
-        except Exception as e:
-            broadcast_log(f"[Warning] Failed to build a sketch feature: {e}")
-            
-    shapes = [s for s in shapes if s is not None and hasattr(s, 'wrapped')]
+        final_shape = b3d.Compound(children=shapes_to_export) if len(shapes_to_export) > 1 else shapes_to_export[0]
 
-    if any([symmetry.get('x'), symmetry.get('y'), symmetry.get('z')]):
-        broadcast_log("[System] Applying structural symmetry arrays using build123d.mirror()...")
-        
-        final_shapes = []
-        for s in shapes:
-            final_shapes.append(s)
-
-        try:
-            if symmetry.get('x'):
-                final_shapes.extend([b3d.mirror(s, about=b3d.Plane.YZ) for s in list(final_shapes)])
-            if symmetry.get('y'):
-                final_shapes.extend([b3d.mirror(s, about=b3d.Plane.XZ) for s in list(final_shapes)])
-            if symmetry.get('z'):
-                final_shapes.extend([b3d.mirror(s, about=b3d.Plane.XY) for s in list(final_shapes)])
-            shapes = final_shapes
-        except Exception as mirror_err:
-            broadcast_log(f"[Warning] Symmetry Mirroring failed during export: {mirror_err}")
-
-    if not shapes:
-        broadcast_log("[Error] No geometry found to export.")
-        raise HTTPException(status_code=400, detail="No geometry found to export.")
-        
-    broadcast_log("[System] Writing STEP file to disk...")
     fd, path = tempfile.mkstemp(suffix=".step")
     os.close(fd)
     
+    def remove_temp_file(filepath: str):
+        try: os.remove(filepath)
+        except Exception: pass
+            
     try:
-        try:
-            comp = b3d.Compound(children=shapes)
-        except Exception:
-            comp = b3d.Compound(shapes)
-            
-        if hasattr(comp, 'export_step'):
-            comp.export_step(path)
-        elif hasattr(b3d, 'export_step'):
-            b3d.export_step(comp, path)
-        else:
-            from build123d import exporters3d
-            exporters3d.export_step(comp, path)
-            
-    except Exception as export_error:
-        broadcast_log(f"[Error] Fatal OpenCASCADE crash: {export_error}")
-        raise HTTPException(status_code=500, detail=f"Failed during STEP compilation: {str(export_error)}")
-    
-    broadcast_log("[Success] STEP translation complete! Initiating download.")
-    return FileResponse(path, media_type="application/octet-stream", filename="RetopoCAD_Export.step")
+        b3d_export_step(final_shape, path)
+        broadcast_log(f"[Success] STEP file generated successfully.")
+        background_tasks.add_task(remove_temp_file, path)
+        return FileResponse(path=path, filename="RetopoCAD_Export.step", media_type="application/octet-stream")
+    except Exception as e:
+        background_tasks.add_task(remove_temp_file, path)
+        broadcast_log(f"[Error] STEP export crashed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Export error: {str(e)}")
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

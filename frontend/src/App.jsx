@@ -107,7 +107,6 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
   const hasFaces = selectedItemsData.length > 0 && selectedItemsData.every(i => i.type === 'sheet');
 
   if (selectedLoops.length > 0 && selectedItemsData.length === 0) {
-      
       if (selectedLoops.length === 1) {
           buttons.push({ label: extrudeLabel, icon: isCylinderLoop ? <IconCylinderFill /> : <IconExtrude />, angle: -90, action: onExtrude, disabled: false, color: 'text-blue-400' });
           
@@ -189,7 +188,7 @@ function ActionRing({ anchorPos, selectedLoops, selectedItemsData, extrudeDepth,
   }
 
   return (
-    <div style={{ left: pos.x, top: pos.y }} className="fixed pointer-events-none z-50 flex items-center justify-center -translate-x-1/2 -translate-y-1/2 transition-all duration-200">
+    <div style={{ left: pos.x, top: pos.y }} className="fixed pointer-events-none z-40 flex items-center justify-center -translate-x-1/2 -translate-y-1/2 transition-all duration-200">
        
        <div className="absolute bottom-[130px] flex flex-col items-center gap-1.5 pointer-events-none w-80 text-center">
           {selectionString && (
@@ -322,6 +321,7 @@ export default function App() {
   const [isCommitting, setIsCommitting] = useState(false);
   
   const [patchAnalysis, setPatchAnalysis] = useState(null);
+  const [showBatchModal, setShowBatchModal] = useState(false); // NEW BATCH MODAL STATE
 
   const [symmetry, setSymmetry] = useState({ x: false, y: false, z: false });
   const toggleSymmetry = (axis) => setSymmetry(prev => ({ ...prev, [axis]: !prev[axis] }));
@@ -537,8 +537,10 @@ export default function App() {
     executeGeometryOperation('magic-patch', { patch_faces: selectedLoops[0].patch_faces, sharpness_angle: sharpnessAngle }, 'sheet', 'Patch');
   };
 
+  // --- EXISTING ORGANIC BATCH PIPELINE ---
   const handleBatchMagicPatch = async () => {
     setIsCommitting(true);
+    setServerLogs(prev => [...prev, `[System] Initiating Organic Surface Extraction...`]);
     try {
         const res = await fetch('http://localhost:8000/batch-magic-patch', {
             method: 'POST',
@@ -550,25 +552,78 @@ export default function App() {
         });
         if (res.ok) {
             const data = await res.json();
-            const geoType = data.is_solid ? 'solid' : 'shell';
-            setRebuildHistory(prev => [...prev, {
-                ...data,
-                type: geoType,
-                visible: true,
-                name: `Auto${data.is_solid ? 'Solid' : 'Shell'}_${data.id.substring(0,4)}`,
-                endpoint: 'batch-magic-patch',
-                payload: { sharpness_angle: sharpnessAngle, edge_smoothing: edgeSmoothing / 100.0 },
-                naked_edges: data.naked_edges || []
-            }]);
             
-            setOutlinerExpanded(prev => ({...prev, shells: true, solids: true}));
-            setSelectedItemIds([data.id]);
+            const newGeometries = data.geometries.map(geo => ({
+                ...geo,
+                visible: true,
+            }));
+            
+            setRebuildHistory(prev => [...prev, ...newGeometries]);
+            
+            setOutlinerExpanded(prev => ({...prev, solids: true}));
+            setSelectedItemIds(newGeometries.map(g => g.id));
+            setServerLogs(prev => [...prev, `[Success] Extracted ${newGeometries.length} surfaces. Ready for Booleans.`]);
         } else {
             const err = await res.json();
-            setServerLogs(prev => [...prev, `[Error] Batch Patch failed: ${err.detail}`]);
+            setServerLogs(prev => [...prev, `[Error] Surface extraction failed: ${err.detail}`]);
         }
     } catch (err) {
         setServerLogs(prev => [...prev, `[Error] Network Failure connecting to Backend.`]);
+    }
+    setIsCommitting(false);
+  };
+
+  // --- NEW STRUCTURED MASTER SKELETON PIPELINE ---
+  const handleStructuredPipeline = async () => {
+    setIsCommitting(true);
+    setServerLogs(prev => [...prev, `[System] Initiating Structured CAD Pipeline (3-Pass Classification)...`]);
+
+    try {
+        // Step 1: Extract Base Skeleton
+        setServerLogs(prev => [...prev, `[System] Step 1/3: Extracting underlying wireframe...`]);
+        let res = await fetch('http://localhost:8000/build-skeleton', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sharpness_angle: sharpnessAngle, edge_smoothing: edgeSmoothing / 100.0 })
+        });
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail);
+        }
+
+        // Step 2: Refine/Classify 3D Curves
+        setServerLogs(prev => [...prev, `[System] Step 2/3: Running Andrew's 3-Pass Classification (Circles -> Lines -> Splines)...`]);
+        res = await fetch('http://localhost:8000/refine-skeleton', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ circle_tolerance: 0.05, line_tolerance: 0.05 })
+        });
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail);
+        }
+        let refData = await res.json();
+        setServerLogs(prev => [...prev, `[System] Found: ${refData.metrics.circle} Circles, ${refData.metrics.line} Lines, ${refData.metrics.spline} Splines.`]);
+
+        // Step 3: Inject Faces & Sew Shell
+        setServerLogs(prev => [...prev, `[System] Step 3/3: Surfacing Curve Network...`]);
+        res = await fetch('http://localhost:8000/generate-shell', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail);
+        }
+        let geoData = await res.json();
+
+        setRebuildHistory(prev => [...prev, { ...geoData, type: geoData.is_solid ? 'solid' : 'shell', visible: true, name: `Structured_${geoData.id.substring(0,4)}` }]);
+        setSelectedItemIds([geoData.id]);
+        setOutlinerExpanded(prev => ({...prev, solids: true, shells: true}));
+        setServerLogs(prev => [...prev, `[Success] Master Skeleton surfacing complete. Result: ${geoData.is_solid ? 'Solid' : 'Shell'}`]);
+
+    } catch (err) {
+        setServerLogs(prev => [...prev, `[Error] Pipeline Halted: ${err.message || 'Unknown network error'}`]);
     }
     setIsCommitting(false);
   };
@@ -590,7 +645,7 @@ export default function App() {
                 let newHistory = prev.map(geo => selectedItemIds.includes(geo.id) ? { ...geo, deleted: true } : geo);
                 newHistory.push({ 
                     ...geometryData, 
-                    type: geometryData.is_solid ? 'solid' : 'sheet', 
+                    type: geometryData.is_solid ? 'solid' : 'shell', 
                     id: geoId, 
                     visible: true, 
                     name: `Sewn_${geoId}`, 
@@ -978,6 +1033,33 @@ export default function App() {
         ::-webkit-scrollbar { display: none; }
         * { -ms-overflow-style: none; scrollbar-width: none; overscroll-behavior: none; }
       `}</style>
+
+      {/* --- NEW MODAL FOR BATCH MAGIC WAND --- */}
+      {showBatchModal && (
+        <div className="absolute inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm pointer-events-auto" onClick={() => setShowBatchModal(false)}>
+            <div className="bg-zinc-900 border border-zinc-700 p-6 rounded-xl shadow-2xl flex flex-col gap-4 max-w-md w-full" onClick={e => e.stopPropagation()}>
+                <h3 className="text-lg font-bold text-white uppercase tracking-wider border-b border-zinc-800 pb-2">Select Processing Method</h3>
+
+                <button
+                    onClick={() => { setShowBatchModal(false); handleBatchMagicPatch(); }}
+                    className="flex flex-col text-left p-4 rounded-lg border border-zinc-700 bg-zinc-800 hover:bg-indigo-600/20 hover:border-indigo-500 transition-colors"
+                >
+                    <span className="text-sm font-bold text-indigo-400">Organic (Surface Stitching)</span>
+                    <span className="text-xs text-zinc-400 mt-1 leading-relaxed">Extracts patches and aggressively sews them together. Best for organic shapes, scans, and complex curved topology. Tolerant of small mesh errors.</span>
+                </button>
+
+                <button
+                    onClick={() => { setShowBatchModal(false); handleStructuredPipeline(); }}
+                    className="flex flex-col text-left p-4 rounded-lg border border-zinc-700 bg-zinc-800 hover:bg-emerald-600/20 hover:border-emerald-500 transition-colors"
+                >
+                    <span className="text-sm font-bold text-emerald-400">Structured (CAD Wireframe)</span>
+                    <span className="text-xs text-zinc-400 mt-1 leading-relaxed">Extracts a master skeleton, classifies 3D curves (Circles/Lines), and surfaces the perfect network. <strong className="text-amber-500 font-bold">Requires a perfectly Watertight mesh.</strong></span>
+                </button>
+
+                <button onClick={() => setShowBatchModal(false)} className="mt-2 text-xs font-bold text-zinc-500 hover:text-white uppercase tracking-widest self-center transition-colors">Cancel</button>
+            </div>
+        </div>
+      )}
       
       <ActionRing 
         anchorPos={menuAnchor} 
@@ -1426,10 +1508,10 @@ export default function App() {
             
             <div className="w-full h-px bg-zinc-700/50 my-1"></div>
             
-            {/* NEW BATCH MAGIC PATCH BUTTON */}
+            {/* UPDATED: BATCH MAGIC WAND NOW OPENS MODAL */}
             <button 
               title="Batch Magic Patch" 
-              onClick={handleBatchMagicPatch} 
+              onClick={() => setShowBatchModal(true)} 
               disabled={isCommitting}
               className={`p-2 rounded transition-all flex justify-center items-center ${isCommitting ? 'bg-indigo-900 text-indigo-400 opacity-50' : 'bg-indigo-600/20 text-indigo-400 border border-indigo-500/50 hover:bg-indigo-600 hover:text-white hover:border-indigo-400 shadow-[0_0_10px_rgba(79,70,229,0.3)]'}`}
             >
