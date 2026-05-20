@@ -1374,10 +1374,15 @@ async def scout_loop(params: Point3D):
             
         ordered_points = math_mesh.vertices[ordered_nodes]
         
+        # --- NEW: Extract and format corners for UI Debugging ---
+        corner_indices = find_dynamic_corners(ordered_points, params.sharpness_angle)
+        corner_pts = [ordered_points[i].tolist() for i in corner_indices]
+        
         return {
             "id": patch_id,
             "type": "planar",
             "points": ordered_points.tolist(),
+            "corners": corner_pts, # Added to light up the UI
             "patch_faces": ref_target_region.tolist() 
         }
     except Exception as e:
@@ -2340,9 +2345,15 @@ def auto_extract(params: AutoExtractParams):
                         ordered_nodes = list(nx.dfs_preorder_nodes(subgraph))
                     
                     ordered_points = mesh.vertices[ordered_nodes]
+                    
+                    # Extract and format corners for UI Debugging 
+                    corner_indices = find_dynamic_corners(ordered_points, params.sharpness_angle)
+                    corner_pts = [ordered_points[i].tolist() for i in corner_indices]
+
                     extracted_features.append({
                         "type": "planar",
                         "points": ordered_points.tolist(),
+                        "corners": corner_pts, # Added
                         "normal": region_normal.tolist(),
                         "patch_faces": comp.tolist(),
                         "id": f"wire_{uuid.uuid4().hex[:8]}"

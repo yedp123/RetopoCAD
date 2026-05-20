@@ -215,7 +215,7 @@ function CircleCurve({ feature, centerOffset, hoveredOverride, originalMeshes, i
 
 function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, originalMeshes, disabled, isSelected }) {
   const [hovered, setHovered] = useState(false);
-  const { points } = feature;
+  const { points, corners } = feature; // <--- Extract corners from feature
 
   const geometry = useMemo(() => {
     if (!points?.length) return null;
@@ -226,6 +226,16 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, orig
         return new THREE.BufferGeometry().setFromPoints(pts);
     } catch (e) { return null; }
   }, [points, centerOffset]);
+
+  // --- NEW: Generate Geometry for Debug Corners ---
+  const cornerGeo = useMemo(() => {
+    if (!corners || corners.length === 0) return null;
+    try {
+        const pts = corners.map(c => new THREE.Vector3(...c));
+        if (centerOffset) pts.forEach(p => p.sub(centerOffset));
+        return new THREE.BufferGeometry().setFromPoints(pts);
+    } catch (e) { return null; }
+  }, [corners, centerOffset]);
 
   if (!geometry) return null;
 
@@ -248,6 +258,13 @@ function PlanarCurve({ feature, centerOffset, customColor, hoveredOverride, orig
       >
         <lineBasicMaterial color={activeColor} linewidth={finalHover || isSelected ? 3 : 2} depthTest={false} />
       </line>
+
+      {/* --- NEW: Render Debug Dots (Always on top, fixed screen size) --- */}
+      {cornerGeo && (
+        <points geometry={cornerGeo}>
+          <pointsMaterial color="#fbbf24" size={8} sizeAttenuation={false} depthTest={false} />
+        </points>
+      )}
     </group>
   );
 }
