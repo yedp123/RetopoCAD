@@ -804,11 +804,30 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
     # Without this, edges have separate vertex objects at the same position,
     # which prevents OCCT from recognizing topological connections between faces.
     try:
-        from OCP.BRep import BRep_Tool, BRep_Builder
+        from OCP.BRep import BRep_Tool as _BRepTool
         from OCP.TopLoc import TopLoc_Location
         from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeVertex
         from OCP.TopoDS import TopoDS
         from OCP.TopExp import TopExp
+        
+        # Detect which API style python-ocp uses (some versions use _s suffix for statics)
+        _has_curve_s = hasattr(_BRepTool, 'Curve_s')
+        _has_pnt_s = hasattr(_BRepTool, 'Pnt_s')
+        
+        def _brep_curve(edge_shape):
+            """Get curve from edge, handling both OCP API styles."""
+            loc = TopLoc_Location()
+            if _has_curve_s:
+                return _BRepTool.Curve_s(edge_shape, loc)
+            else:
+                return _BRepTool.Curve(edge_shape, loc)
+        
+        def _brep_pnt(vertex):
+            """Get point from vertex, handling both OCP API styles."""
+            if _has_pnt_s:
+                return _BRepTool.Pnt_s(vertex)
+            else:
+                return _BRepTool.Pnt(vertex)
         
         junction_occt_verts = {}
         for jv in junction_verts:
@@ -828,12 +847,18 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
             
             edge = chain_b3d_edges[chain_idx]
             try:
-                loc = TopLoc_Location()
-                curve_result = BRep_Tool.Curve(edge.wrapped, loc)
+                curve_result = _brep_curve(edge.wrapped)
                 
                 # BRep_Tool.Curve returns (Handle_Geom_Curve, first_param, last_param)
                 if curve_result is None:
-                    share_errors.append(f"chain {chain_idx}: Curve returned None")
+                    # Fallback: just make a line edge with shared vertices
+                    maker = BRepBuilderAPI_MakeEdge(
+                        junction_occt_verts[jv_start],
+                        junction_occt_verts[jv_end]
+                    )
+                    if maker.IsDone():
+                        chain_b3d_edges[chain_idx] = b3d.Edge(maker.Edge())
+                        shared_count += 1
                     continue
                     
                 curve_handle = curve_result[0]
@@ -841,9 +866,7 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
                 u_last = curve_result[2]
                 
                 if curve_handle is None or curve_handle.IsNull():
-                    # For degenerate/line edges, try making a fresh line edge with shared verts
-                    p1 = BRep_Tool.Pnt(TopExp.FirstVertex_s(edge.wrapped))
-                    p2 = BRep_Tool.Pnt(TopExp.LastVertex_s(edge.wrapped))
+                    # For degenerate/line edges, make a fresh line edge with shared verts
                     maker = BRepBuilderAPI_MakeEdge(
                         junction_occt_verts[jv_start],
                         junction_occt_verts[jv_end]

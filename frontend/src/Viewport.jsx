@@ -585,16 +585,37 @@ function GhostModel({
     let curveHit = null;
     let solidHit = null;
 
+    // Build a set of visible (non-deleted) geometry IDs for filtering
+    const visibleGeoIds = new Set();
+    rebuildHistory?.forEach(geo => {
+      if (geo.visible !== false && !geo.deleted) {
+        visibleGeoIds.add(geo.id);
+      }
+    });
+
     for (let i = 0; i < intersections.length; i++) {
         const object = intersections[i].object;
         if (!object.visible) continue;
         
+        // Check for curve hit first (curves have priority)
         if (object.userData && object.userData.isCurve) {
             curveHit = intersections[i];
             break; 
         }
-        if (!solidHit && object.parent && object.parent.userData && object.parent.userData.isSolidGroup) {
-            solidHit = intersections[i];
+        
+        // Walk up the parent chain to find the isSolidGroup ancestor
+        if (!solidHit) {
+            let parent = object.parent;
+            while (parent) {
+                if (parent.userData && parent.userData.isSolidGroup) {
+                    // Only accept this hit if the geometry is visible and not deleted
+                    if (visibleGeoIds.has(parent.userData.id)) {
+                        solidHit = { ...intersections[i], _solidGroupId: parent.userData.id };
+                    }
+                    break;
+                }
+                parent = parent.parent;
+            }
         }
     }
 
@@ -608,7 +629,7 @@ function GhostModel({
         onSelectLoop({ ...feature, clickPoint: { x: rawPoint.x, y: rawPoint.y, z: rawPoint.z } }, { x: screenX, y: screenY });
         if (scoutLoop) setScoutLoop(null);
     } else if (solidHit) {
-        const id = solidHit.object.parent.userData.id;
+        const id = solidHit._solidGroupId;
         onSelectSolid(id, { x: screenX, y: screenY }, e);
     } else if (scoutLoop) {
         const worldPoint = e.point.clone();
