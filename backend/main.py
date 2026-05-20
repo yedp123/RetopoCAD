@@ -710,18 +710,59 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
 
     broadcast_log(f"[System] Created {len(chain_b3d_edges)} canonical B3D edges (exactly 1 per shared boundary).")
 
+    # --- VERTEX SHARING: Re-build edges with shared OCCT TopoDS_Vertex objects ---
+    # Without this, edges have separate vertex objects at the same position,
+    # which prevents OCCT from recognizing topological connections between faces.
+    from OCP.BRep import BRep_Tool
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeVertex
+    
+    junction_occt_verts = {}
+    for jv in junction_verts:
+        pos = state.mesh.vertices[jv]
+        pnt = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
+        junction_occt_verts[jv] = BRepBuilderAPI_MakeVertex(pnt).Vertex()
+    
+    shared_count = 0
+    for chain_idx in list(chain_b3d_edges.keys()):
+        chain_verts_list, _ = edge_chains[chain_idx]
+        jv_start = chain_verts_list[0]
+        jv_end = chain_verts_list[-1]
+        
+        if jv_start not in junction_occt_verts or jv_end not in junction_occt_verts:
+            continue
+        
+        edge = chain_b3d_edges[chain_idx]
+        try:
+            loc = TopLoc_Location()
+            curve_handle, u_first, u_last = BRep_Tool.Curve(edge.wrapped, loc)
+            if curve_handle is not None:
+                maker = BRepBuilderAPI_MakeEdge(
+                    curve_handle,
+                    junction_occt_verts[jv_start],
+                    junction_occt_verts[jv_end],
+                    u_first, u_last
+                )
+                if maker.IsDone():
+                    chain_b3d_edges[chain_idx] = b3d.Edge(maker.Edge())
+                    shared_count += 1
+        except Exception:
+            pass  # Keep original edge if re-making fails
+    
+    broadcast_log(f"[System] Enforced vertex sharing on {shared_count}/{len(chain_b3d_edges)} edges across {len(junction_occt_verts)} junctions.")
+
     # =====================================================================
     # PHASE 3: ASSIGN EDGES TO COMPONENTS & BUILD SURFACES
     # =====================================================================
     
-    # 3a. For each component, find which chains bound it
+    # 3a. For each component, find which chains bound it (deduplicated)
     comp_to_chains = {ci: [] for ci in valid_comp_indices}
     for chain_idx, (chain_verts, comp_pairs) in enumerate(edge_chains):
         if chain_idx not in chain_b3d_edges:
             continue
         for pair in comp_pairs:
             for ci in pair:
-                if ci in comp_to_chains:
+                if ci in comp_to_chains and chain_idx not in comp_to_chains[ci]:
                     comp_to_chains[ci].append(chain_idx)
     
     # 3b. Process components in planarity order (flattest first)
@@ -738,13 +779,13 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
         cycle_edges = []
         
         # We need to order the chains into a proper loop.
-        # Build a mini-graph of junction connections for this component.
-        junction_graph = nx.Graph()
+        # Use MultiGraph to handle parallel edges between the same junction pair.
+        junction_graph = nx.MultiGraph()
         for ch_idx in chain_indices:
             if ch_idx not in chain_junction_keys:
                 continue
             kA, kB = chain_junction_keys[ch_idx]
-            junction_graph.add_edge(kA, kB, chain_idx=ch_idx)
+            junction_graph.add_edge(kA, kB, key=ch_idx, chain_idx=ch_idx)
         
         if len(junction_graph.edges()) == 0:
             continue
@@ -754,12 +795,18 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
             # For components that form a closed loop
             cycle_path = nx.find_cycle(junction_graph)
             ordered_chain_indices = []
-            for u, v, _ in cycle_path:
-                edata = junction_graph.edges[u, v]
+            for cycle_entry in cycle_path:
+                u, v = cycle_entry[0], cycle_entry[1]
+                # For MultiGraph, get the edge key (chain_idx) from the cycle entry
+                if len(cycle_entry) >= 3:
+                    edge_key = cycle_entry[2]
+                    edata = junction_graph.edges[u, v, edge_key]
+                else:
+                    # Fallback: get any edge between u and v
+                    edata = list(junction_graph[u][v].values())[0]
                 ch_idx = edata['chain_idx']
                 kA, kB = chain_junction_keys[ch_idx]
                 
-                edge = chain_b3d_edges[ch_idx]
                 # Determine if we need to reverse this edge
                 if kA == u:
                     ordered_chain_indices.append((ch_idx, False))
@@ -838,7 +885,10 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
 
         # --- THE INVINCIBLE FALLBACK HIERARCHY ---
         face = None
+        mse_val = comp_planarity.get(ci, 999.0)
+        is_organic = mse_val > 0.5  # High MSE = curved/organic surface
 
+        # STRATEGY 1: Analytic surface + edge constraints (best for plane/cylinder)
         if geom_surf is not None:
             try:
                 filler = BRepOffsetAPI_MakeFilling()
@@ -850,22 +900,93 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
                     if f.is_valid: face = f
             except: pass
 
+        # STRATEGY 2: Direct surface from curves (only works with 2-4 edges)
         if face is None and len(cycle_edges) in [2, 3, 4]:
             try: 
                 f = b3d.Face.make_surface_from_curves(cycle_edges)
                 if f.is_valid: face = f
             except: pass
 
+        # STRATEGY 3: MakeFilling with INTERIOR POINT CONSTRAINTS from original mesh
+        # This is the critical path for organic surfaces - we sample points from the
+        # component's actual mesh faces to guide the surface curvature
         if face is None:
             try:
+                from OCP.gp import gp_Pnt as gp_Pnt_filling
                 filler = BRepOffsetAPI_MakeFilling()
                 for edge in cycle_edges: filler.Add(edge.wrapped, GeomAbs_C0)
+                
+                # Sample interior points from the original mesh component
+                if len(internal_pts) >= 3:
+                    pts_arr = np.array(internal_pts)
+                    # For organic surfaces, use more points for better curvature capture
+                    max_constraint_pts = 30 if is_organic else 15
+                    
+                    if len(pts_arr) > max_constraint_pts:
+                        # Subsample evenly across the point cloud
+                        indices = np.linspace(0, len(pts_arr) - 1, max_constraint_pts, dtype=int)
+                        sample_pts = pts_arr[indices]
+                    else:
+                        sample_pts = pts_arr
+                    
+                    pts_added = 0
+                    for sp in sample_pts:
+                        try:
+                            filler.Add(gp_Pnt_filling(float(sp[0]), float(sp[1]), float(sp[2])))
+                            pts_added += 1
+                        except: pass
+                
                 filler.Build()
                 if filler.IsDone(): 
                     f = b3d.Face(filler.Shape())
                     if f.is_valid: face = f
             except: pass
 
+        # STRATEGY 4: MakeFilling with relaxed tolerances + interior points
+        # Some complex organic shapes need more flexible tolerances
+        if face is None:
+            for fill_tol in [1e-2, 0.05, 0.1]:
+                try:
+                    from OCP.gp import gp_Pnt as gp_Pnt_filling2
+                    filler = BRepOffsetAPI_MakeFilling(3, 15, int(max(5, len(cycle_edges) * 2)), False, fill_tol, fill_tol, fill_tol * 0.1, fill_tol * 10)
+                    for edge in cycle_edges: filler.Add(edge.wrapped, GeomAbs_C0)
+                    
+                    if len(internal_pts) >= 3:
+                        pts_arr = np.array(internal_pts)
+                        sample_count = min(20, len(pts_arr))
+                        if len(pts_arr) > sample_count:
+                            indices = np.linspace(0, len(pts_arr) - 1, sample_count, dtype=int)
+                            sample_pts = pts_arr[indices]
+                        else:
+                            sample_pts = pts_arr
+                        
+                        for sp in sample_pts:
+                            try:
+                                filler.Add(gp_Pnt_filling2(float(sp[0]), float(sp[1]), float(sp[2])))
+                            except: pass
+                    
+                    filler.Build()
+                    if filler.IsDone(): 
+                        f = b3d.Face(filler.Shape())
+                        if f.is_valid: 
+                            face = f
+                            break
+                except: pass
+
+        # STRATEGY 5: Build a wire and make face from wire (works for simpler cases)
+        if face is None:
+            try:
+                from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeWire
+                wire_builder = BRepBuilderAPI_MakeWire()
+                for edge in cycle_edges:
+                    wire_builder.Add(edge.wrapped)
+                if wire_builder.IsDone():
+                    wire = b3d.Wire(wire_builder.Wire())
+                    f = b3d.Face.make_from_wires(wire)
+                    if f.is_valid: face = f
+            except: pass
+
+        # STRATEGY 6: Convex hull polygon fallback (last resort for anything)
         if face is None:
             try:
                 from scipy.spatial import ConvexHull
@@ -911,6 +1032,8 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
 
         if face is not None:
             b3d_faces.append(face)
+        else:
+            broadcast_log(f"[Warning] Component {ci} failed all face strategies (MSE: {mse_val:.3f}, edges: {len(cycle_edges)}, organic: {is_organic})")
 
     broadcast_log(f"[System] Generated {len(b3d_faces)} CAD faces from {len(sorted_comp_indices)} components.")
 
@@ -928,7 +1051,9 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
     is_solid = False
     final_geo = None
     
-    tolerances_to_try = [1e-3, 1e-2, 0.05, 0.1] 
+    # Wider tolerance range - vertex sharing should make tight tolerances work,
+    # but we keep wider ones as fallbacks for any remaining gaps
+    tolerances_to_try = [1e-4, 1e-3, 1e-2, 0.05, 0.1, 0.2, 0.5] 
     
     for tol in tolerances_to_try:
         sewer = BRepBuilderAPI_Sewing()
