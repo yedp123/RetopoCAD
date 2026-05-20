@@ -573,7 +573,27 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
     
     clamped_tension = max(0.01, params.edge_smoothing / 100.0 if params.edge_smoothing > 1 else params.edge_smoothing)
 
-    for loop_idx, raw_pts in enumerate(snapped_loops):
+    # --- NEW: PLANARITY HIERARCHY SORTING ---
+    # We calculate the Mean Squared Error (MSE) of each patch against a perfect mathematical plane.
+    # We sort the loops so the absolute flattest patches generate their edges FIRST.
+    # Organic surfaces will then be forced to inherit these clean, strict guidelines.
+    loop_planarity = []
+    for loop_idx, internal_pts in enumerate(comp_verts):
+        mse = 999.0
+        if len(internal_pts) >= 3:
+            pts = np.array(internal_pts)
+            centroid = np.mean(pts, axis=0)
+            _, _, vh = np.linalg.svd(pts - centroid)
+            plane_normal = vh[2, :]
+            mse = float(np.mean((np.dot(pts - centroid, plane_normal))**2))
+        loop_planarity.append((loop_idx, mse))
+
+    sorted_loop_indices = [x[0] for x in sorted(loop_planarity, key=lambda x: x[1])]
+    broadcast_log(f"[System] Planarity Hierarchy locked. Flat surfaces will dictate boundary guidelines.")
+    # ----------------------------------------
+
+    for loop_idx in sorted_loop_indices:
+        raw_pts = snapped_loops[loop_idx]
         if len(raw_pts) < 4: continue
         
         corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
@@ -601,7 +621,7 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
             pA = corner_pts[i]
             pB = corner_pts[(i+1)%len(corners)]
             
-            # UNIQUE STRING KEY LOGIC
+            # UNIQUE STRING KEY LOGIC (Direction-agnostic Handshake)
             key_A = f"{int(round(pA[0]*10000))}_{int(round(pA[1]*10000))}_{int(round(pA[2]*10000))}"
             key_B = f"{int(round(pB[0]*10000))}_{int(round(pB[1]*10000))}_{int(round(pB[2]*10000))}"
 
@@ -611,20 +631,18 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
             else:
                 edge_key = f"{key_B}___{key_A}"
                 is_reversed = True
-
+            
             if edge_key not in edge_registry:
                 new_edge = create_tension_edge(seg_pts, pA, pB, tension=clamped_tension)
                 if new_edge:
                     edge_registry[edge_key] = new_edge
-
+            
             if edge_key in edge_registry:
                 existing_edge = edge_registry[edge_key]
                 if is_reversed:
                     try:
-                        # Attempt native build123d reverse function
                         cycle_edges.append(existing_edge.reversed())
                     except AttributeError:
-                        # Fallback for underlying OCP object reversal
                         cycle_edges.append(b3d.Edge(existing_edge.wrapped.Reversed()))
                 else:
                     cycle_edges.append(existing_edge)
