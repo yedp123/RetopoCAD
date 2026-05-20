@@ -601,17 +601,33 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
             pA = corner_pts[i]
             pB = corner_pts[(i+1)%len(corners)]
             
-            keyA = tuple(np.round(pA, 4))
-            keyB = tuple(np.round(pB, 4))
-            edge_key = tuple(sorted([keyA, keyB]))
-            
+            # UNIQUE STRING KEY LOGIC
+            key_A = f"{int(round(pA[0]*10000))}_{int(round(pA[1]*10000))}_{int(round(pA[2]*10000))}"
+            key_B = f"{int(round(pB[0]*10000))}_{int(round(pB[1]*10000))}_{int(round(pB[2]*10000))}"
+
+            if key_A <= key_B:
+                edge_key = f"{key_A}___{key_B}"
+                is_reversed = False
+            else:
+                edge_key = f"{key_B}___{key_A}"
+                is_reversed = True
+
             if edge_key not in edge_registry:
                 new_edge = create_tension_edge(seg_pts, pA, pB, tension=clamped_tension)
                 if new_edge:
                     edge_registry[edge_key] = new_edge
-            
+
             if edge_key in edge_registry:
-                cycle_edges.append(edge_registry[edge_key])
+                existing_edge = edge_registry[edge_key]
+                if is_reversed:
+                    try:
+                        # Attempt native build123d reverse function
+                        cycle_edges.append(existing_edge.reversed())
+                    except AttributeError:
+                        # Fallback for underlying OCP object reversal
+                        cycle_edges.append(b3d.Edge(existing_edge.wrapped.Reversed()))
+                else:
+                    cycle_edges.append(existing_edge)
 
         if len(cycle_edges) >= 3:
             geom_surf = None
