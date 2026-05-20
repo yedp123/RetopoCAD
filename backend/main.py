@@ -501,233 +501,391 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
     from OCP.gp import gp_Pln, gp_Pnt, gp_Dir, gp_Ax3
     from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
     
-    broadcast_log(f"[System] Initiating Organic Surface Extraction...")
+    broadcast_log(f"[System] Initiating Organic Surface Extraction (Global Skeleton-First)...")
 
-    # 1. Component Extraction
+    # =====================================================================
+    # PHASE 1: GLOBAL TOPOLOGY - Extract the shared skeleton BEFORE surfaces
+    # =====================================================================
+
+    # 1a. Component Extraction - assign every face to a component
     components = get_patch_components(state.mesh, params.sharpness_angle)
-    loops_pts = []
-    comp_verts = []
     
-    for comp in components:
+    # Build face-to-component lookup
+    face_to_comp = np.full(len(state.mesh.faces), -1, dtype=int)
+    valid_comp_indices = []
+    comp_verts_map = {}  # comp_idx -> vertices of the component's faces
+    for ci, comp in enumerate(components):
         if len(comp) < 3: continue
-        faces = state.mesh.faces[comp]
-        edges = trimesh.geometry.faces_to_edges(faces)
-        edges_sorted = np.sort(edges, axis=1)
-        unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
-        boundary_edges = unique_edges[counts == 1]
-        if len(boundary_edges) == 0: continue
-        
-        G = nx.Graph()
-        G.add_edges_from(boundary_edges)
-        try:
-            cycle = nx.find_cycle(G)
-            ordered_nodes = [u for u, v in cycle]
-        except:
-            ordered_nodes = list(nx.dfs_preorder_nodes(G))
-            
-        loops_pts.append(state.mesh.vertices[ordered_nodes])
-        comp_verts.append(state.mesh.vertices[np.unique(faces)])
+        valid_comp_indices.append(ci)
+        for fi in comp:
+            face_to_comp[fi] = ci
+        comp_faces = state.mesh.faces[comp]
+        comp_verts_map[ci] = state.mesh.vertices[np.unique(comp_faces)]
 
-    if not loops_pts:
-        msg = "No boundary loops found. Try adjusting the sharpness angle."
+    if not valid_comp_indices:
+        msg = "No valid patch components found. Try adjusting the sharpness angle."
         broadcast_log(f"[Error] {msg}")
         raise HTTPException(status_code=400, detail=msg)
 
-    # 2. Point Welding & Skeleton Construction
-    all_pts = np.vstack(loops_pts)
-    tree = scipy.spatial.cKDTree(all_pts)
-    pairs = tree.query_pairs(r=0.01)
+    # 1b. Find ALL sharp edges globally (edges where adjacent faces belong to different components)
+    adjacency = state.mesh.face_adjacency
+    angles = state.mesh.face_adjacency_angles
+    threshold_rad = np.radians(params.sharpness_angle)
     
-    parent = {i: i for i in range(len(all_pts))}
-    def find(i):
-        if parent[i] == i: return i
-        parent[i] = find(parent[i])
-        return parent[i]
-    def union(i, j):
-        root_i = find(i)
-        root_j = find(j)
-        if root_i != root_j:
-            parent[root_i] = root_j
+    sharp_mask = angles >= threshold_rad
+    sharp_face_pairs = adjacency[sharp_mask]
     
-    for i, j in pairs: union(i, j)
-        
-    merged_positions = {}
-    for i in range(len(all_pts)):
-        root = find(i)
-        if root not in merged_positions:
-            merged_positions[root] = all_pts[root]
-            
-    snapped_loops = []
-    idx_counter = 0
-    for raw_pts in loops_pts:
-        snapped = []
-        for _ in range(len(raw_pts)):
-            root = find(idx_counter)
-            snapped.append(merged_positions[root])
-            idx_counter += 1
-        snapped_loops.append(np.array(snapped))
+    # Get the actual mesh edges (vertex pairs) for each sharp face adjacency
+    adjacency_edges = state.mesh.face_adjacency_edges
+    sharp_vertex_edges = adjacency_edges[sharp_mask]
+    
+    if len(sharp_vertex_edges) == 0:
+        msg = "No sharp edges detected. Try lowering the sharpness angle."
+        broadcast_log(f"[Error] {msg}")
+        raise HTTPException(status_code=400, detail=msg)
 
-    # 3. Edge Registry & Analytic Surface Generation
-    edge_registry = {}
-    b3d_faces = []
+    broadcast_log(f"[System] Found {len(sharp_vertex_edges)} sharp edges across {len(valid_comp_indices)} components.")
+
+    # 1c. Build global sharp-edge graph from mesh vertex indices
+    sharp_graph = nx.Graph()
+    for edge_idx, (v0, v1) in enumerate(sharp_vertex_edges):
+        # Store which two components this edge separates
+        f0, f1 = sharp_face_pairs[edge_idx]
+        c0, c1 = face_to_comp[f0], face_to_comp[f1]
+        sharp_graph.add_edge(int(v0), int(v1), comp_pair=tuple(sorted([c0, c1])))
+
+    # 1d. Find JUNCTION vertices (degree != 2) — these are the TRUE topological corners
+    # Degree 1 = boundary endpoint, Degree 3+ = where 3+ surfaces meet
+    junction_verts = set()
+    for v in sharp_graph.nodes():
+        if sharp_graph.degree(v) != 2:
+            junction_verts.add(v)
+
+    # If no junctions found (e.g., all closed loops), break loops at arbitrary points
+    if not junction_verts:
+        for cc in nx.connected_components(sharp_graph):
+            cc_list = list(cc)
+            if len(cc_list) > 0:
+                junction_verts.add(cc_list[0])
     
+    broadcast_log(f"[System] Found {len(junction_verts)} topological junction vertices (true corners).")
+
+    # 1e. Walk between junctions to extract CHAINS (each chain = one shared edge curve)
+    # A chain is a path of vertices from one junction to the next, along sharp edges.
+    visited_edges = set()
+    edge_chains = []  # List of (chain_vertices, set_of_comp_pairs)
+    
+    for start_v in junction_verts:
+        for neighbor in sharp_graph.neighbors(start_v):
+            edge_key = (min(start_v, neighbor), max(start_v, neighbor))
+            if edge_key in visited_edges:
+                continue
+            
+            # Walk from start_v through neighbor until we hit another junction
+            chain = [start_v, neighbor]
+            visited_edges.add(edge_key)
+            comp_pairs_on_chain = set()
+            edata = sharp_graph.edges[start_v, neighbor]
+            if 'comp_pair' in edata:
+                comp_pairs_on_chain.add(edata['comp_pair'])
+            
+            current = neighbor
+            prev = start_v
+            while current not in junction_verts:
+                # Find the next vertex (the one that isn't prev)
+                neighbors = list(sharp_graph.neighbors(current))
+                next_v = None
+                for n in neighbors:
+                    if n != prev:
+                        ek = (min(current, n), max(current, n))
+                        if ek not in visited_edges:
+                            next_v = n
+                            break
+                if next_v is None:
+                    break
+                
+                ek = (min(current, next_v), max(current, next_v))
+                visited_edges.add(ek)
+                edata = sharp_graph.edges[current, next_v]
+                if 'comp_pair' in edata:
+                    comp_pairs_on_chain.add(edata['comp_pair'])
+                chain.append(next_v)
+                prev = current
+                current = next_v
+            
+            if len(chain) >= 2:
+                edge_chains.append((chain, comp_pairs_on_chain))
+
+    broadcast_log(f"[System] Extracted {len(edge_chains)} shared edge chains between junctions.")
+
+    # =====================================================================
+    # PHASE 2: CREATE EXACTLY ONE B3D EDGE PER CHAIN
+    # =====================================================================
+
     clamped_tension = max(0.01, params.edge_smoothing / 100.0 if params.edge_smoothing > 1 else params.edge_smoothing)
 
-    # --- NEW: PLANARITY HIERARCHY SORTING ---
-    # We calculate the Mean Squared Error (MSE) of each patch against a perfect mathematical plane.
-    # We sort the loops so the absolute flattest patches generate their edges FIRST.
-    # Organic surfaces will then be forced to inherit these clean, strict guidelines.
-    loop_planarity = []
-    for loop_idx, internal_pts in enumerate(comp_verts):
+    # 2a. Compute planarity for each component (for processing order)
+    comp_planarity = {}
+    for ci in valid_comp_indices:
         mse = 999.0
+        internal_pts = comp_verts_map.get(ci, np.array([]))
         if len(internal_pts) >= 3:
             pts = np.array(internal_pts)
             centroid = np.mean(pts, axis=0)
             _, _, vh = np.linalg.svd(pts - centroid)
             plane_normal = vh[2, :]
             mse = float(np.mean((np.dot(pts - centroid, plane_normal))**2))
-        loop_planarity.append((loop_idx, mse))
+        comp_planarity[ci] = mse
 
-    sorted_loop_indices = [x[0] for x in sorted(loop_planarity, key=lambda x: x[1])]
-    broadcast_log(f"[System] Planarity Hierarchy locked. Flat surfaces will dictate boundary guidelines.")
-    # ----------------------------------------
+    # 2b. For each chain, determine which component is "flatter" (lower MSE) and use
+    #     that side's vertex positions to define the canonical edge geometry.
+    #     The key insight: the chain vertices are mesh vertex INDICES shared by both sides.
+    #     The 3D positions are the same (same mesh vertices), but we process flatter 
+    #     components first so their edges take priority in the registry.
+    
+    chain_b3d_edges = {}  # chain_index -> b3d.Edge
+    chain_junction_keys = {}  # chain_index -> (key_start, key_end)
+    
+    # Sort chains by the planarity of their flattest adjacent component
+    def chain_priority(chain_idx):
+        _, comp_pairs = edge_chains[chain_idx]
+        min_mse = 999.0
+        for pair in comp_pairs:
+            for ci in pair:
+                if ci in comp_planarity:
+                    min_mse = min(min_mse, comp_planarity[ci])
+        return min_mse
+    
+    sorted_chain_indices = sorted(range(len(edge_chains)), key=chain_priority)
 
-    for loop_idx in sorted_loop_indices:
-        raw_pts = snapped_loops[loop_idx]
-        if len(raw_pts) < 4: continue
+    for chain_idx in sorted_chain_indices:
+        chain_verts, comp_pairs = edge_chains[chain_idx]
+        chain_pts = state.mesh.vertices[chain_verts]
         
-        corners = find_dynamic_corners(raw_pts, params.sharpness_angle)
-        if len(corners) < 3:
-            diffs = np.linalg.norm(raw_pts - np.roll(raw_pts, 1, axis=0), axis=1)
-            cum_dists = np.cumsum(diffs)
-            total_len = cum_dists[-1]
-            targets = [0, total_len * 0.25, total_len * 0.5, total_len * 0.75]
-            corners = []
-            for t in targets:
-                idx = np.searchsorted(cum_dists, t)
-                corners.append(min(idx, len(raw_pts) - 1))
-            corners = sorted(list(set(corners)))
-            if len(corners) < 3:
-                corners = [0, len(raw_pts)//3, 2*len(raw_pts)//3]
+        if len(chain_pts) < 2:
+            continue
+
+        pA = chain_pts[0]
+        pB = chain_pts[-1]
         
-        corner_pts = [raw_pts[c] for c in corners]
-        cycle_edges = []
-
-        for i in range(len(corners)):
-            start_idx = corners[i]
-            end_idx = corners[(i + 1) % len(corners)]
-            
-            seg_pts = extract_segment(raw_pts, start_idx, end_idx)
-            pA = corner_pts[i]
-            pB = corner_pts[(i+1)%len(corners)]
-            
-            # UNIQUE STRING KEY LOGIC (Direction-agnostic Handshake)
-            key_A = f"{int(round(pA[0]*10000))}_{int(round(pA[1]*10000))}_{int(round(pA[2]*10000))}"
-            key_B = f"{int(round(pB[0]*10000))}_{int(round(pB[1]*10000))}_{int(round(pB[2]*10000))}"
-
-            if key_A <= key_B:
-                edge_key = f"{key_A}___{key_B}"
-                is_reversed = False
+        # Create the canonical edge — corners are EXACTLY at junction vertices
+        start_v = b3d.Vector(float(pA[0]), float(pA[1]), float(pA[2]))
+        end_v = b3d.Vector(float(pB[0]), float(pB[1]), float(pB[2]))
+        
+        if (start_v - end_v).length < 1e-6:
+            continue
+        
+        try:
+            if len(chain_pts) <= 2:
+                edge = b3d.Edge.make_line(start_v, end_v)
             else:
-                edge_key = f"{key_B}___{key_A}"
-                is_reversed = True
-            
-            if edge_key not in edge_registry:
-                new_edge = create_tension_edge(seg_pts, pA, pB, tension=clamped_tension)
-                if new_edge:
-                    edge_registry[edge_key] = new_edge
-            
-            if edge_key in edge_registry:
-                existing_edge = edge_registry[edge_key]
-                if is_reversed:
-                    try:
-                        cycle_edges.append(existing_edge.reversed())
-                    except AttributeError:
-                        cycle_edges.append(b3d.Edge(existing_edge.wrapped.Reversed()))
-                else:
-                    cycle_edges.append(existing_edge)
-
-        if len(cycle_edges) >= 3:
-            geom_surf = None
-            internal_pts = comp_verts[loop_idx]
-            
-            # --- EVALUATE ANALYTIC BASE ---
-            if len(internal_pts) >= 15:
-                pts = np.array(internal_pts)
-                centroid = np.mean(pts, axis=0)
-                _, _, vh = np.linalg.svd(pts - centroid)
-                plane_normal = vh[2, :]
-                plane_mse = float(np.mean((np.dot(pts - centroid, plane_normal))**2))
+                # Sample interior points, always pinning start and end exactly
+                target_count = int(len(chain_pts) * (1.0 - clamped_tension))
+                target_count = max(4, min(target_count, len(chain_pts)))
+                indices = np.linspace(0, len(chain_pts) - 1, target_count, dtype=int)
                 
-                cyl_mse = float('inf')
-                radius = 0.0
-                try:
-                    axis = vh[0, :]
-                    u_vec = vh[1, :]
-                    v_vec = vh[2, :]
-                    p2d = np.column_stack((np.dot(pts - centroid, u_vec), np.dot(pts - centroid, v_vec)))
-                    def calc_R(c): return np.sqrt((p2d[:, 0] - c[0])**2 + (p2d[:, 1] - c[1])**2)
-                    def cyl_obj(c): return calc_R(c) - np.mean(calc_R(c))
-                    
-                    res_cyl = scipy.optimize.least_squares(cyl_obj, np.mean(p2d, axis=0))
-                    radii = calc_R(res_cyl.x)
-                    cyl_mse = float(np.mean((radii - np.mean(radii))**2))
-                    radius = float(np.mean(radii))
-                    center_2d = res_cyl.x
-                    center_3d = centroid + center_2d[0]*u_vec + center_2d[1]*v_vec
-                    axis_3d, u_3d = axis, u_vec
-                except: pass
+                clean_pts = [start_v]
+                for idx in indices[1:-1]:
+                    v = b3d.Vector(float(chain_pts[idx][0]), float(chain_pts[idx][1]), float(chain_pts[idx][2]))
+                    if (v - clean_pts[-1]).length > 1e-2 and (v - end_v).length > 1e-2:
+                        clean_pts.append(v)
+                clean_pts.append(end_v)
+                
+                if len(clean_pts) > 2:
+                    edge = b3d.Edge.make_spline(clean_pts)
+                else:
+                    edge = b3d.Edge.make_line(start_v, end_v)
+        except Exception:
+            try:
+                edge = b3d.Edge.make_line(start_v, end_v)
+            except Exception:
+                continue
+        
+        chain_b3d_edges[chain_idx] = edge
+        
+        # Store junction keys for lookup
+        key_A = f"{int(round(pA[0]*10000))}_{int(round(pA[1]*10000))}_{int(round(pA[2]*10000))}"
+        key_B = f"{int(round(pB[0]*10000))}_{int(round(pB[1]*10000))}_{int(round(pB[2]*10000))}"
+        chain_junction_keys[chain_idx] = (key_A, key_B)
 
-                best_match = 'unknown'
-                if plane_mse < 0.05: best_match = 'plane'
-                elif cyl_mse < plane_mse * 0.5 and radius > 0.1: best_match = 'cylinder'
-                elif plane_mse < 0.5: best_match = 'plane'
+    broadcast_log(f"[System] Created {len(chain_b3d_edges)} canonical B3D edges (exactly 1 per shared boundary).")
 
-                try:
-                    if best_match == 'plane':
-                        pln = gp_Pln(gp_Pnt(float(centroid[0]), float(centroid[1]), float(centroid[2])), 
-                                     gp_Dir(float(plane_normal[0]), float(plane_normal[1]), float(plane_normal[2])))
-                        geom_surf = Geom_Plane(pln)
-                    elif best_match == 'cylinder':
-                        ax3 = gp_Ax3(gp_Pnt(float(center_3d[0]), float(center_3d[1]), float(center_3d[2])), 
-                                     gp_Dir(float(axis_3d[0]), float(axis_3d[1]), float(axis_3d[2])),
-                                     gp_Dir(float(u_3d[0]), float(u_3d[1]), float(u_3d[2])))
-                        geom_surf = Geom_CylindricalSurface(ax3, float(radius))
-                except: pass
+    # =====================================================================
+    # PHASE 3: ASSIGN EDGES TO COMPONENTS & BUILD SURFACES
+    # =====================================================================
+    
+    # 3a. For each component, find which chains bound it
+    comp_to_chains = {ci: [] for ci in valid_comp_indices}
+    for chain_idx, (chain_verts, comp_pairs) in enumerate(edge_chains):
+        if chain_idx not in chain_b3d_edges:
+            continue
+        for pair in comp_pairs:
+            for ci in pair:
+                if ci in comp_to_chains:
+                    comp_to_chains[ci].append(chain_idx)
+    
+    # 3b. Process components in planarity order (flattest first)
+    sorted_comp_indices = sorted(valid_comp_indices, key=lambda ci: comp_planarity.get(ci, 999.0))
 
-            # --- THE INVINCIBLE FALLBACK HIERARCHY ---
-            face = None
+    b3d_faces = []
 
-            if geom_surf is not None:
-                try:
-                    filler = BRepOffsetAPI_MakeFilling()
-                    for edge in cycle_edges: filler.Add(edge.wrapped, GeomAbs_C0)
-                    filler.LoadInitSurface(geom_surf)
-                    filler.Build()
-                    if filler.IsDone(): 
-                        f = b3d.Face(filler.Shape())
-                        if f.is_valid: face = f
-                except: pass
+    for ci in sorted_comp_indices:
+        chain_indices = comp_to_chains.get(ci, [])
+        if not chain_indices:
+            continue
+        
+        # Collect the b3d edges for this component's boundary
+        cycle_edges = []
+        
+        # We need to order the chains into a proper loop.
+        # Build a mini-graph of junction connections for this component.
+        junction_graph = nx.Graph()
+        for ch_idx in chain_indices:
+            if ch_idx not in chain_junction_keys:
+                continue
+            kA, kB = chain_junction_keys[ch_idx]
+            junction_graph.add_edge(kA, kB, chain_idx=ch_idx)
+        
+        if len(junction_graph.edges()) == 0:
+            continue
+        
+        # Try to find a cycle through the junction graph
+        try:
+            # For components that form a closed loop
+            cycle_path = nx.find_cycle(junction_graph)
+            ordered_chain_indices = []
+            for u, v, _ in cycle_path:
+                edata = junction_graph.edges[u, v]
+                ch_idx = edata['chain_idx']
+                kA, kB = chain_junction_keys[ch_idx]
+                
+                edge = chain_b3d_edges[ch_idx]
+                # Determine if we need to reverse this edge
+                if kA == u:
+                    ordered_chain_indices.append((ch_idx, False))
+                else:
+                    ordered_chain_indices.append((ch_idx, True))
+            
+            for ch_idx, needs_reverse in ordered_chain_indices:
+                edge = chain_b3d_edges[ch_idx]
+                if needs_reverse:
+                    try:
+                        cycle_edges.append(edge.reversed())
+                    except AttributeError:
+                        cycle_edges.append(b3d.Edge(edge.wrapped.Reversed()))
+                else:
+                    cycle_edges.append(edge)
+        except nx.NetworkXNoCycle:
+            # Open boundary - just collect edges in whatever order
+            for ch_idx in chain_indices:
+                if ch_idx in chain_b3d_edges:
+                    cycle_edges.append(chain_b3d_edges[ch_idx])
+        except Exception:
+            for ch_idx in chain_indices:
+                if ch_idx in chain_b3d_edges:
+                    cycle_edges.append(chain_b3d_edges[ch_idx])
 
-            if face is None and len(cycle_edges) in [2, 3, 4]:
-                try: 
-                    f = b3d.Face.make_surface_from_curves(cycle_edges)
+        if len(cycle_edges) < 2:
+            continue
+        
+        # 3c. Generate the face using the analytic surface hierarchy
+        geom_surf = None
+        internal_pts = comp_verts_map.get(ci, np.array([]))
+        
+        # --- EVALUATE ANALYTIC BASE ---
+        if len(internal_pts) >= 15:
+            pts = np.array(internal_pts)
+            centroid = np.mean(pts, axis=0)
+            _, _, vh = np.linalg.svd(pts - centroid)
+            plane_normal = vh[2, :]
+            plane_mse = float(np.mean((np.dot(pts - centroid, plane_normal))**2))
+            
+            cyl_mse = float('inf')
+            radius = 0.0
+            try:
+                axis = vh[0, :]
+                u_vec = vh[1, :]
+                v_vec = vh[2, :]
+                p2d = np.column_stack((np.dot(pts - centroid, u_vec), np.dot(pts - centroid, v_vec)))
+                def calc_R(c): return np.sqrt((p2d[:, 0] - c[0])**2 + (p2d[:, 1] - c[1])**2)
+                def cyl_obj(c): return calc_R(c) - np.mean(calc_R(c))
+                
+                res_cyl = scipy.optimize.least_squares(cyl_obj, np.mean(p2d, axis=0))
+                radii = calc_R(res_cyl.x)
+                cyl_mse = float(np.mean((radii - np.mean(radii))**2))
+                radius = float(np.mean(radii))
+                center_2d = res_cyl.x
+                center_3d = centroid + center_2d[0]*u_vec + center_2d[1]*v_vec
+                axis_3d, u_3d = axis, u_vec
+            except: pass
+
+            best_match = 'unknown'
+            if plane_mse < 0.05: best_match = 'plane'
+            elif cyl_mse < plane_mse * 0.5 and radius > 0.1: best_match = 'cylinder'
+            elif plane_mse < 0.5: best_match = 'plane'
+
+            try:
+                if best_match == 'plane':
+                    pln = gp_Pln(gp_Pnt(float(centroid[0]), float(centroid[1]), float(centroid[2])), 
+                                 gp_Dir(float(plane_normal[0]), float(plane_normal[1]), float(plane_normal[2])))
+                    geom_surf = Geom_Plane(pln)
+                elif best_match == 'cylinder':
+                    ax3 = gp_Ax3(gp_Pnt(float(center_3d[0]), float(center_3d[1]), float(center_3d[2])), 
+                                 gp_Dir(float(axis_3d[0]), float(axis_3d[1]), float(axis_3d[2])),
+                                 gp_Dir(float(u_3d[0]), float(u_3d[1]), float(u_3d[2])))
+                    geom_surf = Geom_CylindricalSurface(ax3, float(radius))
+            except: pass
+
+        # --- THE INVINCIBLE FALLBACK HIERARCHY ---
+        face = None
+
+        if geom_surf is not None:
+            try:
+                filler = BRepOffsetAPI_MakeFilling()
+                for edge in cycle_edges: filler.Add(edge.wrapped, GeomAbs_C0)
+                filler.LoadInitSurface(geom_surf)
+                filler.Build()
+                if filler.IsDone(): 
+                    f = b3d.Face(filler.Shape())
                     if f.is_valid: face = f
-                except: pass
+            except: pass
 
-            if face is None:
-                try:
-                    filler = BRepOffsetAPI_MakeFilling()
-                    for edge in cycle_edges: filler.Add(edge.wrapped, GeomAbs_C0)
-                    filler.Build()
-                    if filler.IsDone(): 
-                        f = b3d.Face(filler.Shape())
-                        if f.is_valid: face = f
-                except: pass
+        if face is None and len(cycle_edges) in [2, 3, 4]:
+            try: 
+                f = b3d.Face.make_surface_from_curves(cycle_edges)
+                if f.is_valid: face = f
+            except: pass
 
-            if face is None:
-                try:
-                    from scipy.spatial import ConvexHull
+        if face is None:
+            try:
+                filler = BRepOffsetAPI_MakeFilling()
+                for edge in cycle_edges: filler.Add(edge.wrapped, GeomAbs_C0)
+                filler.Build()
+                if filler.IsDone(): 
+                    f = b3d.Face(filler.Shape())
+                    if f.is_valid: face = f
+            except: pass
+
+        if face is None:
+            try:
+                from scipy.spatial import ConvexHull
+                corner_pts = []
+                for ch_idx in chain_indices:
+                    if ch_idx in chain_junction_keys:
+                        kA, kB = chain_junction_keys[ch_idx]
+                        chain_verts_list, _ = edge_chains[ch_idx]
+                        corner_pts.append(state.mesh.vertices[chain_verts_list[0]])
+                        corner_pts.append(state.mesh.vertices[chain_verts_list[-1]])
+                corner_pts = [np.array(p) for p in corner_pts]
+                # Deduplicate
+                if corner_pts:
+                    unique_corners = [corner_pts[0]]
+                    for p in corner_pts[1:]:
+                        if all(np.linalg.norm(p - uc) > 1e-4 for uc in unique_corners):
+                            unique_corners.append(p)
+                    corner_pts = unique_corners
+                
+                if len(corner_pts) >= 3:
                     flat_pts = np.array(apply_pca_firewall(corner_pts))
                     centroid_flat = np.mean(flat_pts, axis=0)
                     flat_pts += np.random.normal(0, 1e-6, flat_pts.shape)
@@ -748,18 +906,22 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
                     f = b3d.Face(b3d.Wire.make_polygon(poly_pts))
                     if f.is_valid: 
                         face = f
-                except Exception as e:
-                    pass
+            except Exception as e:
+                pass
 
-            if face is not None:
-                b3d_faces.append(face)
+        if face is not None:
+            b3d_faces.append(face)
+
+    broadcast_log(f"[System] Generated {len(b3d_faces)} CAD faces from {len(sorted_comp_indices)} components.")
 
     if not b3d_faces:
          msg = "Engine failed to generate valid faces. All fallbacks exhausted."
          broadcast_log(f"[Error] {msg}")
          raise HTTPException(status_code=400, detail=msg)
 
-    # 4. Robust Progressive Sewing & Healing
+    # =====================================================================
+    # PHASE 4: SEWING - faces already share edges by construction
+    # =====================================================================
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
     from OCP.ShapeFix import ShapeFix_Shape, ShapeFix_Solid
     
@@ -853,7 +1015,7 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
                 p2 = tmesh.vertices[edge[1]].tolist()
                 naked_edges.append([p1, p2])
 
-        broadcast_log(f"[Success] Validation Guardrails saved the geometry. Exported {len(tmesh.faces)} faces. Solid: {is_solid}")
+        broadcast_log(f"[Success] Global Skeleton Pipeline complete. Exported {len(tmesh.faces)} faces. Solid: {is_solid}")
         
         return {
             "geometries": [
