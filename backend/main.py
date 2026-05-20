@@ -239,12 +239,47 @@ async def upload_mesh(background_tasks: BackgroundTasks, file: UploadFile = File
         raise HTTPException(status_code=400, detail=f"Failed to load mesh: {str(e)}")
 
 def get_patch_components(mesh, sharpness_angle_deg):
+    """
+    Extract patch components using multi-angle consensus voting.
+    The user's angle is the CENTER of the band — it is NOT overridden.
+    We test 5 angles in a narrow band (±10%) and require majority agreement.
+    This makes results stable across ±2-3° angle changes.
+    """
     if mesh is None: return []
-    threshold_rad = np.radians(sharpness_angle_deg)
+    
     adjacency = mesh.face_adjacency
     angles = mesh.face_adjacency_angles
-    smooth_edges = adjacency[angles < threshold_rad]
+    n_edges = len(angles)
+    
+    if n_edges == 0:
+        return [np.arange(len(mesh.faces))]
+    
+    # User's angle IS the center — no Otsu override
+    center_angle = sharpness_angle_deg
+    
+    # Narrow band: ±10% of the angle, minimum ±1.5°, maximum ±5°
+    band = float(np.clip(center_angle * 0.10, 1.5, 5.0))
+    test_angles_deg = [
+        center_angle - band,
+        center_angle - band / 2,
+        center_angle,
+        center_angle + band / 2,
+        center_angle + band,
+    ]
+    test_angles_deg = [max(1.0, a) for a in test_angles_deg]
+    
+    # Multi-angle consensus: count how many thresholds classify each edge as "sharp"
+    edge_sharp_votes = np.zeros(n_edges, dtype=int)
+    for test_deg in test_angles_deg:
+        test_rad = np.radians(test_deg)
+        edge_sharp_votes += (angles >= test_rad).astype(int)
+    
+    # An edge is "robustly smooth" only if it's smooth in majority (sharp < 3 of 5)
+    robust_smooth = edge_sharp_votes < 3
+    
+    smooth_edges = adjacency[robust_smooth]
     return list(trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces))))
+
 
 def apply_pca_firewall(points):
     pts = np.array(points)
@@ -527,24 +562,41 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
         broadcast_log(f"[Error] {msg}")
         raise HTTPException(status_code=400, detail=msg)
 
-    # 1b. Find ALL sharp edges globally (edges where adjacent faces belong to different components)
+    # 1b. Find ALL sharp edges using the SAME consensus logic as get_patch_components
     adjacency = state.mesh.face_adjacency
     angles = state.mesh.face_adjacency_angles
-    threshold_rad = np.radians(params.sharpness_angle)
-    
-    sharp_mask = angles >= threshold_rad
-    sharp_face_pairs = adjacency[sharp_mask]
-    
-    # Get the actual mesh edges (vertex pairs) for each sharp face adjacency
     adjacency_edges = state.mesh.face_adjacency_edges
+    n_adj = len(angles)
+    
+    # Same consensus band as get_patch_components (user's angle is center)
+    center_angle = params.sharpness_angle
+    band = float(np.clip(center_angle * 0.10, 1.5, 5.0))
+    test_angles_deg = [
+        center_angle - band,
+        center_angle - band / 2,
+        center_angle,
+        center_angle + band / 2,
+        center_angle + band,
+    ]
+    test_angles_deg = [max(1.0, a) for a in test_angles_deg]
+    
+    edge_sharp_votes = np.zeros(n_adj, dtype=int)
+    for test_deg in test_angles_deg:
+        test_rad = np.radians(test_deg)
+        edge_sharp_votes += (angles >= test_rad).astype(int)
+    
+    sharp_mask = edge_sharp_votes >= 3
+    sharp_face_pairs = adjacency[sharp_mask]
     sharp_vertex_edges = adjacency_edges[sharp_mask]
+    
+    broadcast_log(f"[System] Consensus band: {center_angle:.1f}° ± {band:.1f}° → {int(np.sum(sharp_mask))} robust sharp edges")
     
     if len(sharp_vertex_edges) == 0:
         msg = "No sharp edges detected. Try lowering the sharpness angle."
         broadcast_log(f"[Error] {msg}")
         raise HTTPException(status_code=400, detail=msg)
 
-    broadcast_log(f"[System] Found {len(sharp_vertex_edges)} sharp edges across {len(valid_comp_indices)} components.")
+    broadcast_log(f"[System] Found {len(sharp_vertex_edges)} consensus-sharp edges across {len(valid_comp_indices)} components.")
 
     # 1c. Build global sharp-edge graph from mesh vertex indices
     sharp_graph = nx.Graph()
@@ -554,12 +606,27 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
         c0, c1 = face_to_comp[f0], face_to_comp[f1]
         sharp_graph.add_edge(int(v0), int(v1), comp_pair=tuple(sorted([c0, c1])))
 
-    # 1d. Find JUNCTION vertices (degree != 2) — these are the TRUE topological corners
-    # Degree 1 = boundary endpoint, Degree 3+ = where 3+ surfaces meet
+    # 1d. Find JUNCTION vertices — these are the TRUE topological corners
+    # Three types of junctions:
+    #   - Degree 1 = boundary endpoint
+    #   - Degree 3+ = where 3+ sharp edges meet  
+    #   - Degree 2 BUT component pair changes = where two different boundaries meet
+    #     (e.g., edge separating A|B meets edge separating B|C at a degree-2 vertex)
+    #     Without this, the chain walker would create one long chain spanning both
+    #     boundaries, causing the vertex misalignment bug.
     junction_verts = set()
     for v in sharp_graph.nodes():
-        if sharp_graph.degree(v) != 2:
+        deg = sharp_graph.degree(v)
+        if deg != 2:
             junction_verts.add(v)
+        else:
+            # Degree-2 vertex: check if the two edges separate DIFFERENT component pairs
+            neighbors = list(sharp_graph.neighbors(v))
+            if len(neighbors) == 2:
+                pair0 = sharp_graph.edges[v, neighbors[0]].get('comp_pair')
+                pair1 = sharp_graph.edges[v, neighbors[1]].get('comp_pair')
+                if pair0 is not None and pair1 is not None and pair0 != pair1:
+                    junction_verts.add(v)  # Component boundary changes here = real junction
 
     # If no junctions found (e.g., all closed loops), break loops at arbitrary points
     if not junction_verts:
@@ -568,7 +635,7 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
             if len(cc_list) > 0:
                 junction_verts.add(cc_list[0])
     
-    broadcast_log(f"[System] Found {len(junction_verts)} topological junction vertices (true corners).")
+    broadcast_log(f"[System] Found {len(junction_verts)} topological junction vertices (including {sum(1 for v in junction_verts if sharp_graph.degree(v) == 2)} comp-pair-change junctions).")
 
     # 1e. Walk between junctions to extract CHAINS (each chain = one shared edge curve)
     # A chain is a path of vertices from one junction to the next, along sharp edges.
@@ -679,20 +746,43 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
             if len(chain_pts) <= 2:
                 edge = b3d.Edge.make_line(start_v, end_v)
             else:
-                # Sample interior points, always pinning start and end exactly
-                target_count = int(len(chain_pts) * (1.0 - clamped_tension))
+                # Use MORE points from the chain to keep the edge close to the mesh
+                # Subsample to max 50 points but keep the density high near endpoints
+                max_pts = min(50, len(chain_pts))
+                target_count = max(max_pts, int(len(chain_pts) * (1.0 - clamped_tension)))
                 target_count = max(4, min(target_count, len(chain_pts)))
                 indices = np.linspace(0, len(chain_pts) - 1, target_count, dtype=int)
                 
+                # Build clean point list — use tighter distance filter (1e-4 instead of 1e-2)
+                # so we don't skip critical points near junctions
                 clean_pts = [start_v]
                 for idx in indices[1:-1]:
                     v = b3d.Vector(float(chain_pts[idx][0]), float(chain_pts[idx][1]), float(chain_pts[idx][2]))
-                    if (v - clean_pts[-1]).length > 1e-2 and (v - end_v).length > 1e-2:
+                    if (v - clean_pts[-1]).length > 1e-4 and (v - end_v).length > 1e-4:
                         clean_pts.append(v)
                 clean_pts.append(end_v)
                 
                 if len(clean_pts) > 2:
-                    edge = b3d.Edge.make_spline(clean_pts)
+                    # Compute tangent directions at endpoints from the mesh boundary
+                    # This prevents spline overshooting at junction corners
+                    tangent_start = (clean_pts[1] - clean_pts[0])
+                    tangent_end = (clean_pts[-1] - clean_pts[-2])
+                    
+                    # Normalize tangents (avoid zero-length)
+                    ts_len = tangent_start.length
+                    te_len = tangent_end.length
+                    
+                    if ts_len > 1e-8 and te_len > 1e-8:
+                        try:
+                            # Create spline with tangent constraints at endpoints
+                            # tangents list: [start_tangent, None for interior, ..., end_tangent]
+                            tangents = [tangent_start] + [None] * (len(clean_pts) - 2) + [tangent_end]
+                            edge = b3d.Edge.make_spline(clean_pts, tangents=tangents)
+                        except Exception:
+                            # Fallback: unconstrained spline
+                            edge = b3d.Edge.make_spline(clean_pts)
+                    else:
+                        edge = b3d.Edge.make_spline(clean_pts)
                 else:
                     edge = b3d.Edge.make_line(start_v, end_v)
         except Exception:
@@ -713,30 +803,56 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
     # --- VERTEX SHARING: Re-build edges with shared OCCT TopoDS_Vertex objects ---
     # Without this, edges have separate vertex objects at the same position,
     # which prevents OCCT from recognizing topological connections between faces.
-    from OCP.BRep import BRep_Tool
-    from OCP.TopLoc import TopLoc_Location
-    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeVertex
-    
-    junction_occt_verts = {}
-    for jv in junction_verts:
-        pos = state.mesh.vertices[jv]
-        pnt = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
-        junction_occt_verts[jv] = BRepBuilderAPI_MakeVertex(pnt).Vertex()
-    
-    shared_count = 0
-    for chain_idx in list(chain_b3d_edges.keys()):
-        chain_verts_list, _ = edge_chains[chain_idx]
-        jv_start = chain_verts_list[0]
-        jv_end = chain_verts_list[-1]
+    try:
+        from OCP.BRep import BRep_Tool, BRep_Builder
+        from OCP.TopLoc import TopLoc_Location
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeVertex
+        from OCP.TopoDS import TopoDS
+        from OCP.TopExp import TopExp
         
-        if jv_start not in junction_occt_verts or jv_end not in junction_occt_verts:
-            continue
+        junction_occt_verts = {}
+        for jv in junction_verts:
+            pos = state.mesh.vertices[jv]
+            pnt = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
+            junction_occt_verts[jv] = BRepBuilderAPI_MakeVertex(pnt).Vertex()
         
-        edge = chain_b3d_edges[chain_idx]
-        try:
-            loc = TopLoc_Location()
-            curve_handle, u_first, u_last = BRep_Tool.Curve(edge.wrapped, loc)
-            if curve_handle is not None:
+        shared_count = 0
+        share_errors = []
+        for chain_idx in list(chain_b3d_edges.keys()):
+            chain_verts_list, _ = edge_chains[chain_idx]
+            jv_start = chain_verts_list[0]
+            jv_end = chain_verts_list[-1]
+            
+            if jv_start not in junction_occt_verts or jv_end not in junction_occt_verts:
+                continue
+            
+            edge = chain_b3d_edges[chain_idx]
+            try:
+                loc = TopLoc_Location()
+                curve_result = BRep_Tool.Curve(edge.wrapped, loc)
+                
+                # BRep_Tool.Curve returns (Handle_Geom_Curve, first_param, last_param)
+                if curve_result is None:
+                    share_errors.append(f"chain {chain_idx}: Curve returned None")
+                    continue
+                    
+                curve_handle = curve_result[0]
+                u_first = curve_result[1]
+                u_last = curve_result[2]
+                
+                if curve_handle is None or curve_handle.IsNull():
+                    # For degenerate/line edges, try making a fresh line edge with shared verts
+                    p1 = BRep_Tool.Pnt(TopExp.FirstVertex_s(edge.wrapped))
+                    p2 = BRep_Tool.Pnt(TopExp.LastVertex_s(edge.wrapped))
+                    maker = BRepBuilderAPI_MakeEdge(
+                        junction_occt_verts[jv_start],
+                        junction_occt_verts[jv_end]
+                    )
+                    if maker.IsDone():
+                        chain_b3d_edges[chain_idx] = b3d.Edge(maker.Edge())
+                        shared_count += 1
+                    continue
+                
                 maker = BRepBuilderAPI_MakeEdge(
                     curve_handle,
                     junction_occt_verts[jv_start],
@@ -746,10 +862,16 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
                 if maker.IsDone():
                     chain_b3d_edges[chain_idx] = b3d.Edge(maker.Edge())
                     shared_count += 1
-        except Exception:
-            pass  # Keep original edge if re-making fails
-    
-    broadcast_log(f"[System] Enforced vertex sharing on {shared_count}/{len(chain_b3d_edges)} edges across {len(junction_occt_verts)} junctions.")
+                else:
+                    share_errors.append(f"chain {chain_idx}: MakeEdge not done (error: {maker.Error()})")
+            except Exception as e:
+                share_errors.append(f"chain {chain_idx}: {type(e).__name__}: {e}")
+        
+        if share_errors:
+            broadcast_log(f"[Debug] Vertex sharing issues: {share_errors[:5]}")
+        broadcast_log(f"[System] Enforced vertex sharing on {shared_count}/{len(chain_b3d_edges)} edges across {len(junction_occt_verts)} junctions.")
+    except Exception as e:
+        broadcast_log(f"[Warning] Vertex sharing phase failed entirely: {e}. Continuing without it.")
 
     # =====================================================================
     # PHASE 3: ASSIGN EDGES TO COMPONENTS & BUILD SURFACES
@@ -1043,122 +1165,208 @@ async def batch_magic_patch(params: BatchMagicPatchParams):
          raise HTTPException(status_code=400, detail=msg)
 
     # =====================================================================
-    # PHASE 4: SEWING - faces already share edges by construction
+    # PHASE 4: SMART CLUSTER SEWING
+    # Instead of all-or-nothing, we group faces by shared edges,
+    # sew each cluster independently, and return problematic faces separately.
     # =====================================================================
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
     from OCP.ShapeFix import ShapeFix_Shape, ShapeFix_Solid
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_VERTEX, TopAbs_EDGE
+    from OCP.TopoDS import TopoDS
     
-    is_solid = False
-    final_geo = None
+    broadcast_log(f"[System] Analyzing face adjacency for smart sewing ({len(b3d_faces)} faces)...")
     
-    # Wider tolerance range - vertex sharing should make tight tolerances work,
-    # but we keep wider ones as fallbacks for any remaining gaps
-    tolerances_to_try = [1e-4, 1e-3, 1e-2, 0.05, 0.1, 0.2, 0.5] 
-    
-    for tol in tolerances_to_try:
-        sewer = BRepBuilderAPI_Sewing()
-        sewer.SetTolerance(tol)
-        
-        for face in b3d_faces:
-            if face.is_valid: 
-                sewer.Add(face.wrapped)
-
-        sewer.Perform()
-        temp_sewed = sewer.SewedShape()
-        
-        if temp_sewed.IsNull():
-            continue
-            
-        healer = ShapeFix_Shape(temp_sewed)
-        healer.SetPrecision(tol)
-        healer.SetMinTolerance(tol)
-        healer.SetMaxTolerance(tol * 5)
-        healer.Perform()
-        healed_shape = healer.Shape()
-        
-        if healed_shape.IsNull():
-            continue
-
+    # 4a. Extract edge vertex-pair keys from each face to determine adjacency
+    def get_face_edge_keys(face):
+        """Get set of (vertex_key_A, vertex_key_B) tuples representing each edge.
+        Uses 2-decimal rounding for more tolerant matching (~0.01 unit tolerance)."""
+        edge_keys = set()
         try:
-            temp_b3d = b3d.Shape.cast(healed_shape)
-        except Exception:
-            continue
-
-        if isinstance(temp_b3d, b3d.Solid):
-            final_geo = temp_b3d
-            is_solid = True
-            broadcast_log(f"[System] Zipped into a watertight Solid at tolerance {tol}")
-            break
-            
-        elif isinstance(temp_b3d, b3d.Shell):
-            if temp_b3d.is_closed:
+            from OCP.TopExp import TopExp
+            from OCP.BRep import BRep_Tool as BRT
+            exp = TopExp_Explorer(face.wrapped, TopAbs_EDGE)
+            while exp.More():
+                edge_shape = exp.Current()
                 try:
-                    final_geo = b3d.Solid.make_solid(temp_b3d)
-                    is_solid = True
-                    broadcast_log(f"[System] Shell successfully sealed into a Solid at tolerance {tol}")
-                    break
-                except Exception:
+                    v1 = TopExp.FirstVertex_s(TopoDS.Edge_s(edge_shape))
+                    v2 = TopExp.LastVertex_s(TopoDS.Edge_s(edge_shape))
+                    p1 = BRT.Pnt(v1)
+                    p2 = BRT.Pnt(v2)
+                    # Use 2-decimal rounding (~0.01 unit tolerance) for more forgiving matching
+                    k1 = (round(p1.X(), 2), round(p1.Y(), 2), round(p1.Z(), 2))
+                    k2 = (round(p2.X(), 2), round(p2.Y(), 2), round(p2.Z(), 2))
+                    edge_keys.add(tuple(sorted([k1, k2])))
+                except:
                     pass
-            final_geo = temp_b3d 
-
-        elif isinstance(temp_b3d, b3d.Compound):
-            shells = temp_b3d.shells()
-            if shells and shells[0].is_closed:
-                try:
-                    final_geo = b3d.Solid.make_solid(shells[0])
-                    is_solid = True
-                    broadcast_log(f"[System] Compound shell sealed into a Solid at tolerance {tol}")
-                    break
-                except Exception:
-                    pass
-            final_geo = temp_b3d
-
-    if final_geo is None:
-        final_geo = b3d.Compound(children=b3d_faces)
-        broadcast_log("[Warning] All sewing attempts failed. Outputting loose faces as a Compound.")
-    elif not is_solid:
-        broadcast_log("[Warning] Could not achieve a watertight seal. Outputting as an Open Shell.")
-        
-    geo_id = f"batch_{'solid' if is_solid else 'shell'}_{uuid.uuid4().hex[:8]}"
-    state.rebuild_geometry[geo_id] = final_geo
+                exp.Next()
+        except:
+            pass
+        return edge_keys
     
-    fd, path = tempfile.mkstemp(suffix=".stl")
-    os.close(fd)
-    try:
-        from build123d.exporters3d import export_stl
-        export_stl(final_geo, path)
-        tmesh = trimesh.load(path, file_type='stl')
+    # Build adjacency graph: faces sharing at least one edge are connected
+    face_edge_keys = [get_face_edge_keys(f) for f in b3d_faces]
+    
+    face_adj_graph = nx.Graph()
+    for i in range(len(b3d_faces)):
+        face_adj_graph.add_node(i)
+    
+    for i in range(len(b3d_faces)):
+        for j in range(i + 1, len(b3d_faces)):
+            shared = face_edge_keys[i] & face_edge_keys[j]
+            if shared:
+                face_adj_graph.add_edge(i, j, shared_edges=len(shared))
+    
+    clusters = list(nx.connected_components(face_adj_graph))
+    broadcast_log(f"[System] Found {len(clusters)} face clusters: {[len(c) for c in sorted(clusters, key=len, reverse=True)]}")
+    
+    # 4b. Sew each cluster independently
+    output_geometries = []
+    
+    def try_sew_cluster(cluster_faces, cluster_label):
+        """Try to sew a group of faces into a shell. Returns (geometry, is_solid, was_sewn)."""
+        if len(cluster_faces) == 1:
+            return cluster_faces[0], False, False
         
-        naked_edges = []
-        if not is_solid and len(tmesh.faces) > 0:
-            edges = trimesh.geometry.faces_to_edges(tmesh.faces)
-            edges_sorted = np.sort(edges, axis=1)
-            unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
-            boundary_edges = unique_edges[counts == 1]
-            for edge in boundary_edges:
-                p1 = tmesh.vertices[edge[0]].tolist()
-                p2 = tmesh.vertices[edge[1]].tolist()
-                naked_edges.append([p1, p2])
-
-        broadcast_log(f"[Success] Global Skeleton Pipeline complete. Exported {len(tmesh.faces)} faces. Solid: {is_solid}")
+        tolerances_to_try = [1e-4, 1e-3, 1e-2, 0.05, 0.1, 0.2]
+        best_geo = None
+        best_is_solid = False
         
-        return {
-            "geometries": [
-                {
-                    "vertices": tmesh.vertices.tolist(),
-                    "faces": tmesh.faces.tolist(),
-                    "id": geo_id,
-                    "tag": "Safe Shell",
-                    "is_solid": is_solid,
-                    "naked_edges": naked_edges,
-                    "type": "solid" if is_solid else "shell", 
-                    "name": f"Batch_Patch_{geo_id[:4]}"
-                }
-            ]
-        }
-    finally:
-        try: os.remove(path)
-        except: pass
+        for tol in tolerances_to_try:
+            try:
+                sewer = BRepBuilderAPI_Sewing()
+                sewer.SetTolerance(tol)
+                
+                for face in cluster_faces:
+                    if face.is_valid:
+                        sewer.Add(face.wrapped)
+                
+                sewer.Perform()
+                temp_sewed = sewer.SewedShape()
+                
+                if temp_sewed.IsNull():
+                    continue
+                
+                healer = ShapeFix_Shape(temp_sewed)
+                healer.SetPrecision(tol)
+                healer.SetMinTolerance(tol)
+                healer.SetMaxTolerance(tol * 5)
+                healer.Perform()
+                healed_shape = healer.Shape()
+                
+                if healed_shape.IsNull():
+                    continue
+                
+                temp_b3d = b3d.Shape.cast(healed_shape)
+                
+                if isinstance(temp_b3d, b3d.Solid):
+                    broadcast_log(f"[System] Cluster '{cluster_label}' ({len(cluster_faces)} faces) → Solid at tol={tol}")
+                    return temp_b3d, True, True
+                
+                elif isinstance(temp_b3d, b3d.Shell):
+                    if temp_b3d.is_closed:
+                        try:
+                            solid = b3d.Solid.make_solid(temp_b3d)
+                            broadcast_log(f"[System] Cluster '{cluster_label}' ({len(cluster_faces)} faces) → Sealed Solid at tol={tol}")
+                            return solid, True, True
+                        except:
+                            pass
+                    best_geo = temp_b3d
+                    best_is_solid = False
+                    # Don't break - try tighter tolerance first for Solid
+                    if tol <= 1e-2:
+                        continue
+                    broadcast_log(f"[System] Cluster '{cluster_label}' ({len(cluster_faces)} faces) → Open Shell at tol={tol}")
+                    return best_geo, False, True
+                
+                elif isinstance(temp_b3d, b3d.Compound):
+                    shells = temp_b3d.shells()
+                    if shells:
+                        if shells[0].is_closed:
+                            try:
+                                solid = b3d.Solid.make_solid(shells[0])
+                                broadcast_log(f"[System] Cluster '{cluster_label}' ({len(cluster_faces)} faces) → Solid from Compound at tol={tol}")
+                                return solid, True, True
+                            except:
+                                pass
+                        best_geo = shells[0]
+                    else:
+                        best_geo = temp_b3d
+            except:
+                continue
+        
+        if best_geo is not None:
+            broadcast_log(f"[System] Cluster '{cluster_label}' ({len(cluster_faces)} faces) → Best effort Shell")
+            return best_geo, best_is_solid, True
+        
+        # Sewing completely failed - return as compound
+        broadcast_log(f"[Warning] Cluster '{cluster_label}' ({len(cluster_faces)} faces) → Sewing failed, returning loose")
+        return b3d.Compound(children=cluster_faces), False, False
+    
+    # Sort clusters by size (largest first) for cleaner output
+    sorted_clusters = sorted(clusters, key=len, reverse=True)
+    
+    from build123d.exporters3d import export_stl
+    
+    for cluster_idx, cluster in enumerate(sorted_clusters):
+        cluster_faces = [b3d_faces[i] for i in cluster]
+        
+        if len(cluster_faces) == 1:
+            # Single face - output as individual sheet for easy management
+            geo = cluster_faces[0]
+            geo_type = "face"
+            is_solid = False
+            was_sewn = False
+            label = f"Face_{cluster_idx}"
+        else:
+            label = f"Shell_{cluster_idx}"
+            geo, is_solid, was_sewn = try_sew_cluster(cluster_faces, label)
+            geo_type = "solid" if is_solid else ("shell" if was_sewn else "compound")
+        
+        # Export to STL for visualization
+        geo_id = f"batch_{geo_type}_{uuid.uuid4().hex[:8]}"
+        state.rebuild_geometry[geo_id] = geo
+        
+        fd, path = tempfile.mkstemp(suffix=".stl")
+        os.close(fd)
+        try:
+            export_stl(geo, path)
+            tmesh = trimesh.load(path, file_type='stl')
+            
+            naked_edges = []
+            if not is_solid and len(tmesh.faces) > 0:
+                edges = trimesh.geometry.faces_to_edges(tmesh.faces)
+                edges_sorted = np.sort(edges, axis=1)
+                unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
+                boundary_edges = unique_edges[counts == 1]
+                for edge in boundary_edges:
+                    p1 = tmesh.vertices[edge[0]].tolist()
+                    p2 = tmesh.vertices[edge[1]].tolist()
+                    naked_edges.append([p1, p2])
+            
+            face_count_label = f"{len(cluster)} patches" if len(cluster) > 1 else "1 patch"
+            output_geometries.append({
+                "vertices": tmesh.vertices.tolist(),
+                "faces": tmesh.faces.tolist(),
+                "id": geo_id,
+                "tag": f"{'Merged ' if was_sewn else ''}{geo_type.title()} ({face_count_label})",
+                "is_solid": is_solid,
+                "naked_edges": naked_edges,
+                "type": geo_type,
+                "name": f"Batch_{label}"
+            })
+        except Exception as e:
+            broadcast_log(f"[Warning] Failed to export cluster '{label}': {e}")
+        finally:
+            try: os.remove(path)
+            except: pass
+    
+    # Summary
+    merged_count = sum(1 for g in output_geometries if 'Merged' in g.get('tag', ''))
+    loose_count = len(output_geometries) - merged_count
+    broadcast_log(f"[Success] Smart Sewing complete: {merged_count} merged shells + {loose_count} individual faces = {len(output_geometries)} geometries total.")
+    
+    return {"geometries": output_geometries}
 
 @app.post("/build-skeleton")
 async def build_skeleton(params: BuildSkeletonParams):
