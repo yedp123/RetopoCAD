@@ -1126,22 +1126,22 @@ export default function App() {
                
                <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
                   <div>
-                    <span className="text-[8px] font-bold uppercase text-zinc-400 tracking-wider mb-1 block">Pre-Processing</span>
+                    <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider mb-1 block">Pre-Processing</span>
                     <div className="flex flex-col gap-1 mt-1">
-                      <div className="flex justify-between items-center text-[8px] text-zinc-400 font-mono">
+                      <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
                         <span>Sharpness (Dihedral)</span>
-                        <span className="text-white">{sharpnessAngle}°</span>
+                        <input type="number" min="0" max="180" step="1" value={sharpnessAngle} onChange={(e) => setSharpnessAngle(Math.max(0, Math.min(180, parseFloat(e.target.value) || 0)))} className="text-[10px] text-white w-12 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-indigo-500" />
                       </div>
                       <input 
-                        type="range" min="0" max="180" 
+                        type="range" min="0" max="180" step="0.5"
                         value={sharpnessAngle} 
-                        onChange={(e) => setSharpnessAngle(parseInt(e.target.value))} 
+                        onChange={(e) => setSharpnessAngle(parseFloat(e.target.value))} 
                         className="w-full accent-indigo-500 h-1 mt-1 mb-2" 
                       />
                       
-                      <div className="flex justify-between items-center text-[8px] text-zinc-400 font-mono">
+                      <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
                         <span>Decimation (Faces)</span>
-                        <span className="text-white">{decimationTarget.toLocaleString()}</span>
+                        <input type="number" min="1000" max="100000" step="1000" value={decimationTarget} onChange={(e) => setDecimationTarget(Math.max(1000, Math.min(100000, parseInt(e.target.value) || 5000)))} className="text-[10px] text-white w-16 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-indigo-500" />
                       </div>
                       <input 
                         type="range" min="5000" max="100000" step="1000" 
@@ -1151,9 +1151,9 @@ export default function App() {
                         className="w-full accent-indigo-500 h-1 mt-1 mb-2" 
                       />
                       
-                      <div className="flex justify-between items-center text-[8px] text-zinc-400 font-mono">
+                      <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
                         <span>Sharpening (Iters)</span>
-                        <span className="text-white">{sharpeningIters}</span>
+                        <input type="number" min="0" max="10" step="1" value={sharpeningIters} onChange={(e) => setSharpeningIters(Math.max(0, Math.min(10, parseInt(e.target.value) || 0)))} className="text-[10px] text-white w-12 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-indigo-500" />
                       </div>
                       <input 
                         type="range" min="0" max="10" step="1" 
@@ -1163,7 +1163,7 @@ export default function App() {
                         className="w-full accent-indigo-500 h-1 mt-1 mb-1" 
                       />
                       
-                      <button onClick={applyPreprocessing} className="w-full py-1.5 mt-2 bg-zinc-800 hover:bg-zinc-700 text-[8px] font-bold uppercase text-white rounded border border-zinc-700 transition-colors">
+                      <button onClick={applyPreprocessing} className="w-full py-1.5 mt-2 bg-zinc-800 hover:bg-zinc-700 text-[10px] font-bold uppercase text-white rounded border border-zinc-700 transition-colors">
                         Apply Filters
                       </button>
                     </div>
@@ -1171,36 +1171,36 @@ export default function App() {
                </div>
 
                {/* NEW: PATCHING CONTROLS */}
-               <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
-                  <span className="text-[8px] font-bold uppercase text-zinc-400 tracking-wider mb-1">Patching Controls</span>
+               <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-2">
+                   <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider mb-1">Patching Controls</span>
                   <div className="flex flex-col gap-1">
-                      <div className="flex justify-between items-center text-[8px] text-zinc-400 font-mono">
+                      <div className="flex justify-between items-center text-[10px] text-zinc-400 font-mono">
                           <span>Edge Smoothing</span>
-                          <span className="text-white">{edgeSmoothing}%</span>
+                          <input type="number" min="0" max="100" step="1" value={edgeSmoothing} onChange={(e) => setEdgeSmoothing(Math.max(0, Math.min(100, parseInt(e.target.value) || 0)))} className="text-[10px] text-white w-12 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-indigo-500" />
                       </div>
                       <input
                           type="range" min="0" max="100"
                           value={edgeSmoothing}
                           onChange={(e) => setEdgeSmoothing(parseInt(e.target.value))}
-                          className="w-full accent-indigo-500 h-1 mt-1 mb-1"
+                          className="w-full accent-indigo-500 h-1.5 mt-1 mb-2"
                       />
-                      <span className="text-[7px] text-zinc-500 italic mt-1 leading-tight">
+                      <span className="text-[9px] text-zinc-500 italic leading-tight">
                           0% strictly follows mesh triangles (can be wobbly). 100% simplifies curves for perfectly smooth CAD edges (can lose detail).
                       </span>
                   </div>
                </div>
 
-               <div className="bg-zinc-900 rounded border border-zinc-800 p-2 flex flex-col gap-2">
-                  <span className="text-[8px] font-bold uppercase text-zinc-400 tracking-wider mb-1">Curves Extraction</span>
+               <div className="bg-zinc-900 rounded border border-zinc-800 p-3 flex flex-col gap-2">
+                   <span className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider mb-2">Curves Extraction</span>
 
                   <div className="flex items-center gap-2">
-                    <span className="text-[8px] w-12 text-zinc-400">Min Size</span>
-                    <input type="range" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value))} disabled={isAutoExtracting} className="flex-1 accent-emerald-500 h-1" />
-                    <input type="number" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value) || 0)} disabled={isAutoExtracting} className="text-[8px] text-emerald-400 w-8 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-emerald-500" />
+                    <span className="text-[10px] w-12 text-zinc-400">Min Size</span>
+                    <input type="range" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value))} disabled={isAutoExtracting} className="flex-1 accent-emerald-500 h-1.5" />
+                    <input type="number" min="0.1" max="10.0" step="0.1" value={minFeatureSize} onChange={(e) => setMinFeatureSize(parseFloat(e.target.value) || 0)} disabled={isAutoExtracting} className="text-[10px] text-emerald-400 w-12 text-right font-mono bg-zinc-950 border border-zinc-700 rounded px-1 outline-none focus:border-emerald-500" />
                   </div>
                   
                   <div className="flex gap-1 mt-0.5">
-                    <button onClick={handleAutoExtract} disabled={isAutoExtracting} className="flex-1 py-1 rounded text-[8px] font-bold uppercase tracking-wide bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white border border-emerald-600/50 transition-colors">
+                    <button onClick={handleAutoExtract} disabled={isAutoExtracting} className="flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wide bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white border border-emerald-600/50 transition-colors">
                       Auto Detect
                     </button>
                     

@@ -240,10 +240,13 @@ async def upload_mesh(background_tasks: BackgroundTasks, file: UploadFile = File
 
 def get_patch_components(mesh, sharpness_angle_deg):
     """
-    Extract patch components using multi-angle consensus voting.
-    The user's angle is the CENTER of the band — it is NOT overridden.
-    We test 5 angles in a narrow band (±10%) and require majority agreement.
-    This makes results stable across ±2-3° angle changes.
+    Extract patch components using multi-angle consensus voting,
+    with a normal-clustering fallback for nearly-coplanar surfaces.
+    
+    Phase 1: Standard dihedral angle detection with consensus voting.
+    Phase 2: For each large component, check if face normals cluster into
+             distinct groups. If so, split the component by re-running
+             connected components on only the faces within each cluster.
     """
     if mesh is None: return []
     
@@ -278,7 +281,112 @@ def get_patch_components(mesh, sharpness_angle_deg):
     robust_smooth = edge_sharp_votes < 3
     
     smooth_edges = adjacency[robust_smooth]
-    return list(trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces))))
+    initial_components = list(trimesh.graph.connected_components(edges=smooth_edges, nodes=np.arange(len(mesh.faces))))
+    
+    # =====================================================================
+    # Phase 2: Normal-clustering fallback for nearly-coplanar surfaces
+    # If a component has ≥10 faces and its normals have high variance,
+    # try splitting it using spectral gap analysis on face normals.
+    # =====================================================================
+    MIN_COMPONENT_SIZE = 10  # Don't bother splitting tiny components
+    NORMAL_VARIANCE_THRESHOLD = 0.01  # Minimum variance to trigger splitting
+    
+    final_components = []
+    for comp in initial_components:
+        if len(comp) < MIN_COMPONENT_SIZE:
+            final_components.append(comp)
+            continue
+        
+        # Check if face normals in this component have enough variance to warrant splitting
+        comp_normals = mesh.face_normals[comp]
+        normal_variance = np.var(comp_normals, axis=0).sum()
+        
+        if normal_variance < NORMAL_VARIANCE_THRESHOLD:
+            final_components.append(comp)
+            continue
+        
+        # Try to find the optimal number of clusters using the spectral gap
+        # We use PCA eigenvalues of the normals to determine if there are distinct groups
+        try:
+            from sklearn.cluster import KMeans
+            
+            centered = comp_normals - np.mean(comp_normals, axis=0)
+            _, s, _ = np.linalg.svd(centered, full_matrices=False)
+            
+            # If the top 2 singular values are both significant, normals span 2+ directions
+            if len(s) >= 2 and s[1] / (s[0] + 1e-9) > 0.15:
+                # Try k=2 first, then k=3 if needed
+                best_k = 2
+                best_score = -1
+                
+                for k in [2, 3]:
+                    if k > len(comp) // 3:
+                        continue
+                    km = KMeans(n_clusters=k, random_state=42, n_init=5, max_iter=50)
+                    labels = km.fit_predict(comp_normals)
+                    
+                    # Check cluster quality: each cluster should be internally coherent
+                    cluster_variances = []
+                    for ci in range(k):
+                        mask = labels == ci
+                        if np.sum(mask) < 3:
+                            continue
+                        cluster_var = np.var(comp_normals[mask], axis=0).sum()
+                        cluster_variances.append(cluster_var)
+                    
+                    if len(cluster_variances) == k:
+                        # Score = ratio of (between-cluster variance) / (within-cluster variance)
+                        within = np.mean(cluster_variances)
+                        total = normal_variance
+                        between = total - within
+                        score = between / (within + 1e-9)
+                        
+                        # Only accept the split if the between/within ratio is high
+                        if score > best_score and score > 2.0:
+                            best_score = score
+                            best_k = k
+                
+                if best_score > 2.0:
+                    # Perform the winning split
+                    km = KMeans(n_clusters=best_k, random_state=42, n_init=5, max_iter=50)
+                    labels = km.fit_predict(comp_normals)
+                    
+                    # For each cluster, extract the sub-component using graph connectivity
+                    comp_array = np.array(comp)
+                    for ci in range(best_k):
+                        cluster_faces = comp_array[labels == ci]
+                        if len(cluster_faces) == 0:
+                            continue
+                        
+                        # Build adjacency within this cluster only
+                        cluster_face_set = set(cluster_faces.tolist())
+                        cluster_smooth = []
+                        for i in range(len(adjacency)):
+                            f0, f1 = adjacency[i]
+                            if f0 in cluster_face_set and f1 in cluster_face_set and robust_smooth[i]:
+                                cluster_smooth.append([f0, f1])
+                        
+                        if len(cluster_smooth) > 0:
+                            sub_components = list(trimesh.graph.connected_components(
+                                edges=np.array(cluster_smooth), 
+                                nodes=cluster_faces
+                            ))
+                            final_components.extend(sub_components)
+                        else:
+                            # No smooth edges within cluster — each face is its own component
+                            final_components.append(cluster_faces)
+                else:
+                    final_components.append(comp)
+            else:
+                final_components.append(comp)
+        except ImportError:
+            # sklearn not available, skip clustering fallback
+            final_components.append(comp)
+        except Exception:
+            # Any clustering failure — just keep the original component
+            final_components.append(comp)
+    
+    return final_components
 
 
 def apply_pca_firewall(points):
