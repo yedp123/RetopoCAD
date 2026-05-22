@@ -1,6 +1,6 @@
 # **RetopoCAD 🚀**
 
-<img width="1920" height="919" alt="1778509335081933314429384891700" src="https://github.com/user-attachments/assets/640fa6e9-e67d-4f76-93f5-b95efd5d9175" />
+<img width="1920" height="919" alt="005238124febceffafdf8ea871d243a8" src="https://github.com/user-attachments/assets/af8590a1-4080-41b5-92fb-1f2634e4f0cd" />
 
 
 **An experimental, browser-based tool to bridge the gap between messy high-poly meshes and clean Solid CAD.**
